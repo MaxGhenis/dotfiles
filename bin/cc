@@ -1,0 +1,15 @@
+#!/bin/zsh
+# Usage: cc [name]
+# Creates a new Claude Code pane in the current tmux session.
+# Falls back to a timestamp if no name is given.
+
+if [[ -z "$TMUX" ]]; then
+  echo "Error: not inside a tmux session" >&2
+  exit 1
+fi
+
+name="${1:-$(date +%H%M%S)}"
+tmux split-window -d -c ~ "claude --dangerously-skip-permissions"
+pane=$(tmux list-panes -F '#{pane_index}' | tail -1)
+tmux select-pane -t "$pane" -T "$name"
+tmux select-layout tiled
