@@ -9,7 +9,7 @@ if [[ -z "$TMUX" ]]; then
 fi
 
 name="${1:-$(date +%H%M%S)}"
-tmux split-window -d -c ~ "claude --dangerously-skip-permissions"
-pane=$(tmux list-panes -F '#{pane_index}' | tail -1)
+pane=$(tmux split-window -c ~ -P -F '#{pane_index}')
+tmux send-keys -t "$pane" "claude --dangerously-skip-permissions" Enter
 tmux select-pane -t "$pane" -T "$name"
 tmux select-layout tiled

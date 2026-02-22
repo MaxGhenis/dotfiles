@@ -62,9 +62,9 @@ unset CLAUDE_CODE_TASK_LIST_ID  # Per-session tasks only; no shared task list
 if [[ -z "$TMUX" ]]; then
   if [[ -n "$SSH_CONNECTION" ]]; then
     # Remote: grouped session with its own window running Claude Code
-    tmux new-session -A -t c -s "remote-$$" \; new-window -n remote 'claude --dangerously-skip-permissions' 2>/dev/null || tmux new -s c 'claude --dangerously-skip-permissions'
+    tmux new-session -A -t c -s "remote-$$" \; new-window -n remote 'claude --dangerously-skip-permissions; exec zsh' 2>/dev/null || tmux new -s c 'claude --dangerously-skip-permissions; exec zsh'
   else
     # Local: attach to main session
-    tmux attach -t c 2>/dev/null || tmux new -s c 'claude --dangerously-skip-permissions'
+    tmux attach -t c 2>/dev/null || tmux new -s c 'claude --dangerously-skip-permissions; exec zsh'
   fi
 fi
