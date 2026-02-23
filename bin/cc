@@ -9,7 +9,8 @@ if [[ -z "$TMUX" ]]; then
 fi
 
 name="${1:-$(date +%H%M%S)}"
-pane=$(tmux split-window -c ~ -P -F '#{pane_index}')
-tmux send-keys -t "$pane" "claude --dangerously-skip-permissions" Enter
-tmux select-pane -t "$pane" -T "$name"
+# Launch claude directly (not via send-keys) so the pane exits cleanly on /exit
+# exec zsh keeps the pane alive as a shell after claude exits
+tmux split-window -c ~ -t '{end}' "claude --dangerously-skip-permissions; exec zsh"
+tmux select-pane -T "$name"
 tmux select-layout tiled
