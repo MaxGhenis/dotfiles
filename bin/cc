@@ -1,16 +1,143 @@
 #!/bin/zsh
-# Usage: cc [name]
-# Creates a new Claude Code pane in the current tmux session.
-# Falls back to a timestamp if no name is given.
+# Usage: cc [name]              — new Claude Code pane in current tmux window
+#        cc resume <words...>   — resume most recent CC session matching ALL keywords
+#
+# Resume finds the most recently modified session JSONL where the first 3 real
+# user messages contain every keyword. It excludes active sessions, teammate/
+# subagent sessions, and continuation pastes. The project directory is decoded
+# from the JSONL path so --resume runs in the correct project context.
+#
+# From inside a CC session: tmux run-shell "unset CLAUDECODE && ~/bin/cc resume <words>"
+#
+# Examples:
+#   cc resume policybench
+#   cc resume tailwind policyengine
+#   cc resume h1b
 
 if [[ -z "$TMUX" ]]; then
   echo "Error: not inside a tmux session" >&2
   exit 1
 fi
 
+if [[ "$1" == "resume" ]]; then
+  shift  # drop "resume"
+  keyword="$*"
+  if [[ -z "$keyword" ]]; then
+    echo "Usage: cc resume <keywords...>" >&2
+    exit 1
+  fi
+
+  project_dir="$HOME/.claude/projects"
+
+  # Collect active session IDs to exclude:
+  # 1. All claude --resume processes
+  active_ids=$(ps aux | grep 'claude.*--resume' | grep -v grep \
+    | sed -n 's/.*--resume[= ]*\([a-f0-9-]*\).*/\1/p')
+  # 2. Any JSONL modified in the last 2 minutes (likely active sessions)
+  active_ids="$active_ids"$'\n'$(find "$project_dir" -maxdepth 2 -name "*.jsonl" -mmin -2 2>/dev/null \
+    | xargs -I{} basename {} .jsonl)
+
+  # Search user messages in session files for the keyword, most recent first
+  # Returns: session_file_path\tlaunch_dir
+  result=$(python3 -c "
+import json, os, glob, sys
+
+keyword = sys.argv[1]
+exclude = set(line for line in sys.argv[2].split() if line.strip())
+base = sys.argv[3]
+files = glob.glob(os.path.join(base, '*/*.jsonl'))
+files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+
+def decode_project_path(encoded):
+    \"\"\"Decode project folder name to real path using greedy directory matching.
+    e.g. -Users-maxghenis-PolicyEngine-policyengine-app-v2
+      -> /Users/maxghenis/PolicyEngine/policyengine-app-v2
+    \"\"\"
+    raw = encoded.lstrip('-')
+    parts = raw.split('-')
+    path = '/'
+    i = 0
+    while i < len(parts):
+        matched = False
+        for j in range(len(parts), i, -1):
+            candidate = os.path.join(path, '-'.join(parts[i:j]))
+            if os.path.isdir(candidate):
+                path = candidate
+                i = j
+                matched = True
+                break
+        if not matched:
+            path = os.path.join(path, parts[i])
+            i += 1
+    return path
+
+def should_skip(msg):
+    \"\"\"Skip messages that aren't real user input.\"\"\"
+    s = msg.strip()
+    # Continuation pastes (full prior session output)
+    if 'Claude Code v' in msg[:500] or s.startswith('continue'):
+        return True
+    # Teammate/subagent sessions
+    if s.startswith('<teammate-message'):
+        return True
+    # Empty or trivial
+    if len(s) < 3:
+        return True
+    return False
+
+for f in files:
+    sid = os.path.basename(f).replace('.jsonl', '')
+    if sid in exclude:
+        continue
+    try:
+        with open(f) as fh:
+            user_count = 0
+            for line in fh:
+                obj = json.loads(line)
+                if obj.get('type') == 'user':
+                    msg = obj.get('message', {}).get('content', '')
+                    if isinstance(msg, list):
+                        msg = ' '.join(c.get('text','') for c in msg if isinstance(c, dict))
+                    if should_skip(msg):
+                        continue
+                    msg_lower = msg.lower()
+                    if all(kw in msg_lower for kw in keyword.lower().split()):
+                        folder = os.path.basename(os.path.dirname(f))
+                        launch = decode_project_path(folder)
+                        print(f + '\t' + launch)
+                        sys.exit(0)
+                    user_count += 1
+                    if user_count >= 3:
+                        break  # only check first 3 user messages (session topic)
+    except:
+        pass
+sys.exit(1)
+" "$keyword" "$active_ids" "$project_dir" 2>/dev/null)
+
+  if [[ -z "$result" ]]; then
+    echo "No session found matching '$keyword'" >&2
+    exit 1
+  fi
+
+  session_file="${result%%	*}"
+  launch_dir="${result##*	}"
+  session_id=$(basename "$session_file" .jsonl)
+
+  # Final fallback if decoded path doesn't exist
+  if [[ ! -d "$launch_dir" ]]; then
+    launch_dir="$HOME"
+  fi
+
+  echo "Resuming $session_id from $launch_dir"
+  tmux split-window -c "$launch_dir" "unset CLAUDECODE; claude --resume '$session_id' --dangerously-skip-permissions; exec zsh"
+  tmux select-pane -T "$keyword"
+  tmux select-layout tiled
+  exit 0
+fi
+
 name="${1:-$(date +%H%M%S)}"
 # Launch claude directly (not via send-keys) so the pane exits cleanly on /exit
 # exec zsh keeps the pane alive as a shell after claude exits
-tmux split-window -c ~ -t '{end}' "claude --dangerously-skip-permissions; exec zsh"
+tmux split-window -c ~ "claude --dangerously-skip-permissions; exec zsh"
 tmux select-pane -T "$name"
 tmux select-layout tiled
