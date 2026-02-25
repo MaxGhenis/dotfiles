@@ -59,7 +59,8 @@ source <(fzf --zsh)
 unset CLAUDE_CODE_TASK_LIST_ID  # Per-session tasks only; no shared task list
 
 # === tmux ===
-if [[ -z "$TMUX" ]]; then
+# Skip auto-attach in VS Code terminals (use VS Code's Claude Code panel instead)
+if [[ -z "$TMUX" && -z "$VSCODE_INJECTION" ]]; then
   if [[ -n "$SSH_CONNECTION" ]]; then
     # Remote: grouped session with its own window running Claude Code
     tmux new-session -A -t c -s "remote-$$" \; new-window -n remote 'claude --dangerously-skip-permissions; exec zsh' 2>/dev/null || tmux new -s c 'claude --dangerously-skip-permissions; exec zsh'
