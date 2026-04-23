@@ -27,6 +27,7 @@ REMOVE_CLOSED=0
 DISCOVER=0
 DISCOVER_MAXDEPTH=5
 RECENT_HOURS=24
+GH_READY_CACHE=""
 ARGS=()
 
 HOME_DIR=${HOME:-/Users/maxghenis}
@@ -42,7 +43,7 @@ NOW_EPOCH=$(date +%s)
 
 # Files that frequently drift without semantic meaning in fresh worktrees. If
 # the only dirty files match this list, treat the worktree as effectively clean.
-BENIGN_DIRTY_PATTERNS='^(uv\.lock|Cargo\.lock|bun\.lock|bun\.lockb|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Pipfile\.lock)$'
+BENIGN_DIRTY_PATTERNS='^(uv\.lock|Cargo\.lock|bun\.lock|bun\.lockb|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Pipfile\.lock|\.venv/?|venv/?|\.pytest_cache/?|\.ruff_cache/?|\.mypy_cache/?|\.tox/?)$|(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.mypy_cache)/'
 
 usage() {
   cat <<'EOF'
@@ -73,7 +74,18 @@ have_cmd() {
 }
 
 gh_ready() {
-  have_cmd gh && gh auth status >/dev/null 2>&1
+  if [ -n "$GH_READY_CACHE" ]; then
+    [ "$GH_READY_CACHE" = "1" ]
+    return
+  fi
+
+  if have_cmd gh && gh auth status >/dev/null 2>&1; then
+    GH_READY_CACHE=1
+  else
+    GH_READY_CACHE=0
+  fi
+
+  [ "$GH_READY_CACHE" = "1" ]
 }
 
 abspath_from() {
@@ -137,18 +149,6 @@ discover_roots() {
       \( -path "$HOME_DIR/Library" -o -path "$HOME_DIR/.Trash" -o -path "$HOME_DIR/.cache" -o -path '*/node_modules' -o -path '*/.git' \) -prune \
       -o -type d \( -name '.codex-worktrees' -o -name '.claude-worktrees' -o -name 'pr-worktrees' -o -name 'pr_worktrees' -o -name '_pr_worktrees' -o -name '_codex_prs' -o -path '*/.claude/worktrees' \) -print
   done | sort -u
-}
-
-path_is_within() {
-  local path=$1
-  local root=$2
-  if [ "$path" = "$root" ]; then
-    return 0
-  fi
-  case "$path" in
-    "$root"/*) return 0 ;;
-    *) return 1 ;;
-  esac
 }
 
 stat_mtime() {
@@ -280,7 +280,8 @@ ahead_of_upstream_count() {
   upstream=$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
   [ -n "$upstream" ] || { echo 0; return 0; }
 
-  git -C "$wt" rev-list --count "${upstream}..HEAD" 2>/dev/null || echo 0
+  git -C "$wt" cherry "$upstream" HEAD 2>/dev/null \
+    | awk '$1 == "+" { count++ } END { print count + 0 }' || echo 0
 }
 
 maybe_fetch_repo() {
@@ -369,7 +370,7 @@ lookup_pr_info() {
     fi
   fi
 
-  if [ -n "$head_sha" ]; then
+  if [ -z "$branch" ] && [ -n "$head_sha" ]; then
     row=$(pr_lookup_by_sha "$repo_slug" "$head_sha" || true)
     if [ -n "$row" ]; then
       printf '%s\t%s\n' "sha" "$row"
@@ -419,7 +420,7 @@ inspect_worktree() {
   is_git_repo "$wt" || return 0
 
   local wt_name branch branchref head_sha common_dir default_branch base_ref dirty benign_only non_benign
-  local git_dir git_index git_head
+  local git_index git_head
   local merged_state repo_top origin_url repo_slug status_line upstream_gone
   local pr_row pr_source pr_number pr_state pr_merged_at pr_closed_at pr_url pr_head_ref
   local safe_to_remove=0 removal_candidate=0 allow_force=0 tag removal_reason repo_label line
@@ -433,11 +434,6 @@ inspect_worktree() {
   [ -n "$common_dir" ] || return 0
   common_dir=$(abspath_from "$common_dir" "$wt")
   [ -n "$common_dir" ] || return 0
-
-  git_dir=$(git -C "$wt" rev-parse --git-dir 2>/dev/null || true)
-  [ -n "$git_dir" ] || return 0
-  git_dir=$(abspath_from "$git_dir" "$wt")
-  [ -n "$git_dir" ] || return 0
 
   git_index=$(git -C "$wt" rev-parse --git-path index 2>/dev/null || true)
   git_head=$(git -C "$wt" rev-parse --git-path HEAD 2>/dev/null || true)
@@ -598,6 +594,8 @@ EOF
     fi
   elif [ "$removal_candidate" = "1" ] && [ -n "$hold_reasons" ]; then
     printf 'BLOCKED\t%s\treason=%s\tmode=%s\n' "$line" "$removal_reason" "$tag"
+  elif [ "$pr_state" = "MERGED" ] && [ "$dirty" != "0" ] && [ "$benign_only" != "yes" ] && [ "$FORCE_DIRTY" != "1" ]; then
+    printf 'MERGED-BUT-DIRTY\t%s\n' "$line"
   elif [ "$pr_state" = "CLOSED" ] && [ -z "$pr_merged_at" ]; then
     printf 'REVIEW-CLOSED\t%s\tmode=%s\n' "$line" "$tag"
   elif [ "$merged_state" = "merged" ] && [ "$dirty" != "0" ] && [ "$benign_only" != "yes" ] && [ "$FORCE_DIRTY" != "1" ]; then
