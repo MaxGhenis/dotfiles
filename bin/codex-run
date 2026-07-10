@@ -66,7 +66,7 @@ while :; do
   attempt=$((attempt + 1))
   : > "$OUT_FILE"
   CODEX_HOME="$CODEX_HOME_ARG" codex exec --skip-git-repo-check --color never \
-    --sandbox "$SANDBOX" "${EXTRA_CFG[@]}" -m "$MODEL" -C "$WORKDIR" -o "$OUT_FILE" \
+    --sandbox "$SANDBOX" ${EXTRA_CFG[@]+"${EXTRA_CFG[@]}"} -m "$MODEL" -C "$WORKDIR" -o "$OUT_FILE" \
     "$(cat "$PROMPT_FILE")" </dev/null >/dev/null 2>"$ERR_FILE"
   rc=$?
   [ $rc -eq 0 ] && [ -s "$OUT_FILE" ] && { echo "codex-run: OK attempt=$attempt bytes=$(wc -c <"$OUT_FILE" | tr -d ' ')"; exit 0; }
