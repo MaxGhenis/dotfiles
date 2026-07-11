@@ -14,12 +14,18 @@
 #
 # Usage:
 #   codex-run -H <codex_home> -m <model> -C <workdir> -p <prompt_file> -o <out_file> \
-#             [-s read-only|workspace-write] [-b <salvage_branch>] [-r <max_retries>]
+#             [-s read-only|workspace-write] [-b <salvage_branch>] [-R <salvage_remote>] \
+#             [-r <max_retries>]
+#
+# PUBLIC REPOS: the -b salvage push fires on EVERY exit, including success —
+# content reaches the remote BEFORE any review. When origin is public, either
+# omit -b (the salvage COMMIT still protects local work) or pass -R with a
+# private mirror remote; push to origin yourself after review.
 set -u
 
 CODEX_HOME_ARG="" MODEL="" WORKDIR="" PROMPT_FILE="" OUT_FILE=""
-SANDBOX="workspace-write" SALVAGE_BRANCH="" MAX_RETRIES=2
-while getopts "H:m:C:p:o:s:b:r:" opt; do
+SANDBOX="workspace-write" SALVAGE_BRANCH="" SALVAGE_REMOTE="origin" MAX_RETRIES=2
+while getopts "H:m:C:p:o:s:b:R:r:" opt; do
   case "$opt" in
     H) CODEX_HOME_ARG=$OPTARG ;;
     m) MODEL=$OPTARG ;;
@@ -28,6 +34,7 @@ while getopts "H:m:C:p:o:s:b:r:" opt; do
     o) OUT_FILE=$OPTARG ;;
     s) SANDBOX=$OPTARG ;;
     b) SALVAGE_BRANCH=$OPTARG ;;
+    R) SALVAGE_REMOTE=$OPTARG ;;
     r) MAX_RETRIES=$OPTARG ;;
     *) exit 2 ;;
   esac
@@ -46,8 +53,8 @@ salvage() {
       && echo "codex-run: salvaged dirty state → $(git -C "$WORKDIR" rev-parse --short HEAD)" >&2
   fi
   if [ -n "$SALVAGE_BRANCH" ]; then
-    git -C "$WORKDIR" push -qf origin "HEAD:$SALVAGE_BRANCH" 2>/dev/null \
-      && echo "codex-run: pushed HEAD → origin/$SALVAGE_BRANCH" >&2
+    git -C "$WORKDIR" push -qf "$SALVAGE_REMOTE" "HEAD:$SALVAGE_BRANCH" 2>/dev/null \
+      && echo "codex-run: pushed HEAD → $SALVAGE_REMOTE/$SALVAGE_BRANCH" >&2
   fi
 }
 trap salvage EXIT
