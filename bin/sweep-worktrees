@@ -6,12 +6,15 @@
 #   sweep-worktrees --dry-run [REPO_OR_ROOT ...]
 #   sweep-worktrees --discover [BASE_DIR ...]
 #   sweep-worktrees --remove-closed [REPO_OR_ROOT ...]
+#   sweep-worktrees --prune-venvs [REPO_OR_ROOT ...]
+#   sweep-worktrees --prune-ignored [REPO_OR_ROOT ...]
 #
 # Behavior:
 #   - In a git repo with no args: sweep that repo's linked worktrees.
 #   - Outside a git repo with no args: sweep ~/.codex-worktrees and ~/.claude-worktrees.
 #   - If an arg is a git repo: sweep linked worktrees registered to that repo.
 #   - If an arg is a directory root: inspect its child worktree directories.
+#   - With --prune-venvs or --prune-ignored, root children may also be ordinary git clones.
 #
 # PR-aware classification:
 #   - Detects PRs from directory names like pr-123 / review-123 when possible.
@@ -24,11 +27,14 @@ set -u
 DRY_RUN=0
 FORCE_DIRTY=0
 REMOVE_CLOSED=0
+PRUNE_VENVS=0
+PRUNE_IGNORED=0
 DISCOVER=0
 DISCOVER_MAXDEPTH=5
 RECENT_HOURS=24
 GH_READY_CACHE=""
 ARGS=()
+PR_FIELD_SEP=$(printf '\037')
 
 HOME_DIR=${HOME:-/Users/maxghenis}
 TMPDIR_BASE=${TMPDIR:-/tmp}
@@ -43,7 +49,7 @@ NOW_EPOCH=$(date +%s)
 
 # Files that frequently drift without semantic meaning in fresh worktrees. If
 # the only dirty files match this list, treat the worktree as effectively clean.
-BENIGN_DIRTY_PATTERNS='^(uv\.lock|Cargo\.lock|bun\.lock|bun\.lockb|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Pipfile\.lock|\.venv/?|venv/?|\.pytest_cache/?|\.ruff_cache/?|\.mypy_cache/?|\.tox/?)$|(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.mypy_cache)/'
+BENIGN_DIRTY_PATTERNS='^(\.venv/?|venv/?|\.pytest_cache/?|\.ruff_cache/?|\.mypy_cache/?|\.tox/?)$|(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.mypy_cache)/'
 
 usage() {
   cat <<'EOF'
@@ -51,12 +57,16 @@ Usage:
   sweep-worktrees [REPO_OR_ROOT ...]
   sweep-worktrees --dry-run [REPO_OR_ROOT ...]
   sweep-worktrees --discover [BASE_DIR ...]
+  sweep-worktrees --prune-venvs [REPO_OR_ROOT ...]
+  sweep-worktrees --prune-ignored [REPO_OR_ROOT ...]
 
 Options:
   --dry-run        Classify only; do not remove anything.
   --force-dirty    Allow removal of merged/closed worktrees with non-benign dirt.
   --remove-closed  Also remove clean worktrees for closed-but-unmerged PRs.
-  --discover       Find common agent worktree roots below the given base dirs.
+  --prune-venvs    Remove ignored root .venv/venv dirs, preserving worktrees.
+  --prune-ignored  Remove Git-ignored generated files, preserving worktrees.
+  --discover       Find common agent/worktree roots below the given base dirs.
   --maxdepth N     Max depth for --discover. Default: 5.
   --recent-hours N Keep recently touched worktrees. Default: 24.
   -h, --help       Show this help.
@@ -66,6 +76,9 @@ Examples:
   sweep-worktrees ~/PolicyEngine/policyengine-us-data
   sweep-worktrees ~/.codex-worktrees ~/.claude-worktrees
   sweep-worktrees --discover ~/PolicyEngine
+  sweep-worktrees --prune-venvs --dry-run ~/worktrees
+  sweep-worktrees --prune-venvs --dry-run --discover ~/PolicyEngine
+  sweep-worktrees --prune-ignored --dry-run --discover ~/PolicyEngine
 EOF
 }
 
@@ -147,7 +160,7 @@ discover_roots() {
     [ -d "$base" ] || continue
     find "$base" -maxdepth "$DISCOVER_MAXDEPTH" \
       \( -path "$HOME_DIR/Library" -o -path "$HOME_DIR/.Trash" -o -path "$HOME_DIR/.cache" -o -path '*/node_modules' -o -path '*/.git' \) -prune \
-      -o -type d \( -name '.codex-worktrees' -o -name '.claude-worktrees' -o -name 'pr-worktrees' -o -name 'pr_worktrees' -o -name '_pr_worktrees' -o -name '_codex_prs' -o -path '*/.claude/worktrees' \) -print
+      -o -type d \( -name '.codex-worktrees' -o -name '.claude-worktrees' -o -name 'worktrees' -o -name 'pr-worktrees' -o -name 'pr_worktrees' -o -name '_pr_worktrees' -o -name '_codex_prs' -o -path '*/.claude/worktrees' \) -print
   done | sort -u
 }
 
@@ -170,6 +183,19 @@ format_age() {
   else
     printf '%sd' "$(( (age + 86399) / 86400 ))"
   fi
+}
+
+format_kb() {
+  local kb=$1
+  awk -v kb="$kb" 'BEGIN {
+    if (kb >= 1048576) {
+      printf "%.1fG", kb / 1048576
+    } else if (kb >= 1024) {
+      printf "%.0fM", kb / 1024
+    } else {
+      printf "%dK", kb
+    }
+  }'
 }
 
 populate_process_cwds() {
@@ -241,6 +267,136 @@ tmux_usage_summary() {
       }
     }
   ' "$TMUX_PANES_FILE"
+}
+
+prune_worktree_venvs() {
+  local wt=$1
+  local line=$2
+  local activity_holds=$3
+  local env_name env_dir size_kb size_label
+  local found=0
+
+  for env_name in .venv venv; do
+    env_dir="$wt/$env_name"
+    [ -d "$env_dir" ] || continue
+    found=1
+
+    if ! git -C "$wt" check-ignore -q "$env_name/" 2>/dev/null; then
+      printf 'VENV-SKIP\t%s\tenv=%s\treason=not-ignored\n' "$line" "$env_name"
+      continue
+    fi
+
+    case "${VIRTUAL_ENV:-}" in
+      "$env_dir"|"$env_dir"/*)
+        printf 'VENV-BLOCKED\t%s\tenv=%s\thold=current-shell\n' "$line" "$env_name"
+        continue
+        ;;
+    esac
+
+    size_kb=$(du -sk "$env_dir" 2>/dev/null | awk '{print $1}')
+    [ -n "$size_kb" ] || size_kb=0
+    size_label=$(format_kb "$size_kb")
+
+    if [ -n "$activity_holds" ]; then
+      printf 'VENV-BLOCKED\t%s\tenv=%s\tsize=%s\thold=%s\n' "$line" "$env_name" "$size_label" "$activity_holds"
+    elif [ "$DRY_RUN" = "1" ]; then
+      printf 'WOULD-PRUNE-VENV\t%s\tenv=%s\tsize=%s\n' "$line" "$env_name" "$size_label"
+    else
+      printf 'PRUNE-VENV\t%s\tenv=%s\tsize=%s\n' "$line" "$env_name" "$size_label"
+      rm -rf -- "$env_dir"
+    fi
+  done
+
+  if [ "$found" = "0" ]; then
+    printf 'NO-VENV\t%s\n' "$line"
+  fi
+}
+
+ignored_clean_paths() {
+  local wt=$1
+  local path clean_path target
+  git -C "$wt" clean -ndX 2>/dev/null | sed -n 's/^Would remove //p' \
+    | while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      clean_path=${path%/}
+      target="$wt/$clean_path"
+      if should_keep_ignored_path "$clean_path" || ignored_target_has_kept_file "$target"; then
+        continue
+      fi
+      printf '%s\n' "$path"
+    done
+}
+
+should_keep_ignored_path() {
+  local path=${1%/}
+  case "$path" in
+    .env|.env.*|*/.env|*/.env.*|.netrc|*/.netrc|*.pem|*.key|*.p12|*.pfx|.venv|*/.venv|venv|*/venv)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+ignored_target_has_kept_file() {
+  local target=$1
+  [ -d "$target" ] || return 1
+  find "$target" \( -name '.env' -o -name '.env.*' -o -name '.netrc' -o -name '*.pem' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' -o -name '.venv' -o -name 'venv' \) -print -quit 2>/dev/null | grep -q .
+}
+
+prune_worktree_ignored() {
+  local wt=$1
+  local line=$2
+  local activity_holds=$3
+  local paths_file sizes_file path clean_path target size_kb total_kb count
+  local size_label top_summary item_label
+
+  paths_file=$(mktemp "$TMPDIR_BASE/sweep-worktrees.ignored.paths.XXXXXX") || return 0
+  sizes_file=$(mktemp "$TMPDIR_BASE/sweep-worktrees.ignored.sizes.XXXXXX") || {
+    rm -f "$paths_file"
+    return 0
+  }
+
+  ignored_clean_paths "$wt" > "$paths_file"
+  count=$(wc -l < "$paths_file" | tr -d ' ')
+  if [ "$count" = "0" ]; then
+    printf 'NO-IGNORED\t%s\n' "$line"
+    rm -f "$paths_file" "$sizes_file"
+    return 0
+  fi
+
+  total_kb=0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    clean_path=${path%/}
+    target="$wt/$clean_path"
+    size_kb=$(du -sk "$target" 2>/dev/null | awk '{print $1}')
+    [ -n "$size_kb" ] || size_kb=0
+    total_kb=$((total_kb + size_kb))
+    printf '%s\t%s\n' "$size_kb" "$path" >> "$sizes_file"
+  done < "$paths_file"
+
+  size_label=$(format_kb "$total_kb")
+  top_summary=""
+  while IFS=$'\t' read -r size_kb path; do
+    [ -n "$path" ] || continue
+    item_label=$(format_kb "$size_kb")
+    top_summary="${top_summary:+$top_summary,}$path:$item_label"
+  done < <(sort -nr "$sizes_file" | head -5)
+
+  if [ -n "$activity_holds" ]; then
+    printf 'IGNORED-BLOCKED\t%s\tignored=%s\tsize=%s\thold=%s\tlargest=%s\n' "$line" "$count" "$size_label" "$activity_holds" "$top_summary"
+  elif [ "$DRY_RUN" = "1" ]; then
+    printf 'WOULD-PRUNE-IGNORED\t%s\tignored=%s\tsize=%s\tlargest=%s\n' "$line" "$count" "$size_label" "$top_summary"
+  else
+    printf 'PRUNE-IGNORED\t%s\tignored=%s\tsize=%s\tlargest=%s\n' "$line" "$count" "$size_label" "$top_summary"
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      clean_path=${path%/}
+      rm -rf "$wt/$clean_path"
+    done < "$paths_file"
+  fi
+
+  rm -f "$paths_file" "$sizes_file"
 }
 
 recent_activity_age() {
@@ -318,8 +474,8 @@ pr_lookup_by_number() {
   local repo_slug=$1
   local pr_number=$2
   gh pr view "$pr_number" -R "$repo_slug" \
-    --json number,state,mergedAt,closedAt,url,headRefName \
-    --jq '[.number, .state, (.mergedAt // ""), (.closedAt // ""), .url, (.headRefName // "")] | @tsv' \
+    --json number,state,mergedAt,closedAt,url,headRefName,headRefOid \
+    --jq '[.number, .state, (.mergedAt // ""), (.closedAt // ""), .url, (.headRefName // ""), (.headRefOid // "")] | map(tostring) | join("\u001f")' \
     2>/dev/null
 }
 
@@ -327,8 +483,8 @@ pr_lookup_by_branch() {
   local repo_slug=$1
   local branch=$2
   gh pr list -R "$repo_slug" --head "$branch" --state all --limit 20 \
-    --json number,state,mergedAt,closedAt,url,headRefName,updatedAt \
-    --jq 'sort_by(.updatedAt) | reverse | .[0] | if . then [.number, .state, (.mergedAt // ""), (.closedAt // ""), .url, (.headRefName // "")] | @tsv else empty end' \
+    --json number,state,mergedAt,closedAt,url,headRefName,headRefOid,updatedAt \
+    --jq 'sort_by(.updatedAt) | reverse | .[0] | if . then [.number, .state, (.mergedAt // ""), (.closedAt // ""), .url, (.headRefName // ""), (.headRefOid // "")] | map(tostring) | join("\u001f") else empty end' \
     2>/dev/null
 }
 
@@ -336,8 +492,8 @@ pr_lookup_by_sha() {
   local repo_slug=$1
   local sha=$2
   gh pr list -R "$repo_slug" --search "$sha" --state all --limit 20 \
-    --json number,state,mergedAt,closedAt,url,headRefName,updatedAt \
-    --jq 'sort_by(.updatedAt) | reverse | .[0] | if . then [.number, .state, (.mergedAt // ""), (.closedAt // ""), .url, (.headRefName // "")] | @tsv else empty end' \
+    --json number,state,mergedAt,closedAt,url,headRefName,headRefOid,updatedAt \
+    --jq 'sort_by(.updatedAt) | reverse | .[0] | if . then [.number, .state, (.mergedAt // ""), (.closedAt // ""), .url, (.headRefName // ""), (.headRefOid // "")] | map(tostring) | join("\u001f") else empty end' \
     2>/dev/null
 }
 
@@ -357,7 +513,7 @@ lookup_pr_info() {
   if [ -n "$pr_number" ]; then
     row=$(pr_lookup_by_number "$repo_slug" "$pr_number" || true)
     if [ -n "$row" ]; then
-      printf '%s\t%s\n' "name" "$row"
+      printf '%s%s%s\n' "name" "$PR_FIELD_SEP" "$row"
       return 0
     fi
   fi
@@ -365,7 +521,7 @@ lookup_pr_info() {
   if [ -n "$branch" ]; then
     row=$(pr_lookup_by_branch "$repo_slug" "$branch" || true)
     if [ -n "$row" ]; then
-      printf '%s\t%s\n' "branch" "$row"
+      printf '%s%s%s\n' "branch" "$PR_FIELD_SEP" "$row"
       return 0
     fi
   fi
@@ -373,7 +529,7 @@ lookup_pr_info() {
   if [ -z "$branch" ] && [ -n "$head_sha" ]; then
     row=$(pr_lookup_by_sha "$repo_slug" "$head_sha" || true)
     if [ -n "$row" ]; then
-      printf '%s\t%s\n' "sha" "$row"
+      printf '%s%s%s\n' "sha" "$PR_FIELD_SEP" "$row"
       return 0
     fi
   fi
@@ -422,8 +578,8 @@ inspect_worktree() {
   local wt_name branch branchref head_sha common_dir default_branch base_ref dirty benign_only non_benign
   local git_index git_head
   local merged_state repo_top origin_url repo_slug status_line upstream_gone
-  local pr_row pr_source pr_number pr_state pr_merged_at pr_closed_at pr_url pr_head_ref
-  local safe_to_remove=0 removal_candidate=0 allow_force=0 tag removal_reason repo_label line
+  local pr_row pr_source pr_number pr_state pr_merged_at pr_closed_at pr_url pr_head_ref pr_head_oid
+  local safe_to_remove=0 removal_candidate=0 allow_force=0 tag removal_reason repo_label line pr_exact_head
   local proc_usage tmux_usage recent_age hold_reasons ahead_count
 
   wt_name=$(basename "$wt")
@@ -439,6 +595,64 @@ inspect_worktree() {
   git_head=$(git -C "$wt" rev-parse --git-path HEAD 2>/dev/null || true)
   [ -n "$git_index" ] && git_index=$(abspath_from "$git_index" "$wt")
   [ -n "$git_head" ] && git_head=$(abspath_from "$git_head" "$wt")
+
+  branchref=$hinted_branchref
+  if [ -z "$branchref" ]; then
+    branch=$(git -C "$wt" branch --show-current 2>/dev/null || true)
+    if [ -n "$branch" ]; then
+      branchref="refs/heads/$branch"
+    else
+      branchref="DETACHED"
+    fi
+  fi
+
+  if [ "$branchref" = "DETACHED" ]; then
+    branch=""
+  else
+    branch=${branchref#refs/heads/}
+  fi
+
+  origin_url=$(git -C "$wt" remote get-url origin 2>/dev/null || true)
+  repo_slug=$(github_repo_from_origin "$origin_url" 2>/dev/null || true)
+  if [ -n "$repo_slug" ]; then
+    repo_label=$repo_slug
+  else
+    repo_label=$(basename "$repo_top")
+  fi
+
+  if [ "$PRUNE_VENVS" = "1" ] || [ "$PRUNE_IGNORED" = "1" ]; then
+    dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+    hold_reasons=""
+    proc_usage=$(process_usage_summary "$wt")
+    if [ -n "$proc_usage" ]; then
+      hold_reasons="${hold_reasons:+$hold_reasons,}proc=$proc_usage"
+    fi
+
+    tmux_usage=$(tmux_usage_summary "$wt")
+    if [ -n "$tmux_usage" ]; then
+      hold_reasons="${hold_reasons:+$hold_reasons,}tmux=$tmux_usage"
+    fi
+
+    recent_age=$(recent_activity_age "$wt" "$git_index" "$git_head" || true)
+    if [ -n "$recent_age" ]; then
+      hold_reasons="${hold_reasons:+$hold_reasons,}recent=$recent_age"
+    fi
+
+    line=$(printf '%s\t[%s]\tartifact-prune' "$(printf '%s\n' "$wt" | safe_label)" "$repo_label")
+    if [ -n "$branch" ]; then
+      line="$line branch=$branch"
+    fi
+    line="$line dirty=$dirty"
+
+    if [ "$PRUNE_VENVS" = "1" ]; then
+      prune_worktree_venvs "$wt" "$line" "$hold_reasons"
+    fi
+    if [ "$PRUNE_IGNORED" = "1" ]; then
+      prune_worktree_ignored "$wt" "$line" "$hold_reasons"
+    fi
+    return 0
+  fi
 
   default_branch=$(git -C "$wt" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|origin/||')
   [ -z "$default_branch" ] && default_branch="main"
@@ -464,22 +678,6 @@ inspect_worktree() {
     benign_only="n/a"
   fi
 
-  branchref=$hinted_branchref
-  if [ -z "$branchref" ]; then
-    branch=$(git -C "$wt" branch --show-current 2>/dev/null || true)
-    if [ -n "$branch" ]; then
-      branchref="refs/heads/$branch"
-    else
-      branchref="DETACHED"
-    fi
-  fi
-
-  if [ "$branchref" = "DETACHED" ]; then
-    branch=""
-  else
-    branch=${branchref#refs/heads/}
-  fi
-
   head_sha=$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)
 
   if [ -z "$branch" ]; then
@@ -496,14 +694,6 @@ inspect_worktree() {
     *) upstream_gone="no" ;;
   esac
 
-  origin_url=$(git -C "$wt" remote get-url origin 2>/dev/null || true)
-  repo_slug=$(github_repo_from_origin "$origin_url" 2>/dev/null || true)
-  if [ -n "$repo_slug" ]; then
-    repo_label=$repo_slug
-  else
-    repo_label=$(basename "$repo_top")
-  fi
-
   pr_source=""
   pr_number=""
   pr_state=""
@@ -511,9 +701,10 @@ inspect_worktree() {
   pr_closed_at=""
   pr_url=""
   pr_head_ref=""
+  pr_head_oid=""
   pr_row=$(lookup_pr_info "$repo_slug" "$wt_name" "$branch" "$head_sha" 2>/dev/null || true)
   if [ -n "$pr_row" ]; then
-    IFS=$'\t' read -r pr_source pr_number pr_state pr_merged_at pr_closed_at pr_url pr_head_ref <<EOF
+    IFS="$PR_FIELD_SEP" read -r pr_source pr_number pr_state pr_merged_at pr_closed_at pr_url pr_head_ref pr_head_oid <<EOF
 $pr_row
 EOF
   fi
@@ -547,8 +738,16 @@ EOF
     fi
   fi
 
+  pr_exact_head="no"
+  if [ -n "$head_sha" ] && [ -n "$pr_head_oid" ] && [ "$head_sha" = "$pr_head_oid" ]; then
+    pr_exact_head="yes"
+  fi
+  if [ "$pr_state" = "MERGED" ] && [ "$merged_state" != "merged" ] && [ "$pr_exact_head" != "yes" ]; then
+    hold_reasons="${hold_reasons:+$hold_reasons,}local-not-at-merged-pr-head"
+  fi
+
   removal_reason=""
-  if [ "$pr_state" = "MERGED" ] && [ "$allow_force" = "1" ]; then
+  if [ "$pr_state" = "MERGED" ] && [ "$allow_force" = "1" ] && { [ "$merged_state" = "merged" ] || [ "$pr_exact_head" = "yes" ]; }; then
     removal_candidate=1
     removal_reason="merged-pr"
   elif [ -z "$pr_state" ] && [ "$merged_state" = "merged" ] && [ "$allow_force" = "1" ]; then
@@ -632,7 +831,11 @@ sweep_root() {
   [ -d "$root" ] || return 0
 
   find "$root" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r wt; do
-    is_linked_worktree_dir "$wt" || continue
+    if [ "$PRUNE_VENVS" = "1" ] || [ "$PRUNE_IGNORED" = "1" ]; then
+      is_git_repo "$wt" || continue
+    else
+      is_linked_worktree_dir "$wt" || continue
+    fi
     inspect_worktree "$wt"
   done
 }
@@ -649,6 +852,14 @@ while [ $# -gt 0 ]; do
       ;;
     --remove-closed)
       REMOVE_CLOSED=1
+      shift
+      ;;
+    --prune-venvs)
+      PRUNE_VENVS=1
+      shift
+      ;;
+    --prune-ignored)
+      PRUNE_IGNORED=1
       shift
       ;;
     --discover)
@@ -673,6 +884,9 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+populate_process_cwds
+populate_tmux_panes
 
 if [ "$DISCOVER" = "1" ]; then
   if [ ${#ARGS[@]} -eq 0 ]; then
@@ -699,9 +913,6 @@ if [ ${#ARGS[@]} -eq 0 ]; then
   echo "No repos or worktree roots found."
   exit 0
 fi
-
-populate_process_cwds
-populate_tmux_panes
 
 for target in "${ARGS[@]}"; do
   if is_git_repo "$target"; then
