@@ -49,14 +49,6 @@ if [[ -z "$TMUX" && -z "$VSCODE_INJECTION" ]]; then
   fi
 fi
 
-# bun
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
-
-# bun
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
-
 # uv: use committed lockfile as-is; `uv sync` never regenerates it.
 # Prevents spurious uv.lock drift in fresh worktrees when local dep
 # resolution differs from the upstream committer's. Override for a
