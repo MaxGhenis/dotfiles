@@ -1,0 +1,60 @@
+#!/bin/bash
+# claude-model — which model is actually serving this Claude Code session?
+#
+# Claude Code's environment block shows the CONFIGURED model. After a
+# safety-classifier fallback, turns are silently served by another model
+# (e.g. claude-fable-5 -> claude-opus-4-8, sticky ~1hr) and the agent has no
+# way to see it from its prompt. The transcript's per-message model field is
+# ground truth; this prints it.
+#
+# Usage:
+#   claude-model [-n <turns>] [-e <expected_model>] [transcript.jsonl | session-id]
+#
+#   -n  recent assistant turns to summarize (default 20)
+#   -e  exit 1 with DOWNGRADED unless the latest turn was served by this model
+#
+# With no transcript argument, uses the most recently modified transcript for
+# the current directory's project — in the common case (the calling session is
+# the one writing) that's the caller itself. With parallel sessions in one
+# directory, pass your session id or transcript path to be exact.
+set -u
+
+N=20 EXPECTED=""
+while getopts "n:e:" opt; do
+  case "$opt" in
+    n) N=$OPTARG ;;
+    e) EXPECTED=$OPTARG ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# Claude Code encodes a project's cwd by replacing '/' and '.' with '-'.
+PROJ_DIR="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr '/.' '--')"
+
+TRANSCRIPT=""
+if [ $# -ge 1 ]; then
+  if [ -f "$1" ]; then TRANSCRIPT=$1
+  elif [ -f "$PROJ_DIR/$1.jsonl" ]; then TRANSCRIPT="$PROJ_DIR/$1.jsonl"
+  else echo "claude-model: no transcript at '$1' or $PROJ_DIR/$1.jsonl" >&2; exit 2; fi
+else
+  [ -d "$PROJ_DIR" ] || { echo "claude-model: no project dir $PROJ_DIR — pass a transcript path" >&2; exit 2; }
+  TRANSCRIPT=$(ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -1)
+  [ -n "$TRANSCRIPT" ] || { echo "claude-model: no transcripts in $PROJ_DIR" >&2; exit 2; }
+fi
+
+MODELS=$(jq -rc 'select(.type=="assistant")|.message.model' "$TRANSCRIPT" 2>/dev/null | grep -v '^null$' | tail -"$N")
+[ -n "$MODELS" ] || { echo "claude-model: no assistant turns in $TRANSCRIPT" >&2; exit 2; }
+LATEST=$(printf '%s\n' "$MODELS" | tail -1)
+REFUSALS=$(grep -c '"stop_reason":"refusal"' "$TRANSCRIPT" 2>/dev/null || true)
+
+echo "transcript: $TRANSCRIPT"
+echo "last $N assistant turns:"
+printf '%s\n' "$MODELS" | sort | uniq -c | sort -rn | awk '{printf "  %s x%s\n", $2, $1}'
+echo "refusal fallbacks in session: ${REFUSALS:-0}"
+echo "latest: $LATEST"
+
+if [ -n "$EXPECTED" ] && [ "$LATEST" != "$EXPECTED" ]; then
+  echo "DOWNGRADED: latest turn served by $LATEST (expected $EXPECTED)" >&2
+  exit 1
+fi

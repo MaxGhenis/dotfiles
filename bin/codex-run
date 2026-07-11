@@ -90,5 +90,6 @@ while :; do
   fi
   echo "codex-run: FAILED rc=$rc attempt=$attempt (out_bytes=$(wc -c <"$OUT_FILE" | tr -d ' ')); stderr tail:" >&2
   tail -3 "$ERR_FILE" >&2
+  [ "$rc" -eq 0 ] && rc=1  # rc=0 with an empty out file is still a failure — don't report success
   exit "$rc"
 done
