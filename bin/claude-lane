@@ -1,0 +1,257 @@
+#!/bin/bash
+# claude-lane — hardened headless Claude Code dispatch, pinned to an enrolled
+# account lane. The Claude-side analog of codex-run + codex-pick.
+#
+# Identity = lane, not login: each enrolled account's `claude setup-token`
+# OAuth token lives in the agent keychain (claude-quota-<email>, stored by
+# `ai-quota enroll <email>`), and the run pins it via CLAUDE_CODE_OAUTH_TOKEN —
+# capacity comes from picking a lane, never from rotating the app login.
+#
+# What it hardens:
+#   1. Transient deaths (5xx/overloaded, stream disconnects, connection
+#      refused, 429s): retried with backoff. Hard account limits (session/
+#      weekly/usage) are NOT slept on — with -A the run re-picks a different
+#      lane immediately; pinned (-a) runs fail fast (rc=4) so the orchestrator
+#      can re-dispatch.
+#   2. Auth failures (401 / revoked or expired setup-token): fail fast (rc=5)
+#      with the re-enrollment ritual — retrying cannot help.
+#   3. Evaporating uncommitted work on kill/crash: an EXIT/INT/TERM trap
+#      snapshots any dirty state (tracked + untracked) to refs/claude-salvage/*
+#      via a temp index + commit-tree. HEAD, the current branch, the real
+#      index, and the worktree are never touched. Resume: the worktree is
+#      still dirty, so just keep working. List: git for-each-ref refs/claude-salvage
+#   4. Silent model downgrades: after the run, the transcript's per-message
+#      model field is checked (claude-model). A lane silently served by Opus
+#      (safety-classifier fallback) gets a MODEL-DOWNGRADE warning on stderr
+#      plus a .DOWNGRADED marker next to the output file — judgment/writing
+#      output from a downgraded lane needs re-verification before use.
+#
+# Usage:
+#   claude-lane -a <email> | -A  -C <workdir> -p <prompt_file> -o <out_file> \
+#               [-m <model>] [-s workspace-write|read-only] [-b <salvage_branch>] \
+#               [-R <salvage_remote>] [-r <max_retries>] [-d]
+#
+#   -a  account email (token read from keychain item claude-quota-<email>)
+#   -A  auto-pick the lane via claude-pick; re-picks if the lane hits a limit
+#   -m  model (default claude-fable-5)
+#   -s  workspace-write (default): --dangerously-skip-permissions;
+#       read-only: default permission mode — headless runs auto-deny mutating
+#       tools, so the lane can read/search but not edit or run commands
+#   -b  salvage branch — on any exit, push the salvage snapshot (or HEAD) there
+#   -R  remote for the salvage push; default origin
+#   -r  max retries for transient failures; default 2
+#   -d  detach: re-exec into the background (nohup) and return immediately;
+#       progress goes to <out_file base>.lane.log
+#
+# PUBLIC REPOS: the -b salvage push fires on EVERY exit, including success —
+# content reaches the remote BEFORE any review. When origin is public, either
+# omit -b (the salvage ref still protects local work) or pass -R with a
+# private mirror remote; push to origin yourself after review.
+set -u
+
+ORIG_ARGS=("$@")
+EMAIL="" AUTO=0 MODEL="claude-fable-5" WORKDIR="" PROMPT_FILE="" OUT_FILE=""
+SANDBOX="workspace-write" SALVAGE_BRANCH="" SALVAGE_REMOTE="origin" MAX_RETRIES=2 DETACH=0
+while getopts "a:Am:C:p:o:s:b:R:r:d" opt; do
+  case "$opt" in
+    a) EMAIL=$OPTARG ;;
+    A) AUTO=1 ;;
+    m) MODEL=$OPTARG ;;
+    C) WORKDIR=$OPTARG ;;
+    p) PROMPT_FILE=$OPTARG ;;
+    o) OUT_FILE=$OPTARG ;;
+    s) SANDBOX=$OPTARG ;;
+    b) SALVAGE_BRANCH=$OPTARG ;;
+    R) SALVAGE_REMOTE=$OPTARG ;;
+    r) MAX_RETRIES=$OPTARG ;;
+    d) DETACH=1 ;;
+    *) exit 2 ;;
+  esac
+done
+[ -n "$EMAIL" ] || [ "$AUTO" = 1 ] || { echo "claude-lane: need -a <email> or -A" >&2; exit 2; }
+[ -n "$WORKDIR" ] || { echo "claude-lane: missing -C <workdir>" >&2; exit 2; }
+[ -n "$PROMPT_FILE" ] || { echo "claude-lane: missing -p <prompt_file>" >&2; exit 2; }
+[ -n "$OUT_FILE" ] || { echo "claude-lane: missing -o <out_file>" >&2; exit 2; }
+[ -d "$WORKDIR" ] || { echo "claude-lane: workdir not found: $WORKDIR" >&2; exit 2; }
+[ -f "$PROMPT_FILE" ] || { echo "claude-lane: prompt file not found: $PROMPT_FILE" >&2; exit 2; }
+case "$SANDBOX" in
+  workspace-write|read-only) ;;
+  *) echo "claude-lane: -s must be workspace-write or read-only" >&2; exit 2 ;;
+esac
+command -v jq >/dev/null || { echo "claude-lane: jq required" >&2; exit 2; }
+command -v uuidgen >/dev/null || { echo "claude-lane: uuidgen required" >&2; exit 2; }
+
+# Overridable for tests and stripped launchd environments.
+CLAUDE_BIN=${CLAUDE_LANE_CLAUDE:-claude}
+AGENT_SECRET=${CLAUDE_LANE_AGENT_SECRET:-$HOME/bin/agent-secret}
+CLAUDE_PICK=${CLAUDE_LANE_PICK:-$HOME/bin/claude-pick}
+CLAUDE_MODEL_BIN=${CLAUDE_LANE_CLAUDE_MODEL:-$(dirname "$0")/claude-model}
+[ -x "$CLAUDE_MODEL_BIN" ] || CLAUDE_MODEL_BIN=$(command -v claude-model || true)
+BACKOFF_BASE=${CLAUDE_LANE_BACKOFF:-60}
+
+BASE="${OUT_FILE%.md}"
+ERR_FILE="$BASE.err.log"
+RAW_FILE="$BASE.result.json"
+LANE_LOG="$BASE.lane.log"
+
+if [ "$DETACH" = 1 ] && [ -z "${CLAUDE_LANE_DETACHED:-}" ]; then
+  export CLAUDE_LANE_DETACHED=1
+  nohup "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} </dev/null >>"$LANE_LOG" 2>&1 &
+  pid=$!
+  disown "$pid" 2>/dev/null || true
+  echo "claude-lane: detached pid=$pid · log=$LANE_LOG · out=$OUT_FILE"
+  exit 0
+fi
+
+salvage() {
+  git -C "$WORKDIR" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  local salvage_sha=""
+  if [ -n "$(git -C "$WORKDIR" status --porcelain 2>/dev/null)" ]; then
+    local gitdir tmpidx tree parent branch ts ref
+    gitdir=$(git -C "$WORKDIR" rev-parse --absolute-git-dir 2>/dev/null)
+    parent=$(git -C "$WORKDIR" rev-parse --verify HEAD 2>/dev/null)
+    if [ -n "$gitdir" ] && [ -n "$parent" ]; then
+      tmpidx="$gitdir/claude-salvage-index.$$"
+      # Snapshot into a temp index: never touches HEAD, branch, real index, or worktree.
+      if GIT_INDEX_FILE="$tmpidx" git -C "$WORKDIR" read-tree "$parent" 2>/dev/null \
+         && GIT_INDEX_FILE="$tmpidx" git -C "$WORKDIR" add -A 2>/dev/null; then
+        tree=$(GIT_INDEX_FILE="$tmpidx" git -C "$WORKDIR" write-tree 2>/dev/null)
+        if [ -n "$tree" ]; then
+          salvage_sha=$(git -C "$WORKDIR" commit-tree "$tree" -p "$parent" \
+            -m "WIP salvage: claude-lane auto-commit (lane=${EMAIL:-unpicked} model=$MODEL)" 2>/dev/null)
+        fi
+      fi
+      rm -f "$tmpidx"
+      if [ -n "$salvage_sha" ]; then
+        branch=$(git -C "$WORKDIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)
+        ts=$(date +%Y%m%d-%H%M%S)
+        ref="refs/claude-salvage/${branch//\//-}-$ts-$$"
+        git -C "$WORKDIR" update-ref "$ref" "$salvage_sha" 2>/dev/null \
+          && echo "claude-lane: salvaged dirty state → $ref ($(git -C "$WORKDIR" rev-parse --short "$salvage_sha")); branch/worktree untouched" >&2
+      else
+        echo "claude-lane: WARNING dirty state present but salvage snapshot failed (unborn HEAD?) — worktree left as-is" >&2
+      fi
+    fi
+  fi
+  if [ -n "$SALVAGE_BRANCH" ]; then
+    local push_src="${salvage_sha:-HEAD}"
+    git -C "$WORKDIR" push -qf "$SALVAGE_REMOTE" "$push_src:refs/heads/$SALVAGE_BRANCH" 2>/dev/null \
+      && echo "claude-lane: pushed $push_src → $SALVAGE_REMOTE/$SALVAGE_BRANCH" >&2
+  fi
+}
+trap salvage EXIT
+trap 'salvage; exit 130' INT
+trap 'salvage; exit 143' TERM
+
+pick_lane() {
+  local picked
+  picked=$("$CLAUDE_PICK") || return 1
+  [ -n "$picked" ] || return 1
+  EMAIL=$picked
+}
+
+fetch_token() {
+  TOKEN=$("$AGENT_SECRET" get "claude-quota-$EMAIL" 2>/dev/null)
+  if [ -z "$TOKEN" ]; then
+    echo "claude-lane: no keychain token for $EMAIL (claude-quota-$EMAIL)" >&2
+    echo "claude-lane: enroll (Max-only): claude setup-token   # sign into $EMAIL" >&2
+    echo "claude-lane:                    ai-quota enroll $EMAIL" >&2
+    return 1
+  fi
+}
+
+# The transcript's per-message model field is ground truth for what actually
+# served the lane (a safety-classifier fallback silently swaps in Opus).
+check_model() {
+  if [ -z "$CLAUDE_MODEL_BIN" ] || [ ! -x "$CLAUDE_MODEL_BIN" ]; then
+    echo "claude-lane: claude-model not found — skipping served-model check" >&2
+    return 0
+  fi
+  local report latest
+  report=$( (cd "$WORKDIR" && "$CLAUDE_MODEL_BIN" -n 10 "$SID") 2>&1 )
+  latest=$(printf '%s\n' "$report" | sed -n 's/^latest: //p' | tail -1)
+  if [ -z "$latest" ]; then
+    echo "claude-lane: served-model check inconclusive (no transcript for session $SID?)" >&2
+    return 0
+  fi
+  case "$latest" in
+    "$MODEL"|*"$MODEL"*)
+      echo "claude-lane: served by $latest (as requested)" >&2 ;;
+    *)
+      {
+        echo "claude-lane: MODEL-DOWNGRADE — lane served $latest, requested $MODEL (safety-classifier fallback)."
+        echo "claude-lane: treat judgment/writing output as unverified; re-run, or route substantive work to a non-Claude reviewer per the downgrade protocol."
+        printf '%s\n' "$report"
+      } | tee "$BASE.DOWNGRADED" >&2 ;;
+  esac
+}
+
+if [ "$AUTO" = 1 ] && [ -z "$EMAIL" ]; then
+  pick_lane || { echo "claude-lane: no dispatchable lane" >&2; exit 1; }
+fi
+fetch_token || exit 2
+
+attempt=0
+while :; do
+  attempt=$((attempt + 1))
+  SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  : > "$OUT_FILE"
+  : > "$RAW_FILE"
+  PERM_ARGS=()
+  [ "$SANDBOX" = "workspace-write" ] && PERM_ARGS=(--dangerously-skip-permissions)
+  (
+    cd "$WORKDIR" || exit 97
+    # Lanes bill the subscription via the pinned OAuth token — never the API meter.
+    unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+    CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" exec "$CLAUDE_BIN" -p --model "$MODEL" \
+      --session-id "$SID" --output-format json ${PERM_ARGS[@]+"${PERM_ARGS[@]}"}
+  ) <"$PROMPT_FILE" >"$RAW_FILE" 2>"$ERR_FILE"
+  rc=$?
+
+  if [ $rc -eq 0 ] && [ -s "$RAW_FILE" ] && [ "$(jq -r \
+      'if type=="object" and .is_error==false and (.result|type=="string" and length>0) then "ok" else "bad" end' \
+      "$RAW_FILE" 2>/dev/null)" = "ok" ]; then
+    jq -r '.result' "$RAW_FILE" > "$OUT_FILE"
+    if [ -s "$OUT_FILE" ]; then
+      echo "claude-lane: OK lane=$EMAIL model=$MODEL attempt=$attempt bytes=$(wc -c <"$OUT_FILE" | tr -d ' ') session=$SID"
+      check_model
+      exit 0
+    fi
+  fi
+
+  ERRTXT=("$ERR_FILE")
+  [ -s "$RAW_FILE" ] && ERRTXT=("$ERR_FILE" "$RAW_FILE")
+  if grep -qiE "401|unauthoriz|authentication_error|oauth token|token.*(revoked|expired)|invalid.*api.?key" \
+      ${ERRTXT[@]+"${ERRTXT[@]}"}; then
+    echo "claude-lane: AUTH FAILURE on lane $EMAIL — the setup-token is dead; retrying cannot help." >&2
+    echo "claude-lane: re-enroll (Max-only): claude setup-token   # sign into $EMAIL" >&2
+    echo "claude-lane:                      ai-quota enroll $EMAIL" >&2
+    exit 5
+  fi
+  if grep -qiE "usage limit|session limit|weekly limit|5-hour limit|limit reached|out of extra usage" \
+      ${ERRTXT[@]+"${ERRTXT[@]}"}; then
+    if [ "$AUTO" = 1 ] && [ $attempt -le $MAX_RETRIES ]; then
+      OLD_EMAIL=$EMAIL
+      echo "claude-lane: lane $OLD_EMAIL hit a hard limit; re-picking (attempt $attempt/$MAX_RETRIES)" >&2
+      if pick_lane && [ "$EMAIL" != "$OLD_EMAIL" ] && fetch_token; then
+        continue
+      fi
+      echo "claude-lane: no alternate lane available" >&2
+    fi
+    echo "claude-lane: LANE LIMITED (rc=$rc) — re-dispatch on another lane (claude-lane -A) or wait for the reset (claude-pick --json --all)." >&2
+    exit 4
+  fi
+  if [ $attempt -le $MAX_RETRIES ] && grep -qiE \
+      "rate limit|too many requests|429|overloaded|capacity|disconnect|connection|ECONN|ETIMEDOUT|timed? ?out|temporarily|internal server error|50[023]|529" \
+      ${ERRTXT[@]+"${ERRTXT[@]}"}; then
+    wait_s=$((BACKOFF_BASE * attempt))
+    echo "claude-lane: transient failure (rc=$rc), retry $attempt/$MAX_RETRIES in ${wait_s}s: $(grep -m1 -ioE 'rate limit|too many requests|429|overloaded|capacity|disconnect|connection[a-z ]*|ECONN[A-Z]*|ETIMEDOUT|timed? ?out|temporarily|internal server error|50[023]|529' ${ERRTXT[@]+"${ERRTXT[@]}"} | head -1)" >&2
+    sleep "$wait_s"
+    continue
+  fi
+  echo "claude-lane: FAILED rc=$rc attempt=$attempt lane=$EMAIL (out_bytes=$(wc -c <"$OUT_FILE" | tr -d ' ')); stderr tail:" >&2
+  tail -3 "$ERR_FILE" >&2
+  [ -s "$RAW_FILE" ] && jq -r '.result // empty' "$RAW_FILE" 2>/dev/null | tail -2 >&2
+  [ "$rc" -eq 0 ] && rc=1  # rc=0 with a bad/empty envelope is still a failure
+  exit "$rc"
+done

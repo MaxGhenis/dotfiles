@@ -4,6 +4,7 @@ Config and scripts for my development machine. The interesting part is `bin/`:
 
 | Script | What it does |
 |--------|--------------|
+| [`claude-lane`](bin/claude-lane) | Hardened headless Claude Code dispatch pinned to an enrolled account "lane" via `CLAUDE_CODE_OAUTH_TOKEN` — retries transient failures, re-picks a lane on hard limits, salvages work on crash, and flags silent model downgrades. Documented below. |
 | [`claude-model`](bin/claude-model) | Which model is *actually* serving a Claude Code session — reads the transcript's per-message model field; `-e <model>` exits 1 on a silent downgrade. See [docs/model-self-knowledge.md](docs/model-self-knowledge.md). |
 | [`codex-run`](bin/codex-run) | Hardened `codex exec` dispatch — retries transient failures, salvages work on crash, unbreaks git in sandboxed worktrees. Documented below. |
 | [`cc`](bin/cc) | Claude Code pane launcher (superseded by [tmux-claude-code](https://github.com/MaxGhenis/tmux-claude-code)) |
@@ -60,7 +61,7 @@ codex-run -H ~/.codex -m gpt-5.6-terra -C ~/src/public-repo \
 
 2. **Transient deaths.** Model-at-capacity, 401s from token rotation, rate limits, disconnects, and timeouts are retried with linear backoff (60s × attempt, up to `-r` retries). **Content-filter refusals are not retried** — they fail fast with exit code 3, because a refusal is a framing problem, not an availability problem. Rewrite the prompt defensively (frame reviews as correctness/completeness audits, not construct-the-exploit exercises) and re-dispatch.
 
-3. **Evaporating uncommitted work.** An EXIT/INT/TERM trap auto-commits any dirty state in the workdir (`WIP salvage: codex-run auto-commit`), and with `-b` force-pushes HEAD to the salvage branch. A killed or crashed run costs minutes to recover from, not the workstream.
+3. **Evaporating uncommitted work.** An EXIT/INT/TERM trap snapshots any dirty state (tracked + untracked) to `refs/codex-salvage/*` via a temp index and `commit-tree` — HEAD, the current branch, the real index, and the worktree are never touched, so a kill can't advance a shared checkout onto WIP. With `-b`, the snapshot (or HEAD) is force-pushed to the salvage branch. Resume by just continuing (the worktree is still dirty); list snapshots with `git for-each-ref refs/codex-salvage`.
 
 ### Exit codes
 
@@ -82,4 +83,51 @@ The `-b` salvage push fires on **every** exit — including success. With a publ
 - **Omit `-b`.** The salvage *commit* still protects local work; nothing is pushed.
 - **Pass `-R <private-mirror-remote>`.** Salvage pushes go to the private mirror; push to the public origin yourself after the review gate.
 
-Also note the salvage push is a force-push (`push -f HEAD:<branch>`) — use a dedicated `salvage/*` branch name, never a branch anything else depends on.
+Also note the salvage push is a force-push — use a dedicated `salvage/*` branch name, never a branch anything else depends on.
+
+## claude-lane
+
+The Claude-side analog of `codex-run` + `codex-pick`: dispatch a long headless `claude -p` run pinned to an enrolled account **lane** instead of whatever account the desktop app is logged into. Each lane is an OAuth token minted by `claude setup-token` and stored in the keychain (`ai-quota enroll <email>` — see the ai-quota repo); the wrapper injects it via `CLAUDE_CODE_OAUTH_TOKEN`, so capacity comes from picking a lane, never from rotating logins.
+
+### Usage
+
+```bash
+claude-lane -a <email> | -A  -C <workdir> -p <prompt_file> -o <out_file> \
+            [-m <model>] [-s workspace-write|read-only] [-b <salvage_branch>] \
+            [-R <salvage_remote>] [-r <max_retries>] [-d]
+```
+
+| Flag | Required | Meaning |
+|------|----------|---------|
+| `-a` | one of `-a`/`-A` | Lane account email (token read from keychain item `claude-quota-<email>`) |
+| `-A` | one of `-a`/`-A` | Auto-pick the best lane via `claude-pick`; re-picks if the lane hits a hard limit mid-run |
+| `-m` | no | Model; default `claude-fable-5` |
+| `-C` | yes | Working directory (repo or worktree) |
+| `-p` | yes | Prompt file — streamed to `claude -p` on stdin |
+| `-o` | yes | Output file — the run's final result text |
+| `-s` | no | `workspace-write` (default; runs with `--dangerously-skip-permissions`) or `read-only` (default permission mode: headless runs auto-deny mutating tools) |
+| `-b` | no | Salvage branch — on any exit, push the salvage snapshot (or HEAD) there (same public-repo caveat as codex-run) |
+| `-R` | no | Remote for the salvage push; default `origin` |
+| `-r` | no | Max retries for transient failures; default 2 |
+| `-d` | no | Detach: re-exec into the background and return immediately; progress in `<out base>.lane.log` |
+
+### Failure handling
+
+- **Transient** (5xx, overloaded, disconnects, 429s): retried with linear backoff.
+- **Hard account limits** (session/weekly/usage): never slept on — `-A` re-picks a different lane immediately; pinned runs exit 4 so the orchestrator can re-dispatch.
+- **Auth failures** (expired/revoked setup-token): exit 5 fast with the re-enrollment ritual — retrying cannot help.
+- **Crash/kill**: same `refs/claude-salvage/*` snapshot mechanism as codex-run — HEAD, branch, index, and worktree untouched.
+- **Silent model downgrades**: after each successful run, the transcript's per-message model field is checked with `claude-model`; a lane silently served by a different model (safety-classifier fallback) gets a loud `MODEL-DOWNGRADE` warning on stderr and a `.DOWNGRADED` marker next to the output file.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success: non-empty result extracted (a `.DOWNGRADED` marker may still demand re-verification) |
+| 1 | No dispatchable lane (`-A`), or unclassified failure with rc 0 |
+| 2 | Usage error / missing keychain token |
+| 4 | Lane hit a hard account limit |
+| 5 | Lane auth is dead — re-enroll |
+| other | `claude`'s own exit code after retries were exhausted |
+
+Diagnostics next to the output file: `.err.log` (stderr), `.result.json` (raw envelope), `.lane.log` (detached-run log).
