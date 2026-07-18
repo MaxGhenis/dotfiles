@@ -10,7 +10,13 @@
 #      stream disconnects): retried with backoff. Content-filter blocks are
 #      NOT retried — they need a defensive prompt rewrite, so fail fast.
 #   3. Evaporating uncommitted work on kill/crash: an EXIT/INT/TERM trap
-#      commits any dirty state and (with -b) pushes HEAD to a salvage branch.
+#      snapshots any dirty state (tracked + untracked) to refs/codex-salvage/*
+#      via a temp index + commit-tree. HEAD, the current branch, the real
+#      index, and the worktree are never touched — a kill can no longer
+#      advance a shared checkout's main onto WIP (bit us twice on 2026-07-12).
+#      Resume: the worktree is still dirty, so just keep working; if it got
+#      cleaned, `git stash apply <salvage-sha>` or cherry-pick the ref.
+#      List snapshots: git for-each-ref refs/codex-salvage
 #
 # Usage:
 #   codex-run -H <codex_home> -m <model> -C <workdir> -p <prompt_file> -o <out_file> \
@@ -19,7 +25,7 @@
 #
 # PUBLIC REPOS: the -b salvage push fires on EVERY exit, including success —
 # content reaches the remote BEFORE any review. When origin is public, either
-# omit -b (the salvage COMMIT still protects local work) or pass -R with a
+# omit -b (the salvage ref still protects local work) or pass -R with a
 # private mirror remote; push to origin yourself after review.
 set -u
 
@@ -47,14 +53,38 @@ ERR_FILE="${OUT_FILE%.md}.err.log"
 
 salvage() {
   git -C "$WORKDIR" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  local salvage_sha=""
   if [ -n "$(git -C "$WORKDIR" status --porcelain 2>/dev/null)" ]; then
-    git -C "$WORKDIR" add -A
-    git -C "$WORKDIR" commit -q -m "WIP salvage: codex-run auto-commit (model=$MODEL)" \
-      && echo "codex-run: salvaged dirty state → $(git -C "$WORKDIR" rev-parse --short HEAD)" >&2
+    local gitdir tmpidx tree parent branch ts ref
+    gitdir=$(git -C "$WORKDIR" rev-parse --absolute-git-dir 2>/dev/null)
+    parent=$(git -C "$WORKDIR" rev-parse --verify HEAD 2>/dev/null)
+    if [ -n "$gitdir" ] && [ -n "$parent" ]; then
+      tmpidx="$gitdir/codex-salvage-index.$$"
+      # Snapshot into a temp index: never touches HEAD, branch, real index, or worktree.
+      if GIT_INDEX_FILE="$tmpidx" git -C "$WORKDIR" read-tree "$parent" 2>/dev/null \
+         && GIT_INDEX_FILE="$tmpidx" git -C "$WORKDIR" add -A 2>/dev/null; then
+        tree=$(GIT_INDEX_FILE="$tmpidx" git -C "$WORKDIR" write-tree 2>/dev/null)
+        if [ -n "$tree" ]; then
+          salvage_sha=$(git -C "$WORKDIR" commit-tree "$tree" -p "$parent" \
+            -m "WIP salvage: codex-run auto-commit (model=$MODEL)" 2>/dev/null)
+        fi
+      fi
+      rm -f "$tmpidx"
+      if [ -n "$salvage_sha" ]; then
+        branch=$(git -C "$WORKDIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)
+        ts=$(date +%Y%m%d-%H%M%S)
+        ref="refs/codex-salvage/${branch//\//-}-$ts-$$"
+        git -C "$WORKDIR" update-ref "$ref" "$salvage_sha" 2>/dev/null \
+          && echo "codex-run: salvaged dirty state → $ref ($(git -C "$WORKDIR" rev-parse --short "$salvage_sha")); branch/worktree untouched" >&2
+      else
+        echo "codex-run: WARNING dirty state present but salvage snapshot failed (unborn HEAD?) — worktree left as-is" >&2
+      fi
+    fi
   fi
   if [ -n "$SALVAGE_BRANCH" ]; then
-    git -C "$WORKDIR" push -qf "$SALVAGE_REMOTE" "HEAD:$SALVAGE_BRANCH" 2>/dev/null \
-      && echo "codex-run: pushed HEAD → $SALVAGE_REMOTE/$SALVAGE_BRANCH" >&2
+    local push_src="${salvage_sha:-HEAD}"
+    git -C "$WORKDIR" push -qf "$SALVAGE_REMOTE" "$push_src:refs/heads/$SALVAGE_BRANCH" 2>/dev/null \
+      && echo "codex-run: pushed $push_src → $SALVAGE_REMOTE/$SALVAGE_BRANCH" >&2
   fi
 }
 trap salvage EXIT
