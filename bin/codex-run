@@ -29,9 +29,9 @@
 # private mirror remote; push to origin yourself after review.
 set -u
 
-CODEX_HOME_ARG="" MODEL="" WORKDIR="" PROMPT_FILE="" OUT_FILE=""
+CODEX_HOME_ARG="" MODEL="" WORKDIR="" PROMPT_FILE="" OUT_FILE="" EFFORT=""
 SANDBOX="workspace-write" SALVAGE_BRANCH="" SALVAGE_REMOTE="origin" MAX_RETRIES=2
-while getopts "H:m:C:p:o:s:b:R:r:" opt; do
+while getopts "H:m:C:p:o:s:b:R:r:e:" opt; do
   case "$opt" in
     H) CODEX_HOME_ARG=$OPTARG ;;
     m) MODEL=$OPTARG ;;
@@ -42,6 +42,7 @@ while getopts "H:m:C:p:o:s:b:R:r:" opt; do
     b) SALVAGE_BRANCH=$OPTARG ;;
     R) SALVAGE_REMOTE=$OPTARG ;;
     r) MAX_RETRIES=$OPTARG ;;
+    e) EFFORT=$OPTARG ;;
     *) exit 2 ;;
   esac
 done
@@ -93,6 +94,7 @@ trap 'salvage; exit 143' TERM
 
 # Sandbox-safe git: expose the worktree's git common dir when writing.
 EXTRA_CFG=()
+[ -n "$EFFORT" ] && EXTRA_CFG+=(-c "model_reasoning_effort=\"$EFFORT\"")
 if [ "$SANDBOX" = "workspace-write" ]; then
   COMMON_DIR=$(git -C "$WORKDIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
   [ -n "$COMMON_DIR" ] && EXTRA_CFG=(-c "sandbox_workspace_write.writable_roots=[\"$COMMON_DIR\"]")
