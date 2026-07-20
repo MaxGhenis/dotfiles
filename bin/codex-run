@@ -97,7 +97,7 @@ EXTRA_CFG=()
 [ -n "$EFFORT" ] && EXTRA_CFG+=(-c "model_reasoning_effort=\"$EFFORT\"")
 if [ "$SANDBOX" = "workspace-write" ]; then
   COMMON_DIR=$(git -C "$WORKDIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-  [ -n "$COMMON_DIR" ] && EXTRA_CFG=(-c "sandbox_workspace_write.writable_roots=[\"$COMMON_DIR\"]")
+  [ -n "$COMMON_DIR" ] && EXTRA_CFG+=(-c "sandbox_workspace_write.writable_roots=[\"$COMMON_DIR\"]")
 fi
 
 attempt=0
