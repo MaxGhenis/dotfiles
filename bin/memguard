@@ -13,8 +13,13 @@ Policy (deliberately narrow):
   - Auto-kill targets: processes owned by $USER whose command contains
     "python", RSS >= 20GB. Nothing else is ever signaled — a giant Chrome or
     Claude process only triggers a notification.
-  - Critical = (pressure level >= 4 and free < 8GB) or free < 1.5GB,
-    sustained for 2 consecutive ticks (~40s at the 20s launchd interval).
+  - Critical = kernel pressure level >= 4, OR reclaimable-aware free
+    (memory_pressure -Q) <= 8%, OR swap-backed thrash (free% <= 20 and
+    swap > 4GB and raw free < 1.5GB) — sustained for 2 consecutive ticks.
+    Raw vm_stat free pages are telemetry only: on macOS they legitimately
+    approach zero under heavy file IO while inactive pages stay reclaimable
+    (memguard v1 mis-killed the dense build on exactly that, 2026-07-29
+    20:28, rc=143 — level was 1 and free% was 91 the whole time).
   - TERM first; if the same pid survives 25s+ and we're still critical, KILL.
   - 60s cooldown between distinct kills; warn-level events notify at most
     every 30 min.
@@ -43,9 +48,11 @@ KILL_LOG = os.path.join(HOME, "Library", "Logs", "memguard-kills.log")
 
 GB = 1024 ** 3
 MIN_TARGET_RSS = 20 * GB          # never signal anything smaller
-FREE_HARD = 1.5 * GB              # critical regardless of pressure level
-FREE_SOFT = 8 * GB                # level-4 pressure only counts if free < this
-FREE_WARN = 6 * GB
+FREE_PCT_CRIT = 8                 # memory_pressure -Q free percentage
+FREE_PCT_WARN = 15
+THRASH_FREE_PCT = 20              # swap-thrash clause gates
+THRASH_SWAP_GB = 4
+THRASH_RAW_FREE = 1.5 * GB
 STRIKES_TO_ACT = 2
 KILL_COOLDOWN_S = 60              # between distinct victims
 ESCALATE_AFTER_S = 25             # TERM -> KILL if still alive and critical
@@ -88,6 +95,34 @@ def pressure_level():
         return int(out.stdout.strip())
     except Exception:
         return -1
+
+
+def free_percentage():
+    """System-wide free percentage from memory_pressure -Q.
+
+    Counts reclaimable (inactive/purgeable) memory as free — the kernel's
+    own view of headroom, unlike vm_stat's raw free-page count.
+    """
+    try:
+        out = subprocess.run(["/usr/bin/memory_pressure", "-Q"],
+                             capture_output=True, text=True, timeout=5)
+        m = re.search(r"free percentage:\s*(\d+)", out.stdout)
+        return int(m.group(1)) if m else -1
+    except Exception:
+        return -1
+
+
+def classify(level, free_pct, raw_free, swap_gb):
+    """Return (critical, warn). Pure so tests can pin the 7/29 profiles."""
+    critical = (
+        level >= 4
+        or (0 <= free_pct <= FREE_PCT_CRIT)
+        or (0 <= free_pct <= THRASH_FREE_PCT
+            and swap_gb > THRASH_SWAP_GB
+            and 0 <= raw_free < THRASH_RAW_FREE)
+    )
+    warn = level >= 2 or (0 <= free_pct <= FREE_PCT_WARN)
+    return critical, warn
 
 
 def parse_vm_stat(text):
@@ -240,9 +275,9 @@ def tick(dry=False):
     vm = vm_stat()
     free, comp = vm["free"], vm["compressor"]
     swap = swap_used_gb()
+    free_pct = free_percentage()
 
-    critical = (level >= 4 and free < FREE_SOFT) or (0 <= free < FREE_HARD)
-    warn = level >= 2 or (0 <= free < FREE_WARN)
+    critical, warn = classify(level, free_pct, free, swap)
 
     strikes = read_state("strikes.json", {"n": 0})["n"]
     strikes = strikes + 1 if critical else 0
@@ -282,8 +317,8 @@ def tick(dry=False):
         notify("Memory pressure warning: level {}, free {:.1f}GB"
                .format(level, free / GB))
 
-    line = "{},{},{:.2f},{:.2f},{:.2f},{},{},{},{}\n".format(
-        now_iso(), level, free / GB, comp / GB, swap,
+    line = "{},{},{},{:.2f},{:.2f},{:.2f},{},{},{},{}\n".format(
+        now_iso(), level, free_pct, free / GB, comp / GB, swap,
         strikes, int(critical), int(warn), action or "-")
     if dry:
         sys.stdout.write("DRY " + line)
@@ -319,8 +354,10 @@ def status():
 
 def test():
     failures = []
+    total = [0]
 
     def check(name, cond):
+        total[0] += 1
         print(("PASS" if cond else "FAIL"), name)
         if not cond:
             failures.append(name)
@@ -346,6 +383,20 @@ def test():
     check("vm_stat parse", vm["free"] == 100000 * 16384
           and vm["compressor"] == 50000 * 16384)
 
+    # Pin the two real 2026-07-29 profiles: the evening h5 cache-fill that
+    # v1 mis-killed (rc=143) must stay quiet; the morning thrash must fire.
+    c, w = classify(1, 91, int(0.06 * GB), 0.0)
+    check("evening cache-fill (level 1, free% 91, raw 60MB) is quiet",
+          not c and not w)
+    c, _ = classify(4, 5, int(0.05 * GB), 9.0)
+    check("morning thrash via level 4 is critical", c)
+    c, _ = classify(1, 3, int(0.05 * GB), 0.0)
+    check("free% collapse alone is critical", c)
+    c, _ = classify(1, 18, int(1.0 * GB), 8.0)
+    check("swap-thrash clause is critical", c)
+    c, w = classify(1, 12, 30 * GB, 0.0)
+    check("free% 12 warns without killing", (not c) and w)
+
     child = subprocess.Popen([sys.executable, "-c",
                               "import time; time.sleep(60)"])
     send_signal(child.pid, "SIGTERM", 0, "(self-test child)", dry=False)
@@ -357,9 +408,10 @@ def test():
         check("live SIGTERM path terminates child", False)
 
     dry_line = tick(dry=True)
-    check("dry tick produces csv", dry_line.count(",") == 8)
+    check("dry tick produces csv", dry_line.count(",") == 9)
 
-    print("{} passed, {} failed".format(6 - len(failures), len(failures)))
+    print("{} passed, {} failed".format(total[0] - len(failures),
+                                        len(failures)))
     return 1 if failures else 0
 
 
