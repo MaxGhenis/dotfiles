@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""memguard — keep runaway sim processes from panicking the machine.
+
+Context: 2026-07-29, two kernel watchdog panics ("no checkins from watchdogd")
+after local sim pythons exhausted the 128GB box (jetsam showed 100-430GB
+footprints). Jetsam reports don't record argv, so blowouts weren't even
+attributable. This agent samples memory every tick (launchd StartInterval),
+and when the box goes critical it SIGTERMs the largest python-family process
+— recording its full argv first — escalating to SIGKILL if it lingers.
+A dead sim beats a dead machine.
+
+Policy (deliberately narrow):
+  - Auto-kill targets: processes owned by $USER whose command contains
+    "python", RSS >= 20GB. Nothing else is ever signaled — a giant Chrome or
+    Claude process only triggers a notification.
+  - Critical = (pressure level >= 4 and free < 8GB) or free < 1.5GB,
+    sustained for 2 consecutive ticks (~40s at the 20s launchd interval).
+  - TERM first; if the same pid survives 25s+ and we're still critical, KILL.
+  - 60s cooldown between distinct kills; warn-level events notify at most
+    every 30 min.
+
+Files:
+  ~/Library/Logs/memguard.log        CSV, one line per tick (self-trimming)
+  ~/Library/Logs/memguard-kills.log  JSON lines, one per signal sent, with argv
+  ~/.local/state/memguard/           strike counter / last-action / rate limits
+
+Usage: memguard tick [--dry-run] | status | test
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+USER = os.environ.get("USER", "maxghenis")
+STATE_DIR = os.path.join(HOME, ".local", "state", "memguard")
+LOG = os.path.join(HOME, "Library", "Logs", "memguard.log")
+KILL_LOG = os.path.join(HOME, "Library", "Logs", "memguard-kills.log")
+
+GB = 1024 ** 3
+MIN_TARGET_RSS = 20 * GB          # never signal anything smaller
+FREE_HARD = 1.5 * GB              # critical regardless of pressure level
+FREE_SOFT = 8 * GB                # level-4 pressure only counts if free < this
+FREE_WARN = 6 * GB
+STRIKES_TO_ACT = 2
+KILL_COOLDOWN_S = 60              # between distinct victims
+ESCALATE_AFTER_S = 25             # TERM -> KILL if still alive and critical
+WARN_NOTIFY_EVERY_S = 30 * 60
+NOCAND_NOTIFY_EVERY_S = 10 * 60
+LOG_MAX_BYTES = 8 * 1024 * 1024
+DENY_PREFIXES = ("claude", "windowserver", "loginwindow", "launchd",
+                 "kernel_task", "finder", "dock")
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def read_state(name, default):
+    try:
+        with open(os.path.join(STATE_DIR, name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_state(name, value):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, name)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(value, f)
+    os.replace(tmp, path)
+
+
+# --- sampling -----------------------------------------------------------
+
+def pressure_level():
+    """kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical."""
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True, text=True, timeout=5)
+        return int(out.stdout.strip())
+    except Exception:
+        return -1
+
+
+def parse_vm_stat(text):
+    page_size = 16384
+    m = re.search(r"page size of (\d+)", text)
+    if m:
+        page_size = int(m.group(1))
+    stats = {}
+    for key, label in (("free", "Pages free"),
+                       ("compressor", "Pages occupied by compressor")):
+        m = re.search(re.escape(label) + r":\s+(\d+)", text)
+        stats[key] = int(m.group(1)) * page_size if m else -1
+    return stats
+
+
+def vm_stat():
+    out = subprocess.run(["/usr/bin/vm_stat"], capture_output=True,
+                         text=True, timeout=5)
+    return parse_vm_stat(out.stdout)
+
+
+def swap_used_gb():
+    try:
+        out = subprocess.run(["/usr/sbin/sysctl", "-n", "vm.swapusage"],
+                             capture_output=True, text=True, timeout=5)
+        m = re.search(r"used = ([\d.]+)M", out.stdout)
+        return float(m.group(1)) / 1024 if m else -1.0
+    except Exception:
+        return -1.0
+
+
+def ps_rows():
+    out = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,user=,rss=,comm=,args="],
+        capture_output=True, text=True, timeout=10)
+    return out.stdout.splitlines()
+
+
+def parse_ps(lines):
+    """Yield dicts from `ps -axo pid=,user=,rss=,comm=,args=` lines."""
+    rows = []
+    for line in lines:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid_s, user, rss_kb_s, rest = parts
+        try:
+            pid, rss = int(pid_s), int(rss_kb_s) * 1024
+        except ValueError:
+            continue
+        # comm may contain spaces; args echoes comm as its first token(s).
+        # Splitting rest on comm is unreliable, so keep rest as comm+args.
+        rows.append({"pid": pid, "user": user, "rss": rss, "cmd": rest})
+    return rows
+
+
+def pick_target(rows, min_rss=MIN_TARGET_RSS, user=USER):
+    """Largest python-family process owned by user at/above the RSS floor.
+
+    Returns (target, giants): giants = non-python processes over the floor,
+    reported but never signaled.
+    """
+    target, giants = None, []
+    me = os.getpid()
+    for r in rows:
+        if r["user"] != user or r["rss"] < min_rss or r["pid"] in (me, 1):
+            continue
+        base = os.path.basename(r["cmd"].split()[0]).lower()
+        if any(base.startswith(p) for p in DENY_PREFIXES):
+            continue
+        if "python" in r["cmd"].split()[0].lower() or base.startswith("python"):
+            if target is None or r["rss"] > target["rss"]:
+                target = r
+        else:
+            giants.append(r)
+    return target, giants
+
+
+# --- actions ------------------------------------------------------------
+
+def notify(msg, dry=False):
+    if dry:
+        return
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-e",
+             'display notification "{}" with title "memguard" sound name '
+             '"Sosumi"'.format(msg.replace('"', "'"))],
+            capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def log_kill(entry):
+    with open(KILL_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def send_signal(pid, sig, rss, cmd, dry=False):
+    entry = {"ts": now_iso(), "pid": pid, "sig": sig,
+             "rss_gb": round(rss / GB, 2), "cmd": cmd, "dry_run": dry}
+    if not dry:
+        try:
+            os.kill(pid, getattr(signal, sig))
+        except ProcessLookupError:
+            entry["result"] = "already-gone"
+        except PermissionError:
+            entry["result"] = "eperm"
+        log_kill(entry)
+        write_state("last_action.json",
+                    {"pid": pid, "ts": time.time(), "sig": sig})
+    return entry
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def trim_log():
+    try:
+        if os.path.getsize(LOG) > LOG_MAX_BYTES:
+            with open(LOG) as f:
+                tail = f.readlines()[-4000:]
+            tmp = LOG + ".tmp"
+            with open(tmp, "w") as f:
+                f.writelines(tail)
+            os.replace(tmp, LOG)
+    except OSError:
+        pass
+
+
+def rate_limited(name, every_s):
+    last = read_state(name, {"ts": 0}).get("ts", 0)
+    if time.time() - last < every_s:
+        return True
+    write_state(name, {"ts": time.time()})
+    return False
+
+
+# --- tick ---------------------------------------------------------------
+
+def tick(dry=False):
+    level = pressure_level()
+    vm = vm_stat()
+    free, comp = vm["free"], vm["compressor"]
+    swap = swap_used_gb()
+
+    critical = (level >= 4 and free < FREE_SOFT) or (0 <= free < FREE_HARD)
+    warn = level >= 2 or (0 <= free < FREE_WARN)
+
+    strikes = read_state("strikes.json", {"n": 0})["n"]
+    strikes = strikes + 1 if critical else 0
+    if not dry:
+        write_state("strikes.json", {"n": strikes})
+
+    action = ""
+    target, giants = (None, [])
+    if critical and strikes >= STRIKES_TO_ACT:
+        target, giants = pick_target(parse_ps(ps_rows()))
+        last = read_state("last_action.json", {})
+        age = time.time() - last.get("ts", 0)
+        if (last.get("sig") == "SIGTERM" and pid_alive(last.get("pid", -1))
+                and ESCALATE_AFTER_S <= age <= 300):
+            e = send_signal(last["pid"], "SIGKILL", 0, "(escalation)", dry)
+            action = "SIGKILL:{}".format(last["pid"])
+            notify("Escalated to SIGKILL pid {} — memory still critical"
+                   .format(last["pid"]), dry)
+        elif target and (not last or age >= KILL_COOLDOWN_S):
+            send_signal(target["pid"], "SIGTERM", target["rss"],
+                        target["cmd"], dry)
+            action = "SIGTERM:{}".format(target["pid"])
+            notify("Memory critical (free {:.1f}GB): SIGTERM pid {} "
+                   "({:.0f}GB python). argv in memguard-kills.log".format(
+                       free / GB, target["pid"], target["rss"] / GB), dry)
+        elif not target:
+            action = "no-candidate"
+            if not dry and not rate_limited("nocand.json",
+                                            NOCAND_NOTIFY_EVERY_S):
+                extra = ("; biggest non-python: pid {} {:.0f}GB".format(
+                    giants[0]["pid"], giants[0]["rss"] / GB)
+                    if giants else "")
+                notify("Memory CRITICAL but no python >=20GB to kill"
+                       + extra)
+    elif warn and not dry and not rate_limited("warn.json",
+                                               WARN_NOTIFY_EVERY_S):
+        notify("Memory pressure warning: level {}, free {:.1f}GB"
+               .format(level, free / GB))
+
+    line = "{},{},{:.2f},{:.2f},{:.2f},{},{},{},{}\n".format(
+        now_iso(), level, free / GB, comp / GB, swap,
+        strikes, int(critical), int(warn), action or "-")
+    if dry:
+        sys.stdout.write("DRY " + line)
+    else:
+        with open(LOG, "a") as f:
+            f.write(line)
+        trim_log()
+    return line
+
+
+def status():
+    print("state dir:", STATE_DIR)
+    for name in ("strikes.json", "last_action.json"):
+        print(" ", name, read_state(name, {}))
+    try:
+        with open(LOG) as f:
+            lines = f.readlines()
+        print("last 5 ticks (ts,level,free_gb,comp_gb,swap_gb,strikes,"
+              "crit,warn,action):")
+        for line in lines[-5:]:
+            print(" ", line.rstrip())
+    except OSError:
+        print("no tick log yet at", LOG)
+    if os.path.exists(KILL_LOG):
+        with open(KILL_LOG) as f:
+            kills = f.readlines()
+        print("kills recorded:", len(kills))
+        for line in kills[-3:]:
+            print(" ", line.rstrip())
+
+
+# --- self-tests ---------------------------------------------------------
+
+def test():
+    failures = []
+
+    def check(name, cond):
+        print(("PASS" if cond else "FAIL"), name)
+        if not cond:
+            failures.append(name)
+
+    rows = parse_ps([
+        "  101 maxghenis  31457280 /opt/python3.14 /opt/python3.14 sim.py --big",
+        "  102 maxghenis  52428800 /usr/bin/python3.13 /usr/bin/python3.13 dense.py",
+        "  103 maxghenis  62914560 /Applications/Claude.app/Contents/MacOS/Claude /Applications/Claude.app/Contents/MacOS/Claude",
+        "  104 maxghenis  73400320 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome /Applications/Google Chrome.app -flag",
+        "  105 root       94371840 /opt/python3.14 /opt/python3.14 rootsim.py",
+        "  106 maxghenis      1024 /usr/bin/python3 /usr/bin/python3 tiny.py",
+    ])
+    target, giants = pick_target(rows)
+    check("picks largest owned python over floor (pid 102)",
+          target is not None and target["pid"] == 102)
+    check("never targets Claude/Chrome", all(g["pid"] == 104 for g in giants))
+    check("ignores root-owned and small pythons",
+          target["pid"] not in (105, 106))
+
+    vm = parse_vm_stat("Mach Virtual Memory Statistics: (page size of 16384 "
+                       "bytes)\nPages free: 100000.\n"
+                       "Pages occupied by compressor: 50000.\n")
+    check("vm_stat parse", vm["free"] == 100000 * 16384
+          and vm["compressor"] == 50000 * 16384)
+
+    child = subprocess.Popen([sys.executable, "-c",
+                              "import time; time.sleep(60)"])
+    send_signal(child.pid, "SIGTERM", 0, "(self-test child)", dry=False)
+    try:
+        rc = child.wait(timeout=5)
+        check("live SIGTERM path terminates child", rc == -signal.SIGTERM)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        check("live SIGTERM path terminates child", False)
+
+    dry_line = tick(dry=True)
+    check("dry tick produces csv", dry_line.count(",") == 8)
+
+    print("{} passed, {} failed".format(6 - len(failures), len(failures)))
+    return 1 if failures else 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd = args[0]
+    if cmd == "tick":
+        tick(dry="--dry-run" in args)
+        return 0
+    if cmd == "status":
+        status()
+        return 0
+    if cmd == "test":
+        return test()
+    print("unknown command:", cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

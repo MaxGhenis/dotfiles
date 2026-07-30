@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""simlock — machine-wide concurrency cap for heavy local sims.
+
+Max's rule: at most 2-3 heavy sims on this box at once (six 100GB+ pythons
+ran concurrently on 2026-07-29 and watchdog-panicked the machine, twice).
+This wraps any heavy command in one of N flock slots; the lock fd survives
+exec, so the slot frees automatically when the process exits or dies.
+
+Usage:
+  simlock [-n SLOTS] [--no-wait] [--timeout SEC] -- CMD [ARGS...]
+  simlock --list          # show slot holders
+  simlock self-test       # exercise acquire/queue/release
+
+Slots default to 2 (override with -n or $SIMLOCK_SLOTS). If all slots are
+held, waits (polling 5s) unless --no-wait (exit 75) or --timeout expires.
+Slot files live in ~/.local/state/simlock/.
+"""
+
+import fcntl
+import json
+import os
+import sys
+import time
+
+SLOT_DIR = os.path.expanduser("~/.local/state/simlock")
+POLL_S = 5
+EX_TEMPFAIL = 75
+
+
+def slot_paths(n):
+    os.makedirs(SLOT_DIR, exist_ok=True)
+    return [os.path.join(SLOT_DIR, "slot-{}".format(i)) for i in range(1, n + 1)]
+
+
+def try_acquire(path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def acquire(n, wait=True, timeout=None):
+    deadline = time.time() + timeout if timeout else None
+    announced = False
+    while True:
+        for path in slot_paths(n):
+            fd = try_acquire(path)
+            if fd is not None:
+                return fd, path
+        if not wait:
+            return None, None
+        if deadline and time.time() > deadline:
+            return None, None
+        if not announced:
+            print("simlock: all {} slots busy; queuing (poll {}s)".format(
+                n, POLL_S), file=sys.stderr)
+            announced = True
+        time.sleep(POLL_S)
+
+
+def list_slots(n):
+    for path in slot_paths(n):
+        fd = try_acquire(path)
+        if fd is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            print("{}: free".format(os.path.basename(path)))
+            continue
+        info = {}
+        try:
+            with open(path) as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            pass
+        print("{}: held by pid {} since {} — {}".format(
+            os.path.basename(path), info.get("pid", "?"),
+            info.get("started", "?"), " ".join(info.get("argv", ["?"]))[:80]))
+
+
+def self_test():
+    import subprocess
+    me = os.path.abspath(__file__)
+    holders = [subprocess.Popen([sys.executable, me, "-n", "2", "--",
+                                 "sleep", "8"]) for _ in range(2)]
+    time.sleep(2)
+    probe = subprocess.run([sys.executable, me, "-n", "2", "--no-wait",
+                            "--", "true"])
+    ok_busy = probe.returncode == EX_TEMPFAIL
+    print(("PASS" if ok_busy else "FAIL"),
+          "third acquisition queues/fails while 2 slots held "
+          "(rc={})".format(probe.returncode))
+    for h in holders:
+        h.wait()
+    probe2 = subprocess.run([sys.executable, me, "-n", "2", "--no-wait",
+                             "--", "true"])
+    ok_free = probe2.returncode == 0
+    print(("PASS" if ok_free else "FAIL"),
+          "slot frees after holder exits (rc={})".format(probe2.returncode))
+    return 0 if (ok_busy and ok_free) else 1
+
+
+def main():
+    args = sys.argv[1:]
+    n = int(os.environ.get("SIMLOCK_SLOTS", "2"))
+    wait, timeout = True, None
+    while args and args[0] != "--":
+        a = args.pop(0)
+        if a == "-n":
+            n = int(args.pop(0))
+        elif a == "--no-wait":
+            wait = False
+        elif a == "--timeout":
+            timeout = float(args.pop(0))
+        elif a == "--list":
+            list_slots(n)
+            return 0
+        elif a == "self-test":
+            return self_test()
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            print("simlock: unknown arg {}".format(a), file=sys.stderr)
+            return 2
+    if args[:1] == ["--"]:
+        args = args[1:]
+    if not args:
+        print(__doc__)
+        return 2
+
+    fd, path = acquire(n, wait=wait, timeout=timeout)
+    if fd is None:
+        print("simlock: no slot available", file=sys.stderr)
+        return EX_TEMPFAIL
+
+    os.ftruncate(fd, 0)
+    os.write(fd, json.dumps({
+        "pid": os.getpid(),
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "argv": args,
+    }).encode())
+    os.fsync(fd)
+    # Keep the lock fd open across exec so the slot frees exactly when the
+    # command exits, however it exits.
+    os.set_inheritable(fd, True)
+    fcntl.fcntl(fd, fcntl.F_SETFD, 0)
+    try:
+        os.execvp(args[0], args)
+    except FileNotFoundError:
+        print("simlock: command not found: {}".format(args[0]),
+              file=sys.stderr)
+        return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main())
