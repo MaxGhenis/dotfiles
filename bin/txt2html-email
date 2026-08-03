@@ -13,6 +13,11 @@ text is HTML-escaped.
 
 Usage: txt2html-email input.txt > output.html
        txt2html-email --test
+
+After creating a Gmail draft from the output (`gog gmail drafts create
+--body-html "$(cat output.html)"`), ALWAYS run verify-gmail-draft (same
+directory) against the draft's message_id + thread_id and require FAITHFUL
+before reporting the draft done.
 """
 import sys, html, re
 

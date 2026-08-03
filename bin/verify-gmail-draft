@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""verify-gmail-draft <account> <message_id> <source.txt> [thread_id]
+
+Fetches a Gmail message (draft OR sent) via gog, decodes its text/html part,
+and checks it against the durable plain-text source (markdown links allowed,
+as consumed by txt2html-email):
+  (a) the source's alphanumeric character stream appears CONTIGUOUSLY in the
+      HTML's — tokenization-free, so the only way to fail is genuinely
+      missing/reordered characters (the bullet letter-chopping bug class);
+  (b) every markdown-link URL appears as an href.
+Exit 0 = FAITHFUL; exit 1 = MANGLED (prints the divergence point).
+Run this after EVERY `gog gmail drafts create --body-html`.
+
+gog quirk: single-message `read <mid> -j` often 404s for drafts and fresh
+sends. Pass the thread_id (also printed by drafts create) as the 4th arg and
+the script falls back to a thread-level read, locating the message by id
+inside the thread JSON — that path is reliable."""
+import sys, json, base64, re, subprocess, html as h
+
+LINK = re.compile(r"\[([^\]]+)\]\(((?:https?://|mailto:)[^)\s]+)\)")
+
+acct, mid, src_path = sys.argv[1], sys.argv[2], sys.argv[3]
+tid = sys.argv[4] if len(sys.argv) > 4 else None
+
+def gog_json(target):
+    p = subprocess.run(['gog', 'gmail', 'read', target, '--account', acct, '-j'],
+                       capture_output=True, text=True)
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        sys.stderr.write(f'gog read {target}: non-JSON output '
+                         f'(stdout {len(p.stdout)}B, stderr: {p.stderr.strip()[:200]})\n')
+        return None
+
+d = gog_json(mid)
+if d is None:
+    if not tid:
+        print('MANGLED-CHECK-FAILED: message read unparseable and no thread_id given; '
+              'rerun as verify-gmail-draft <acct> <mid> <src> <thread_id>')
+        sys.exit(1)
+    d = gog_json(tid)
+    if d is None:
+        print('MANGLED-CHECK-FAILED: thread read also unparseable')
+        sys.exit(1)
+
+# Locate the subtree for our message id (thread reads contain many messages);
+# fall back to the whole document (single-message read shape).
+def find_msg(o):
+    if isinstance(o, dict):
+        if o.get('id') == mid and 'payload' in o:
+            return o
+        for v in o.values():
+            r = find_msg(v)
+            if r is not None:
+                return r
+    elif isinstance(o, list):
+        for v in o:
+            r = find_msg(v)
+            if r is not None:
+                return r
+    return None
+
+scope = find_msg(d) or d
+found = []
+def walk(o):
+    if isinstance(o, dict):
+        if o.get('mimeType') == 'text/html' and (o.get('body') or {}).get('data'):
+            found.append(base64.urlsafe_b64decode(o['body']['data'] + '===').decode('utf-8', 'replace'))
+        for v in o.values(): walk(v)
+    elif isinstance(o, list):
+        for v in o: walk(v)
+walk(scope)
+if not found:
+    print('NO text/html part found'); sys.exit(1)
+
+src_raw = open(src_path).read()
+
+urls = [m.group(2) for m in LINK.finditer(src_raw)]
+missing = [u for u in urls if f'href="{h.escape(u, quote=True)}"' not in found[0]
+           and f'href="{u}"' not in found[0]]
+if missing:
+    print(f'MANGLED: {len(missing)} source link URL(s) missing as href, first: {missing[0]}')
+    sys.exit(1)
+
+def alnum(s):
+    return re.sub(r'[^0-9A-Za-z]+', '', h.unescape(re.sub(r'<[^>]+>', ' ', s)))
+
+html_stream = alnum(found[0])
+src_stream  = alnum(LINK.sub(r'\1', src_raw))
+if src_stream not in html_stream:
+    # Report where the streams diverge, anchored at the best overlap (html may
+    # legitimately carry extra prefix/suffix such as a quoted reply).
+    best, best_start = 0, 0
+    for start in range(len(html_stream)):
+        k = 0
+        while k < len(src_stream) and start + k < len(html_stream) \
+                and src_stream[k] == html_stream[start + k]:
+            k += 1
+        if k > best:
+            best, best_start = k, start
+    print(f'MANGLED: source diverges after {best}/{len(src_stream)} chars')
+    print(f'  source next: ...{src_stream[max(0, best-20):best]}[{src_stream[best:best+30]}]')
+    print(f'  html   next: ...{html_stream[max(0, best_start+best-20):best_start+best]}'
+          f'[{html_stream[best_start+best:best_start+best+30]}]')
+    sys.exit(1)
+print(f'FAITHFUL: all {len(src_stream)} source characters present contiguously; '
+      f'all {len(urls)} links present as hrefs')
