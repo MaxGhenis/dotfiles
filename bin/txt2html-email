@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""txt2html-email: plain text -> Gmail-safe HTML body.
+
+Line-based conversion. NEVER split text on '\n- ' delimiters: the split
+consumes the marker on every item but the first, so a following [2:] strip
+decapitates items 2+ (the "dropped first letters" bug, 2026-08-03).
+
+Rules: blank-line-separated blocks; within a block, lines starting with '- '
+are <li> (marker stripped per line via lstrip()[2:]); non-dash lines after a
+dash line continue the previous <li>; everything else joins into a <p>.
+All text is HTML-escaped.
+
+Usage: txt2html-email input.txt > output.html
+       txt2html-email --test
+"""
+import sys, html, re
+
+
+def convert(text: str) -> str:
+    out = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        segs = []  # list of (kind, [payloads])
+        for ln in block.split("\n"):
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("- "):
+                item = html.escape(stripped[2:].strip())
+                if segs and segs[-1][0] == "ul":
+                    segs[-1][1].append(item)
+                else:
+                    segs.append(("ul", [item]))
+            elif segs and segs[-1][0] == "ul":
+                segs[-1][1][-1] += " " + html.escape(stripped)  # continuation
+            else:
+                if segs and segs[-1][0] == "p":
+                    segs[-1][1].append(html.escape(stripped))
+                else:
+                    segs.append(("p", [html.escape(stripped)]))
+        for kind, payload in segs:
+            if kind == "ul":
+                out.append("<ul>" + "".join(f"<li>{i}</li>" for i in payload) + "</ul>")
+            else:
+                out.append("<p>" + " ".join(payload) + "</p>")
+    return '<div dir="ltr">' + "".join(out) + "</div>"
+
+
+def _test() -> None:
+    t = "Intro line.\n\n- Alpha one\n- Beta two\n- Gamma three\n\nClose."
+    h = convert(t)
+    assert "<li>Alpha one</li>" in h and "<li>Beta two</li>" in h and "<li>Gamma three</li>" in h, h
+    t2 = "Lead:\n- Legal name: PSL Foundation\n- EIN: 86-3092437\n- Designation: \"X\"\nTrailing sentence."
+    h2 = convert(t2)
+    assert "<li>EIN: 86-3092437</li>" in h2, h2
+    assert "Designation" in h2 and "Trailing sentence" in h2, h2
+    t3 = "- Only bullet with continuation\n  wrapped line"
+    h3 = convert(t3)
+    assert "<li>Only bullet with continuation wrapped line</li>" in h3, h3
+    t4 = "A & B <tag>"
+    assert "&amp;" in convert(t4) and "&lt;tag&gt;" in convert(t4)
+    print("all tests pass")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        _test()
+    else:
+        src = open(sys.argv[1]).read() if len(sys.argv) > 1 else sys.stdin.read()
+        sys.stdout.write(convert(src))
