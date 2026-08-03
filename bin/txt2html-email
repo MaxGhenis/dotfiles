@@ -1,47 +1,60 @@
 #!/usr/bin/env python3
-"""txt2html-email: plain text -> Gmail-safe HTML body.
+"""txt2html-email: plain text (with markdown links) -> Gmail-safe HTML body.
 
 Line-based conversion. NEVER split text on '\n- ' delimiters: the split
 consumes the marker on every item but the first, so a following [2:] strip
 decapitates items 2+ (the "dropped first letters" bug, 2026-08-03).
 
 Rules: blank-line-separated blocks; within a block, lines starting with '- '
-are <li> (marker stripped per line via lstrip()[2:]); non-dash lines after a
-dash line continue the previous <li>; everything else joins into a <p>.
-All text is HTML-escaped.
+are <li> (marker stripped per line); non-dash lines after a dash line
+continue the previous <li>; everything else joins into a <p>.
+Markdown links [text](https://... | mailto:...) become <a href>; all other
+text is HTML-escaped.
 
 Usage: txt2html-email input.txt > output.html
        txt2html-email --test
 """
 import sys, html, re
 
+LINK = re.compile(r"\[([^\]]+)\]\(((?:https?://|mailto:)[^)\s]+)\)")
+
+
+def inline(text: str) -> str:
+    out, pos = [], 0
+    for m in LINK.finditer(text):
+        out.append(html.escape(text[pos:m.start()]))
+        out.append(f'<a href="{html.escape(m.group(2), quote=True)}">{html.escape(m.group(1))}</a>')
+        pos = m.end()
+    out.append(html.escape(text[pos:]))
+    return "".join(out)
+
 
 def convert(text: str) -> str:
     out = []
     for block in re.split(r"\n\s*\n", text.strip()):
-        segs = []  # list of (kind, [payloads])
+        segs = []  # list of (kind, [raw payloads])
         for ln in block.split("\n"):
             stripped = ln.strip()
             if not stripped:
                 continue
             if stripped.startswith("- "):
-                item = html.escape(stripped[2:].strip())
+                item = stripped[2:].strip()
                 if segs and segs[-1][0] == "ul":
                     segs[-1][1].append(item)
                 else:
                     segs.append(("ul", [item]))
             elif segs and segs[-1][0] == "ul":
-                segs[-1][1][-1] += " " + html.escape(stripped)  # continuation
+                segs[-1][1][-1] += " " + stripped  # continuation of previous li
             else:
                 if segs and segs[-1][0] == "p":
-                    segs[-1][1].append(html.escape(stripped))
+                    segs[-1][1].append(stripped)
                 else:
-                    segs.append(("p", [html.escape(stripped)]))
+                    segs.append(("p", [stripped]))
         for kind, payload in segs:
             if kind == "ul":
-                out.append("<ul>" + "".join(f"<li>{i}</li>" for i in payload) + "</ul>")
+                out.append("<ul>" + "".join(f"<li>{inline(i)}</li>" for i in payload) + "</ul>")
             else:
-                out.append("<p>" + " ".join(payload) + "</p>")
+                out.append("<p>" + inline(" ".join(payload)) + "</p>")
     return '<div dir="ltr">' + "".join(out) + "</div>"
 
 
@@ -54,10 +67,16 @@ def _test() -> None:
     assert "<li>EIN: 86-3092437</li>" in h2, h2
     assert "Designation" in h2 and "Trailing sentence" in h2, h2
     t3 = "- Only bullet with continuation\n  wrapped line"
-    h3 = convert(t3)
-    assert "<li>Only bullet with continuation wrapped line</li>" in h3, h3
+    assert "<li>Only bullet with continuation wrapped line</li>" in convert(t3)
     t4 = "A & B <tag>"
     assert "&amp;" in convert(t4) and "&lt;tag&gt;" in convert(t4)
+    t5 = "- See [the PR](https://example.com/p?a=1&b=2) for details\n- [Second](mailto:a@b.org) item"
+    h5 = convert(t5)
+    assert '<li>See <a href="https://example.com/p?a=1&amp;b=2">the PR</a> for details</li>' in h5, h5
+    assert '<li><a href="mailto:a@b.org">Second</a> item</li>' in h5, h5
+    t6 = "Para with [link](https://x.nz/) mid-sentence & escaping."
+    h6 = convert(t6)
+    assert '<a href="https://x.nz/">link</a> mid-sentence &amp; escaping' in h6, h6
     print("all tests pass")
 
 
