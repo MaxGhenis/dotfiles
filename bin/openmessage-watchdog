@@ -1,0 +1,217 @@
+#!/bin/bash
+# openmessage-watchdog — keep OpenMessage's daemon alive AND its platforms honest.
+#
+# The macOS app owns the live daemon on 127.0.0.1:7007 (all transports: Google
+# Messages, WhatsApp, Signal). Two distinct failure classes, both handled here:
+#
+#  A. Daemon dead/hung (e.g. jetsam under memory pressure, 2026-07-29: every
+#     platform dark for 2 days). → Relaunch the app, conservatively (Google
+#     reconnect throttling; see ~/openmessage/docs/agent-runbook.md).
+#  B. Daemon up but a platform silently stale (zombie Google session, stalled
+#     v2 projection 7/23-7/25, WhatsApp remote logout, ingest quarantine).
+#     → Alert via macOS notification. NO auto-restart for these: the in-app
+#     supervisors own platform recovery, restarts rarely fix platform-level
+#     death, and hammering reconnects gets the Google account throttled.
+#
+# Class-A behavior:
+#   - Probe /api/status. Dead + no app process: relaunch after 2 consecutive
+#     failed probes. Dead + app process present (hung): quit + relaunch after 3.
+#   - At most one relaunch action per 30 minutes.
+# Class-B checks (each 5-min run while the daemon responds):
+#   - platform paired but disconnected 3 consecutive checks (~15 min sustained;
+#     ignores sub-minute Google heal-cycle dips)     → notify once per episode
+#   - google.needs_repair 3 consecutive checks       → notify once per episode
+#   - google.repairs_paced >= 3 (cookies being revoked faster than the repair
+#     floor — self-heal is losing)                   → notify, re-notify 6h
+#   - projection_stalled (top-level or per-platform) → notify, re-notify 6h
+#   - a platform's latest_received trailing the newest message across all
+#     platforms by > 48h (relative check: other platforms flowing proves the
+#     pipe; one trailing = that platform is broken, not a quiet day)
+#                                                    → notify, re-notify 6h
+#   - newest message on ANY platform > 24h old (global silence; organically
+#     near-impossible at Max's volume — smells like zombie-everything)
+#                                                    → notify, re-notify 6h
+#   - v2 ingest quarantined > 0                      → notify, re-notify 6h
+#   - signal receive_recovery pending_count >= 5     → notify, re-notify 6h
+#
+# Skips entirely if a manual pairing is in flight (`openmessage pair` process)
+# or the disable flag exists:
+#     ~/Library/Application Support/OpenMessage/watchdog-disabled
+# Touch that flag before intentionally quitting the app (re-pair recipe,
+# debugging); remove it when done.
+#
+# Env overrides (testing): OPENMESSAGE_WATCHDOG_PORT, OPENMESSAGE_WATCHDOG_DRYRUN=1
+# (dryrun: log decisions, no relaunch, no notifications)
+
+set -u
+PORT="${OPENMESSAGE_WATCHDOG_PORT:-7007}"
+DRYRUN="${OPENMESSAGE_WATCHDOG_DRYRUN:-0}"
+APP="/Applications/OpenMessage.app"
+FLAG="$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
+STATE_DIR="${OPENMESSAGE_WATCHDOG_STATE:-$HOME/.local/state/openmessage-watchdog}"
+FAILS_F="$STATE_DIR/consecutive_fails"
+LAST_ACTION_F="$STATE_DIR/last_action_epoch"
+LOG="${OPENMESSAGE_WATCHDOG_LOG:-$HOME/Library/Logs/openmessage-watchdog.log}"
+ALERT_COOLDOWN=21600   # 6h between repeat notifications per condition
+NOW=$(date +%s)
+mkdir -p "$STATE_DIR"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+notify() { # $1 = message (keep quote-free)
+  log "NOTIFY: $1"
+  [ "$DRYRUN" = "1" ] && return 0
+  osascript -e "display notification \"$1\" with title \"OpenMessage watchdog\"" >/dev/null 2>&1
+}
+
+[ -e "$FLAG" ] && { log "skip: disable flag present"; exit 0; }
+pgrep -f 'openmessage pair' >/dev/null 2>&1 && { log "skip: pairing in flight"; exit 0; }
+[ -d "$APP" ] || { log "skip: $APP not installed"; exit 0; }
+
+STATUS_JSON=$(curl -s -m 5 "http://127.0.0.1:$PORT/api/status" 2>/dev/null)
+
+# ---------- Class A: daemon dead or hung → relaunch ----------
+if ! echo "$STATUS_JSON" | grep -q '"connected"'; then
+  fails=$(( $(cat "$FAILS_F" 2>/dev/null || echo 0) + 1 ))
+  echo "$fails" > "$FAILS_F"
+
+  # App process = the Swift wrapper; its backend child is `openmessage serve --web`.
+  app_pid=$(pgrep -x OpenMessage || true)
+  if [ -n "$app_pid" ]; then
+    threshold=3; mode="hung (app pid $app_pid, port dead)"
+  else
+    threshold=2; mode="dead (no app process)"
+  fi
+  log "probe failed ($fails/$threshold): $mode"
+  [ "$fails" -lt "$threshold" ] && exit 0
+
+  last_action=$(cat "$LAST_ACTION_F" 2>/dev/null || echo 0)
+  if [ $(( NOW - last_action )) -lt 1800 ]; then
+    log "action throttled ($(( (NOW - last_action) / 60 ))m since last; need 30m)"
+    exit 0
+  fi
+
+  if [ "$DRYRUN" = "1" ]; then
+    log "DRYRUN: would relaunch ($mode)"
+    exit 0
+  fi
+
+  if [ -n "$app_pid" ]; then
+    log "quitting hung app (pid $app_pid)"
+    osascript -e 'quit app "OpenMessage"' >/dev/null 2>&1
+    sleep 10
+    pgrep -x OpenMessage >/dev/null && { pkill -x OpenMessage; sleep 3; }
+  fi
+
+  log "relaunching OpenMessage.app"
+  open -ga OpenMessage
+  echo "$NOW" > "$LAST_ACTION_F"
+  echo 0 > "$FAILS_F"
+  notify "Daemon was down - relaunched the app. Messages were not syncing."
+  exit 0
+fi
+
+# ---------- Class B: daemon healthy → platform staleness sentinel ----------
+if [ -s "$FAILS_F" ] && [ "$(cat "$FAILS_F")" != "0" ]; then
+  log "healthy again (was $(cat "$FAILS_F") fails)"
+fi
+echo 0 > "$FAILS_F"
+
+HEALTH=$(echo "$STATUS_JSON" | /usr/bin/python3 -c '
+import json, sys, time
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("PARSEERR|%s" % str(e)[:60]); sys.exit(0)
+now_ms = time.time() * 1000
+plats = {n: (d.get(n) or {}) for n in ("google", "whatsapp", "signal")}
+fresh = d.get("freshness") or {}
+newest = fresh.get("newest_ms") or 0
+out = []
+for name, p in plats.items():
+    if p.get("paired") and not p.get("connected"):
+        out.append("DISC|%s" % name)
+g = plats["google"]
+if g.get("needs_repair"):
+    out.append("REPAIR|google")
+if (g.get("repairs_paced") or 0) >= 3:
+    out.append("ALERT|repairs_paced|Google cookie repairs throttled (repairs_paced=%s) - something revokes cookies fast" % g.get("repairs_paced"))
+if d.get("projection_stalled"):
+    out.append("ALERT|projection_stalled|v2 read projection stalled - reads are stale while ingest continues")
+for name, f in fresh.items():
+    if not isinstance(f, dict):
+        continue
+    if f.get("projection_stalled"):
+        out.append("ALERT|proj_%s|%s projection stalled" % (name, name))
+    lat = f.get("latest_received_ms") or f.get("latest_ms") or 0
+    if lat and newest and newest - lat > 48 * 3600 * 1000:
+        out.append("ALERT|behind_%s|%s received nothing for %.1fd while other platforms flow" % (name, name, (newest - lat) / 86400000.0))
+if newest and now_ms - newest > 24 * 3600 * 1000:
+    out.append("ALERT|all_quiet|No messages on ANY platform for %dh - likely silent global failure" % int((now_ms - newest) / 3600000))
+per = (d.get("v2_ingest") or {}).get("per_account") or {}
+q = sum((a.get("quarantined") or 0) for a in per.values() if isinstance(a, dict))
+if q:
+    out.append("ALERT|quarantine|%d ingested frame(s) quarantined" % q)
+rr = plats["signal"].get("receive_recovery") or {}
+if (rr.get("pending_count") or 0) >= 5:
+    out.append("ALERT|signal_recovery|Signal receive-recovery backlog: %s pending (%s)" % (rr.get("pending_count"), rr.get("last_issue_reason")))
+print("\n".join(out))
+')
+
+alerts=()
+disc_seen=" "
+repair_seen=0
+
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  case "$line" in
+    PARSEERR\|*)
+      log "status parse error: ${line#PARSEERR|}" ;;
+    DISC\|*)
+      name=${line#DISC|}
+      disc_seen="$disc_seen$name "
+      c=$(( $(cat "$STATE_DIR/disc_$name" 2>/dev/null || echo 0) + 1 ))
+      echo "$c" > "$STATE_DIR/disc_$name"
+      log "disconnected: $name ($c/3)"
+      [ "$c" -eq 3 ] && alerts+=("$name disconnected 15+ min - in-app recovery may be stuck") ;;
+    REPAIR\|google)
+      repair_seen=1
+      c=$(( $(cat "$STATE_DIR/repair_google" 2>/dev/null || echo 0) + 1 ))
+      echo "$c" > "$STATE_DIR/repair_google"
+      log "google needs_repair ($c/3)"
+      [ "$c" -eq 3 ] && alerts+=("Google needs repair 15+ min - cookie self-heal is not recovering it") ;;
+    ALERT\|*)
+      rest=${line#ALERT|}
+      key=${rest%%|*}
+      msg=${rest#*|}
+      last=$(cat "$STATE_DIR/alert_$key" 2>/dev/null || echo 0)
+      if [ $(( NOW - last )) -ge "$ALERT_COOLDOWN" ]; then
+        echo "$NOW" > "$STATE_DIR/alert_$key"
+        alerts+=("$msg")
+      else
+        log "suppressed (cooldown): $key"
+      fi ;;
+  esac
+done <<< "$HEALTH"
+
+# Reset consecutive counters for conditions absent this run.
+for p in google whatsapp signal; do
+  case "$disc_seen" in
+    *" $p "*) ;;
+    *) [ -s "$STATE_DIR/disc_$p" ] && [ "$(cat "$STATE_DIR/disc_$p")" != "0" ] \
+         && { log "reconnected: $p"; echo 0 > "$STATE_DIR/disc_$p"; } ;;
+  esac
+done
+if [ "$repair_seen" = "0" ] && [ -s "$STATE_DIR/repair_google" ] \
+     && [ "$(cat "$STATE_DIR/repair_google")" != "0" ]; then
+  log "google repair cleared"
+  echo 0 > "$STATE_DIR/repair_google"
+fi
+
+if [ "${#alerts[@]}" -gt 0 ]; then
+  extra=""
+  [ "${#alerts[@]}" -gt 1 ] && extra=" (+$(( ${#alerts[@]} - 1 )) more - see log)"
+  for a in "${alerts[@]}"; do log "ALERT: $a"; done
+  notify "${alerts[0]}$extra"
+fi
+exit 0
