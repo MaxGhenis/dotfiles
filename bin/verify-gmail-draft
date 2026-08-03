@@ -1,107 +1,301 @@
 #!/usr/bin/env python3
 """verify-gmail-draft <account> <message_id> <source.txt> [thread_id]
+       verify-gmail-draft --self-test
 
-Fetches a Gmail message (draft OR sent) via gog, decodes its text/html part,
-and checks it against the durable plain-text source (markdown links allowed,
-as consumed by txt2html-email):
+Fetches the STORED copy of a Gmail message (draft OR sent) via gog, decodes
+its text/html part, and checks it against the durable plain-text source
+(markdown links + bare URLs, as consumed by txt2html-email):
   (a) the source's alphanumeric character stream appears CONTIGUOUSLY in the
-      HTML's — tokenization-free, so the only way to fail is genuinely
-      missing/reordered characters (the bullet letter-chopping bug class);
-  (b) every markdown-link URL appears as an href.
-Exit 0 = FAITHFUL; exit 1 = MANGLED (prints the divergence point).
-Run this after EVERY `gog gmail drafts create --body-html`.
+      HTML's visible text — tokenization-free, so the only way to fail is
+      genuinely missing/reordered characters (the bullet letter-chopping bug
+      class);
+  (b) every markdown-link URL appears as an href;
+  (c) every BARE URL in the source (https://... or mailto:...; links live IN
+      the durable .txt per Max's convention) appears in the stored body, as
+      an href or as exact visible text. txt2html-email passes bare URLs
+      through as visible text, and check (a) alone cannot tell
+      "https://axiom.org" from "https:  axiom org" — alnum streams match.
+      Before 2026-08-03 a source whose links were all bare reported the
+      vacuous "all 0 links present as hrefs".
 
-gog quirk: single-message `read <mid> -j` often 404s for drafts and fresh
-sends. Pass the thread_id (also printed by drafts create) as the 4th arg and
-the script falls back to a thread-level read, locating the message by id
-inside the thread JSON — that path is reliable."""
-import sys, json, base64, re, subprocess, html as h
+The HTML compared MUST come from a payload subtree whose id == message_id
+(the authoritative copy). If no such subtree is fetched the script prints
+CHECK-FAILED and exits 2 — it NEVER falls back to another message in the
+thread. (2026-08-03: the old whole-document fallback declared a nonexistent
+draft id FAITHFUL by matching the thread's inbound message instead.)
 
-LINK = re.compile(r"\[([^\]]+)\]\(((?:https?://|mailto:)[^)\s]+)\)")
+gog quirk (v0.12.0): single-message `read <mid> -j` 404s for drafts and
+fresh sends, while `read <thread_id> -j` reliably includes the draft message
+with full payload — so when thread_id is given, the thread read is the
+PRIMARY path and the single-message read the fallback. An edited or sent
+draft gets a NEW message id; if neither path locates the id, list current
+ids with `gog gmail drafts list` or re-read the thread with -j.
 
-acct, mid, src_path = sys.argv[1], sys.argv[2], sys.argv[3]
-tid = sys.argv[4] if len(sys.argv) > 4 else None
+Exit 0 = FAITHFUL (verified against the stored copy of message_id).
+Exit 1 = MANGLED (stored copy fetched; content diverges).
+Exit 2 = CHECK-FAILED (no authoritative copy fetched; NOTHING was verified).
+Run this after EVERY `gog gmail drafts create --body-html`."""
+import sys, os, json, base64, re, subprocess, html as h
 
-def gog_json(target):
+MDLINK = re.compile(r"\[([^\]]+)\]\(((?:https?://|mailto:)[^)\s]+)\)")
+BARE = re.compile(r"(?:https?://|mailto:)[^\s<>()\[\]\"']+")
+TRAIL = ".,;:!?'\""
+
+
+def gog_json(acct, target):
     p = subprocess.run(['gog', 'gmail', 'read', target, '--account', acct, '-j'],
                        capture_output=True, text=True)
     try:
-        return json.loads(p.stdout)
+        return json.loads(p.stdout), None
     except json.JSONDecodeError:
-        sys.stderr.write(f'gog read {target}: non-JSON output '
-                         f'(stdout {len(p.stdout)}B, stderr: {p.stderr.strip()[:200]})\n')
-        return None
+        return None, (f'read {target}: non-JSON output (stdout {len(p.stdout)}B, '
+                      f'stderr: {p.stderr.strip()[:200]})')
 
-d = gog_json(mid)
-if d is None:
-    if not tid:
-        print('MANGLED-CHECK-FAILED: message read unparseable and no thread_id given; '
-              'rerun as verify-gmail-draft <acct> <mid> <src> <thread_id>')
-        sys.exit(1)
-    d = gog_json(tid)
-    if d is None:
-        print('MANGLED-CHECK-FAILED: thread read also unparseable')
-        sys.exit(1)
 
-# Locate the subtree for our message id (thread reads contain many messages);
-# fall back to the whole document (single-message read shape).
-def find_msg(o):
-    if isinstance(o, dict):
-        if o.get('id') == mid and 'payload' in o:
-            return o
-        for v in o.values():
-            r = find_msg(v)
+def locate(doc, mid):
+    """The payload-bearing subtree for message id `mid`, or None — never the
+    whole document (that fallback caused the 2026-08-03 wrong-message pass)."""
+    if isinstance(doc, dict):
+        if doc.get('id') == mid and 'payload' in doc:
+            return doc
+        for v in doc.values():
+            r = locate(v, mid)
             if r is not None:
                 return r
-    elif isinstance(o, list):
-        for v in o:
-            r = find_msg(v)
+    elif isinstance(doc, list):
+        for v in doc:
+            r = locate(v, mid)
             if r is not None:
                 return r
     return None
 
-scope = find_msg(d) or d
-found = []
-def walk(o):
-    if isinstance(o, dict):
-        if o.get('mimeType') == 'text/html' and (o.get('body') or {}).get('data'):
-            found.append(base64.urlsafe_b64decode(o['body']['data'] + '===').decode('utf-8', 'replace'))
-        for v in o.values(): walk(v)
-    elif isinstance(o, list):
-        for v in o: walk(v)
-walk(scope)
-if not found:
-    print('NO text/html part found'); sys.exit(1)
 
-src_raw = open(src_path).read()
+def messages_in(doc, out=None):
+    """(id, labelIds) of each message-shaped dict, for CHECK-FAILED context."""
+    if out is None:
+        out = {}
+    if isinstance(doc, dict):
+        if 'id' in doc and ('payload' in doc or 'labelIds' in doc):
+            out.setdefault(doc['id'], doc.get('labelIds') or [])
+        for v in doc.values():
+            messages_in(v, out)
+    elif isinstance(doc, list):
+        for v in doc:
+            messages_in(v, out)
+    return out
 
-urls = [m.group(2) for m in LINK.finditer(src_raw)]
-missing = [u for u in urls if f'href="{h.escape(u, quote=True)}"' not in found[0]
-           and f'href="{u}"' not in found[0]]
-if missing:
-    print(f'MANGLED: {len(missing)} source link URL(s) missing as href, first: {missing[0]}')
-    sys.exit(1)
+
+def html_of(msg):
+    found = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get('mimeType') == 'text/html' and (o.get('body') or {}).get('data'):
+                found.append(o['body']['data'])
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(msg)
+    if not found:
+        return None
+    return base64.urlsafe_b64decode(found[0] + '===').decode('utf-8', 'replace')
+
+
+def visible(html_doc):
+    return h.unescape(re.sub(r'<[^>]+>', ' ', html_doc))
+
 
 def alnum(s):
-    return re.sub(r'[^0-9A-Za-z]+', '', h.unescape(re.sub(r'<[^>]+>', ' ', s)))
+    return re.sub(r'[^0-9A-Za-z]+', '', s)
 
-html_stream = alnum(found[0])
-src_stream  = alnum(LINK.sub(r'\1', src_raw))
-if src_stream not in html_stream:
-    # Report where the streams diverge, anchored at the best overlap (html may
-    # legitimately carry extra prefix/suffix such as a quoted reply).
-    best, best_start = 0, 0
-    for start in range(len(html_stream)):
-        k = 0
-        while k < len(src_stream) and start + k < len(html_stream) \
-                and src_stream[k] == html_stream[start + k]:
-            k += 1
-        if k > best:
-            best, best_start = k, start
-    print(f'MANGLED: source diverges after {best}/{len(src_stream)} chars')
-    print(f'  source next: ...{src_stream[max(0, best-20):best]}[{src_stream[best:best+30]}]')
-    print(f'  html   next: ...{html_stream[max(0, best_start+best-20):best_start+best]}'
-          f'[{html_stream[best_start+best:best_start+best+30]}]')
-    sys.exit(1)
-print(f'FAITHFUL: all {len(src_stream)} source characters present contiguously; '
-      f'all {len(urls)} links present as hrefs')
+
+def bare_urls(src_raw):
+    urls = [u.rstrip(TRAIL) for u in BARE.findall(MDLINK.sub(' ', src_raw))]
+    return list(dict.fromkeys(u for u in urls if u not in ('http://', 'https://', 'mailto:')))
+
+
+def as_href(u, html_doc):
+    return (f'href="{h.escape(u, quote=True)}"' in html_doc
+            or f'href="{u}"' in html_doc)
+
+
+def check(src_raw, html_doc):
+    """(faithful, failure_lines, stats) — pure; shared by main and self-test."""
+    fails = []
+    md = [m.group(2) for m in MDLINK.finditer(src_raw)]
+    md_missing = [u for u in md if not as_href(u, html_doc)]
+    if md_missing:
+        fails.append(f'{len(md_missing)} markdown link URL(s) missing as href, '
+                     f'first: {md_missing[0]}')
+    vis = visible(html_doc)
+    bare = bare_urls(src_raw)
+    bare_missing = [u for u in bare if not as_href(u, html_doc) and u not in vis]
+    if bare_missing:
+        fails.append(f'{len(bare_missing)} bare source URL(s) absent from stored body '
+                     f'(neither exact visible text nor href), first: {bare_missing[0]}')
+    html_stream = alnum(vis)
+    src_stream = alnum(MDLINK.sub(r'\1', src_raw))
+    if src_stream not in html_stream:
+        # Report where the streams diverge, anchored at the best overlap (html
+        # may legitimately carry extra prefix/suffix such as a quoted reply).
+        best, best_start = 0, 0
+        for start in range(len(html_stream)):
+            k = 0
+            while k < len(src_stream) and start + k < len(html_stream) \
+                    and src_stream[k] == html_stream[start + k]:
+                k += 1
+            if k > best:
+                best, best_start = k, start
+        fails.append(f'source diverges after {best}/{len(src_stream)} chars\n'
+                     f'  source next: ...{src_stream[max(0, best - 20):best]}'
+                     f'[{src_stream[best:best + 30]}]\n'
+                     f'  html   next: ...{html_stream[max(0, best_start + best - 20):best_start + best]}'
+                     f'[{html_stream[best_start + best:best_start + best + 30]}]')
+    stats = {'chars': len(src_stream), 'md': len(md), 'bare': len(bare)}
+    return not fails, fails, stats
+
+
+def fetch_authoritative(acct, mid, tid):
+    """(html, notes): html is None iff no payload subtree with id == mid was
+    fetched — the caller must then CHECK-FAIL, never compare something else."""
+    notes = []
+    for target in ([tid, mid] if tid and tid != mid else [mid]):
+        doc, err = gog_json(acct, target)
+        if err:
+            notes.append(err)
+            continue
+        msg = locate(doc, mid)
+        if msg is None:
+            ids = messages_in(doc)
+            listing = ', '.join(f'{i}{l}' for i, l in ids.items()) or 'none'
+            notes.append(f'read {target}: parsed OK but no payload for message {mid} '
+                         f'(messages seen: {listing})')
+            continue
+        html_doc = html_of(msg)
+        if html_doc is None:
+            notes.append(f'read {target}: message {mid} located but has no text/html part')
+            continue
+        notes.append(f'authoritative copy: message {mid} located in read of {target}')
+        return html_doc, notes
+    return None, notes
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == '--self-test':
+        return self_test()
+    if len(argv) < 4:
+        print(__doc__.split('\n\n')[0])
+        return 2
+    acct, mid, src_path = argv[1], argv[2], argv[3]
+    tid = argv[4] if len(argv) > 4 else None
+    html_doc, notes = fetch_authoritative(acct, mid, tid)
+    if html_doc is None:
+        print(f'CHECK-FAILED: no authoritative copy of message {mid} fetched; '
+              f'NOTHING was verified — do not report this draft as checked.')
+        for n in notes:
+            print(f'  {n}')
+        if tid:
+            print(f'  hint: an edited or sent draft gets a NEW message id — run '
+                  f'`gog gmail drafts list --account {acct}` or '
+                  f'`gog gmail read {tid} --account {acct} -j` for current ids')
+        else:
+            print('  hint: pass the thread_id as 4th arg — thread reads include '
+                  'draft messages whose single-message read 404s')
+        return 2
+    for n in notes:
+        sys.stderr.write(f'note: {n}\n')
+    ok, fails, stats = check(open(src_path).read(), html_doc)
+    if not ok:
+        for f in fails:
+            print(f'MANGLED: {f}')
+        return 1
+    print(f'FAITHFUL: all {stats["chars"]} source characters present contiguously; '
+          f'all {stats["md"]} markdown link(s) present as hrefs; '
+          f'all {stats["bare"]} bare URL(s) present in stored body')
+    return 0
+
+
+def _b64(s):
+    return base64.urlsafe_b64encode(s.encode()).decode()
+
+
+def self_test():
+    """Fixture runs proving both 2026-08-03 failure modes are now caught."""
+    fails = []
+
+    def expect(name, cond, detail=''):
+        print(f'{"PASS" if cond else "FAIL"}: {name}' + ('' if cond else f' — {detail}'))
+        if not cond:
+            fails.append(name)
+
+    # Failure mode 1: target message id absent from the fetched document
+    # (draft 404s AND is gone from the thread, e.g. after being sent). The
+    # old `scope = find_msg(d) or d` fell back to the whole thread and
+    # compared the first text/html part — some OTHER message.
+    src1 = "I wasn't able to make the webinar yesterday. Is there a recording?"
+    inbound_html = '<div dir="ltr"><p>Hi! ' + h.escape(src1) + ' Thanks, B.</p></div>'
+    thread = {'thread': {'id': 't1', 'messages': [
+        {'id': 'inbound1', 'labelIds': ['INBOX'],
+         'payload': {'mimeType': 'text/html', 'body': {'data': _b64(inbound_html)}}}]}}
+    expect('mode1: fixture is a real trap — the wrong message WOULD pass the content check',
+           check(src1, html_of(thread['thread']['messages'][0]))[0])
+    expect('mode1: absent message id is NOT located (no whole-document fallback)',
+           locate(thread, 'gone-draft-mid') is None)
+    expect('mode1: present message id IS located',
+           locate(thread, 'inbound1') is not None)
+
+    # Failure mode 2: bare URLs (Max's normal convention) were invisible to
+    # the markdown-only extractor — "all 0 links present as hrefs".
+    src2 = ("Here's the recording:\n\nhttps://youtu.be/AbCdEfGhIjK\n\n"
+            "More on the launch at https://axiom.org.")
+    expect('mode2: markdown-only extractor sees 0 links here (the old vacuous pass)',
+           not MDLINK.findall(src2))
+    expect('mode2: bare URLs extracted, trailing punctuation stripped',
+           bare_urls(src2) == ['https://youtu.be/AbCdEfGhIjK', 'https://axiom.org'])
+    mangled = ('<p>Here&#39;s the recording:</p><p>https:  youtu.be AbCdEfGhIjK</p>'
+               '<p>More on the launch at https:  axiom.org.</p>')
+    ok, fl, _ = check(src2, mangled)
+    expect('mode2: alnum-identical but punctuation-mangled URLs now FAIL',
+           not ok and any('bare' in f for f in fl), str(fl))
+    astext = ('<p>Here&#39;s the recording:</p><p>https://youtu.be/AbCdEfGhIjK</p>'
+              '<p>More on the launch at https://axiom.org.</p>')
+    expect('mode2: bare URL as exact visible text passes', check(src2, astext)[0],
+           str(check(src2, astext)[1]))
+    ok, fl, _ = check('See https://axiom.org',
+                      '<p>See <a href="https://axiom.org">the launch page</a></p>')
+    expect('mode2: href satisfies the bare-URL check on its own '
+           '(contiguity still governs visible text separately)',
+           not any('bare' in f for f in fl) and not ok, str(fl))
+
+    ok, fl, _ = check('Data: https://e.com/?a=1&b=2 and [the PR](https://gh.com/p?x=1&y=2)',
+                      '<p>Data: https://e.com/?a=1&amp;b=2 and '
+                      '<a href="https://gh.com/p?x=1&amp;y=2">the PR</a></p>')
+    expect('urls containing & survive escaping on both the text and href paths', ok, str(fl))
+    ok, fl, _ = check('[the PR](https://gone.example/x)', '<p>the PR</p>')
+    expect('markdown link with missing href still fails',
+           not ok and any('markdown' in f for f in fl), str(fl))
+
+    # Integration: the real sibling converter's output must pass all checks.
+    import importlib.machinery, importlib.util
+    conv = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'txt2html-email')
+    spec = importlib.util.spec_from_loader(
+        't2h', importlib.machinery.SourceFileLoader('t2h', conv))
+    t2h = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(t2h)
+    src3 = ("Hi,\n\nRecording's here:\n\n- Video: https://youtu.be/AbCdEfGhIjK\n"
+            "- [Slides](https://example.org/launch?a=1&b=2)\n\nMore at "
+            "https://axiom.org.\n\nBest,\nMax")
+    ok, fl, st = check(src3, t2h.convert(src3))
+    expect('integration: real txt2html-email output is FAITHFUL (2 bare + 1 md link)',
+           ok and st['bare'] == 2 and st['md'] == 1, f'{fl} {st}')
+    ok, fl, _ = check(src3, t2h.convert(src3).replace('Recording', 'ecording'))
+    expect('regression: chopped characters still fail contiguity', not ok, str(fl))
+
+    print('SELF-TEST PASS' if not fails else f'SELF-TEST FAIL: {len(fails)} failing')
+    return 0 if not fails else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
