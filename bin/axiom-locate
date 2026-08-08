@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Locate common Axiom artifacts without recursively scanning the filesystem."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import keyword
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Callable, Iterable, Sequence
+
+
+CACHE_VERSION = 1
+CORPUS_COMMAND_DEADLINE_SECONDS = 4.5
+CORPUS_GIT_TIMEOUT_SECONDS = 2.0
+PYTHON_TIMEOUT_SECONDS = 10.0
+
+
+def mirror_root() -> Path:
+    configured = os.environ.get("AXIOM_MIRROR_ROOT", "~/TheAxiomFoundation")
+    return Path(configured).expanduser().resolve(strict=False)
+
+
+def cache_path() -> Path:
+    return Path.home() / ".axiom" / "locate-cache.json"
+
+
+def load_cache(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as cache_file:
+            loaded = json.load(cache_file)
+    except (OSError, ValueError, TypeError):
+        return {"version": CACHE_VERSION, "entries": {}}
+
+    if (
+        not isinstance(loaded, dict)
+        or loaded.get("version") != CACHE_VERSION
+        or not isinstance(loaded.get("entries"), dict)
+    ):
+        return {"version": CACHE_VERSION, "entries": {}}
+    return loaded
+
+
+def write_cache(path: Path, cache: dict[str, Any]) -> None:
+    """Atomically write the cache when its parent is writable."""
+    temporary_path: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_path = tempfile.mkstemp(
+            dir=path.parent, prefix=".locate-cache-", suffix=".tmp"
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as cache_file:
+            json.dump(cache, cache_file, sort_keys=True)
+            cache_file.write("\n")
+        os.replace(temporary_path, path)
+        temporary_path = None
+    except OSError:
+        # Discovery should still work in read-only homes and restricted sandboxes.
+        pass
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+
+def root_children(root: Path) -> list[str]:
+    try:
+        return sorted(os.listdir(root))
+    except OSError:
+        return []
+
+
+def checkout_roots(root: Path, children: Sequence[str]) -> Iterable[Path]:
+    """Expand only <root>/* and <root>/_*/* checkout locations."""
+    for name in children:
+        direct_child = root / name
+        yield direct_child
+        if not name.startswith("_") or not direct_child.is_dir():
+            continue
+        try:
+            nested_names = sorted(os.listdir(direct_child))
+        except OSError:
+            continue
+        for nested_name in nested_names:
+            yield direct_child / nested_name
+
+
+def path_record(path: Path) -> dict[str, Any] | None:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return {"path": str(path), "mtime": stat_result.st_mtime_ns}
+
+
+def records_for_paths(paths: Iterable[Path]) -> list[dict[str, Any]]:
+    records = []
+    for path in paths:
+        record = path_record(path)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def cache_key(
+    root: Path, command: str, argument: str | None = None, interpreter: str | None = None
+) -> str:
+    identity = {
+        "argument": argument,
+        "command": command,
+        "interpreter": interpreter,
+        "root": str(root),
+    }
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
+def cached_results(entry: Any, *, validate_mtime: bool) -> list[str] | None:
+    if not isinstance(entry, dict) or not isinstance(entry.get("results"), list):
+        return None
+    records = entry["results"]
+    if not records:
+        return None
+
+    results: list[str] = []
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            return None
+        path = Path(record["path"])
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return None
+        if validate_mtime and record.get("mtime") != stat_result.st_mtime_ns:
+            return None
+        results.append(str(path))
+    return results
+
+
+def sorted_candidates(
+    candidates: Iterable[Path], predicate: Callable[[Path], bool]
+) -> list[Path]:
+    seen: set[str] = set()
+    matches: list[tuple[int, str, Path]] = []
+    for candidate in candidates:
+        absolute = candidate.absolute()
+        path_text = str(absolute)
+        if path_text in seen:
+            continue
+        seen.add(path_text)
+        try:
+            if not predicate(absolute):
+                continue
+            mtime = absolute.stat().st_mtime_ns
+        except OSError:
+            continue
+        matches.append((mtime, path_text, absolute))
+    matches.sort(key=lambda item: (-item[0], item[1]))
+    return [item[2] for item in matches]
+
+
+def locate_engine(root: Path, children: Sequence[str]) -> tuple[list[Path], bool]:
+    candidates = (
+        checkout / "target" / "release" / "axiom-rules-engine"
+        for checkout in checkout_roots(root, children)
+    )
+    matches = sorted_candidates(candidates, Path.is_file)
+    return matches[:1], True
+
+
+def locate_release(
+    root: Path, children: Sequence[str], name: str
+) -> tuple[list[Path], bool]:
+    candidates = (
+        checkout / "releases" / name for checkout in checkout_roots(root, children)
+    )
+    return sorted_candidates(candidates, Path.is_dir), True
+
+
+def selected_python(override: str | None) -> str:
+    if override:
+        candidate = os.path.expanduser(override)
+    elif os.environ.get("VIRTUAL_ENV"):
+        candidate = os.path.join(os.environ["VIRTUAL_ENV"], "bin", "python")
+    else:
+        candidate = "python3"
+
+    resolved = shutil.which(candidate)
+    if resolved:
+        return str(Path(resolved).resolve(strict=False))
+    if os.path.sep in candidate or (os.path.altsep and os.path.altsep in candidate):
+        return str(Path(candidate).resolve(strict=False))
+    return candidate
+
+
+def locate_pypkg(name: str, interpreter: str) -> tuple[list[Path], bool]:
+    statement = f"import {name}; print({name}.__file__)"
+    try:
+        completed = subprocess.run(
+            [interpreter, "-c", statement],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PYTHON_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return [], True
+    if completed.returncode != 0:
+        return [], True
+
+    output_lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if not output_lines or output_lines[-1] == "None":
+        return [], True
+    package_path = Path(output_lines[-1]).expanduser().resolve(strict=False)
+    if not package_path.exists():
+        return [], True
+    return [package_path], True
+
+
+def tracked_files(repo: Path, deadline: float) -> tuple[list[str], bool]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return [], False
+    timeout = min(CORPUS_GIT_TIMEOUT_SECONDS, remaining)
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "ls-files", "-z"],
+            check=False,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return [], False
+    if completed.returncode != 0:
+        return [], True
+    return [
+        os.fsdecode(path) for path in completed.stdout.split(b"\0") if path
+    ], True
+
+
+def locate_corpus_file(
+    root: Path, children: Sequence[str], fragment: str
+) -> tuple[list[Path], bool]:
+    repos = [
+        root / name
+        for name in children
+        if name == "axiom-corpus" or name.startswith("axiom-corpus-")
+    ]
+    deadline = time.monotonic() + CORPUS_COMMAND_DEADLINE_SECONDS
+    matches: set[str] = set()
+    complete = True
+    for repo in repos:
+        if not repo.is_dir():
+            continue
+        paths, repo_complete = tracked_files(repo, deadline)
+        complete = complete and repo_complete
+        if not repo_complete and time.monotonic() >= deadline:
+            break
+        for tracked_path in paths:
+            if fragment not in tracked_path and not fnmatch.fnmatchcase(
+                tracked_path, fragment
+            ):
+                continue
+            candidate = (repo / tracked_path).absolute()
+            if candidate.exists():
+                matches.add(str(candidate))
+    if time.monotonic() >= deadline and repos:
+        complete = False
+    return [Path(path) for path in sorted(matches)], complete
+
+
+def valid_release_name(name: str) -> bool:
+    if not name or name in {".", ".."}:
+        return False
+    if os.path.sep in name or (os.path.altsep and os.path.altsep in name):
+        return False
+    return True
+
+
+def add_shared_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="bypass cached results",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="emit a JSON result object",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="axiom-locate",
+        description="Locate Axiom artifacts with bounded, purpose-specific lookups.",
+    )
+    add_shared_options(parser)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    engine_parser = subparsers.add_parser("engine", help="locate the newest engine")
+    add_shared_options(engine_parser)
+
+    release_parser = subparsers.add_parser("release", help="locate corpus releases")
+    release_parser.add_argument("name")
+    add_shared_options(release_parser)
+
+    pypkg_parser = subparsers.add_parser("pypkg", help="locate an imported package")
+    pypkg_parser.add_argument("name")
+    pypkg_parser.add_argument("--python", dest="python_path")
+    add_shared_options(pypkg_parser)
+
+    corpus_parser = subparsers.add_parser(
+        "corpus-file", help="locate tracked files in corpus checkouts"
+    )
+    corpus_parser.add_argument("path_fragment")
+    add_shared_options(corpus_parser)
+    return parser
+
+
+def emit(query: str, results: Sequence[str], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"query": query, "results": list(results)}))
+    else:
+        for result in results:
+            print(result)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
+    refresh = getattr(arguments, "refresh", False)
+    as_json = getattr(arguments, "json", False)
+    root = mirror_root()
+    children = root_children(root)
+    interpreter: str | None = None
+    argument: str | None = None
+
+    if arguments.command == "engine":
+        query = "engine"
+        locator = lambda: locate_engine(root, children)
+    elif arguments.command == "release":
+        if not valid_release_name(arguments.name):
+            parser.error("release name must be one path component")
+        argument = arguments.name
+        query = f"release {argument}"
+        locator = lambda: locate_release(root, children, argument)
+    elif arguments.command == "pypkg":
+        if not arguments.name.isidentifier() or keyword.iskeyword(arguments.name):
+            parser.error("package name must be a legal Python identifier")
+        argument = arguments.name
+        interpreter = selected_python(arguments.python_path)
+        query = f"pypkg {argument}"
+        locator = lambda: locate_pypkg(argument, interpreter)
+    else:
+        if not arguments.path_fragment:
+            parser.error("path fragment must not be empty")
+        argument = arguments.path_fragment
+        query = f"corpus-file {argument}"
+        locator = lambda: locate_corpus_file(root, children, argument)
+
+    path = cache_path()
+    cache = load_cache(path)
+    entries = cache["entries"]
+    key = cache_key(root, arguments.command, argument, interpreter)
+    results: list[str] | None = None
+    if not refresh:
+        results = cached_results(
+            entries.get(key), validate_mtime=arguments.command == "engine"
+        )
+
+    complete = True
+    if results is None:
+        located_paths, complete = locator()
+        records = records_for_paths(located_paths)
+        results = [record["path"] for record in records]
+        entries.pop(key, None)
+        if records and complete:
+            entries[key] = {"results": records}
+        write_cache(path, cache)
+
+    emit(query, results, as_json)
+    if not complete:
+        print(
+            "axiom-locate: corpus lookup reached its time limit; results may be incomplete",
+            file=sys.stderr,
+        )
+    if not results:
+        print(f"axiom-locate: no results for {query}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
