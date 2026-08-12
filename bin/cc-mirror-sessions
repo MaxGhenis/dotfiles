@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""cc-mirror-sessions — make every Claude account share one combined Code sidebar.
+
+The Claude desktop app stores one small JSON "index" file per Claude Code session at:
+
+    ~/Library/Application Support/Claude/claude-code-sessions/<accountUuid>/<orgUuid>/local_<id>.json
+
+The sidebar shows only the folder for the *currently logged-in* account, so sessions
+vanish when you switch logins. The transcript itself lives in
+~/.claude/projects/<cwd>/<cliSessionId>.jsonl and is account-agnostic — only the folder
+an index file sits in decides which account "owns" it. This tool unifies the sidebars.
+
+IDENTITY & CORRECTNESS (learned the hard way):
+  * A session's stable identity is its FILENAME (`local_<sessionId>.json`), NOT its
+    cliSessionId. Resuming a session under another account keeps the filename but the
+    cliSessionId is filled in later — so an early copy can be frozen with an empty
+    cliSessionId and render as "no messages". We therefore mirror the *resolvable*
+    version (the copy whose cliSessionId has a real transcript on disk) and OVERWRITE
+    stale empty copies.
+  * Claude Code prunes old transcripts (default ~30 days; consider raising
+    cleanupPeriodDays in ~/.claude/settings.json). A session whose
+    transcript is gone is "dead" — it shows "no messages" in EVERY account. We never
+    spread dead sessions; we keep each dead session only in its home account
+    (--dead-home). BUT: if you keep a raw-transcript backup (an "archive" glob in
+    ~/.claude/cc-mirror.json), a dead session whose transcript survives there is
+    REVIVED first — the transcript is copied back to
+    ~/.claude/projects/<cwd-slug>/<cli>.jsonl, making the session openable again
+    everywhere. Creation-only and idempotent.
+
+Behavior: revives dead sessions from the transcript archive (if configured), then
+copies/repairs index
+files so every account shows every *openable* session. Dead-session copies that were
+previously spread are pruned back to the home account.
+
+FLAG SYNC (added 2026-08-05): isArchived and title live inside each per-account index
+file, so archiving (or renaming) a session in one account never propagated — switch
+accounts and the archive status "goes away". Step 1.6 syncs both across all copies of
+a session. Semantics: a sidecar (~/.claude/cc-mirror-state.json, keyed by
+cliSessionId) remembers each session's last-synced values; a copy that differs from
+that base is a user action, and the *change* wins in both directions (archive AND
+un-archive). On first-ever divergence (no base — the historical backlog, or a revived
+dead store) archived-anywhere wins, and divergent titles prefer a manual rename, then
+the most recently active copy. No mtime adjudication: the app rewrites these files on
+mere focus, so mtimes are noise. Note the app only re-reads the store at launch/account
+switch, so an archive flip becomes visible elsewhere at the next restart or switch.
+Always backs nothing up itself — make a backup first if you're nervous (the launchd
+job has run against a backup in ~/.claude/backups/).
+
+TRANSCRIPT-ANCHORED TITLES (added 2026-08-12): the app appends a
+{"type": "custom-title"} record to the session transcript on every (re)title, so
+the transcript's last record is the newest intended name — account-agnostic,
+append-only, and written even when the index write is skipped or lost (the
+anthropics/claude-code#85794 regression class). Step 1.6 treats a change in that
+record since the last sync as a rename and stamps it across every index copy, so
+session names persist across accounts even if no index file ever caught the
+rename. Transcript tails are re-read only when the transcript mtime moves.
+
+Usage:
+    cc-mirror-sessions            # sync now: add missing + repair stale-empty openable sessions
+    cc-mirror-sessions --list     # show per-account openable/dead counts, do nothing
+    cc-mirror-sessions --dry-run  # show what would change, change nothing
+    cc-mirror-sessions --prune    # also remove dead-session copies (app usually does this itself)
+    cc-mirror-sessions --quiet    # one-line summary (launchd)
+    cc-mirror-sessions --dead-home <orgUuid>   # account to keep dead sessions in
+    cc-mirror-sessions --no-restore            # skip reviving from the transcript archive
+    cc-mirror-sessions --archive <glob>        # override transcript-archive location
+    cc-mirror-sessions --no-flag-sync          # skip isArchived/title propagation
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import re
+import shutil
+import sys
+import time
+
+__version__ = "5.0"
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, "Library", "Application Support", "Claude", "claude-code-sessions")
+PROJ = os.path.join(HOME, ".claude", "projects")
+LOCKFILE = os.path.join(HOME, "Library", "Application Support", "Claude", ".cc-mirror-sessions.lock")
+# Last-synced isArchived/title per cliSessionId — the merge base for flag sync.
+STATE = os.path.join(HOME, ".claude", "cc-mirror-state.json")
+# Optional per-user settings so the launchd job needs no CLI args:
+#   { "dead_home": "<orgUuid to park dead sessions in>",
+#     "archive":   "<recursive glob of raw-transcript backups; ~ is expanded>",
+#     "exclude":   ["<uuid>", ...] }
+CONFIG = os.path.join(HOME, ".claude", "cc-mirror.json")
+
+
+def load_config(path=None):
+    try:
+        with open(path or CONFIG) as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def resolve_emails():
+    """Best-effort accountUuid/orgUuid -> label map, for --list output only."""
+    labels = {}
+    try:
+        with open(os.path.join(HOME, ".claude.json")) as f:
+            acct = json.load(f).get("oauthAccount") or {}
+        if acct.get("emailAddress"):
+            for k in ("accountUuid", "organizationUuid"):
+                if acct.get(k):
+                    labels[acct[k]] = acct["emailAddress"]
+    except Exception:
+        pass
+    uuid_re = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    blob = b""
+    for p in glob.glob(os.path.join(HOME, "Library", "Application Support", "Claude",
+                                     "Local Storage", "leveldb", "*")):
+        if os.path.isfile(p):
+            try:
+                with open(p, "rb") as f:
+                    blob += f.read()
+            except Exception:
+                pass
+    text = blob.decode("latin-1", "ignore")
+    for m in re.finditer(r'"(?:emailAddress|email|account_email)"\s*:\s*"([^"]+@[^"]+)"', text):
+        window = text[max(0, m.start() - 400): m.end() + 400]
+        for u in set(re.findall(uuid_re, window)):
+            labels.setdefault(u, m.group(1))
+    try:
+        with open(os.path.join(HOME, ".claude", "cc-mirror-accounts.json")) as f:
+            labels.update({k: v for k, v in json.load(f).items() if v})
+    except Exception:
+        pass
+    return labels
+
+
+def discover_folders(exclude):
+    folders = []
+    for acct_dir in sorted(glob.glob(os.path.join(BASE, "*"))):
+        if not os.path.isdir(acct_dir):
+            continue
+        acct = os.path.basename(acct_dir)
+        for org_dir in sorted(glob.glob(os.path.join(acct_dir, "*"))):
+            if not os.path.isdir(org_dir):
+                continue
+            org = os.path.basename(org_dir)
+            if any(x and (x in acct or x in org) for x in exclude):
+                continue
+            folders.append((acct, org, org_dir))
+    return folders
+
+
+def transcript_stems():
+    """Map <stem> -> transcript path for every ~/.claude/projects/**/*.jsonl
+    (a session is openable iff its cliSessionId is a key)."""
+    return {os.path.basename(p)[:-6]: p
+            for p in glob.glob(os.path.join(PROJ, "**", "*.jsonl"), recursive=True)}
+
+
+def transcript_title(path, window=262144):
+    """Newest {"type": "custom-title"} record in the transcript tail. The app
+    appends one on every (re)title — UI, backend, and auto alike — so the last
+    record is the newest intended title regardless of which account's index
+    caught it (verified 2026-08-12 against a live rename). Returns None when no
+    record is inside the window: treat that as no-signal, never as a change."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - window))
+            tail = f.read().decode("utf-8", "ignore")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        if '"custom-title"' not in line:
+            continue
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        if j.get("type") == "custom-title":
+            t = j.get("customTitle")
+            if isinstance(t, str) and t:
+                return t
+    return None
+
+
+def load(fp):
+    try:
+        with open(fp) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def slug(cwd):
+    """~/.claude/projects folder name for a session cwd (rule verified empirically
+    against 400 live transcripts on 2026-07-04)."""
+    return re.sub(r"[^A-Za-z0-9-]", "-", cwd)
+
+
+def archive_index(pattern):
+    """Map transcript stem -> archived path. Largest file wins on duplicate stems
+    (an archive can hold multiple snapshots of the same session)."""
+    best = {}
+    for p in glob.glob(pattern, recursive=True):
+        stem = os.path.basename(p)[:-6]
+        try:
+            sz = os.path.getsize(p)
+        except OSError:   # archive sync may unlink+rewrite files mid-walk
+            continue
+        prev = best.get(stem)
+        if prev is None or sz > prev[0]:
+            best[stem] = (sz, p)
+    return {stem: sp[1] for stem, sp in best.items()}
+
+
+def restore_dead(folder_files, stems, pattern, dry_run):
+    """Revive dead sessions: copy the archived transcript back to
+    ~/.claude/projects/<slug(cwd)>/<cli>.jsonl. Creation-only — never overwrites
+    or deletes; safe to run every launchd cycle. Mutates `stems` so the caller's
+    mirroring step treats revived sessions as openable. Returns count revived."""
+    dead = {}
+    for files in folder_files.values():
+        for d in files.values():
+            cli = d.get("cliSessionId") or ""
+            if not cli or cli in stems:
+                continue
+            # Worktree sessions live under the ORIGIN project dir, so prefer
+            # the entry that knows its originCwd.
+            if cli not in dead or (d.get("originCwd") and not dead[cli].get("originCwd")):
+                dead[cli] = d
+    if not dead:
+        return 0
+    archive = archive_index(pattern)
+    revived = 0
+    for cli, d in sorted(dead.items()):
+        src = archive.get(cli)
+        cwd = d.get("originCwd") or d.get("cwd")
+        if not src or not cwd:
+            continue
+        dest = os.path.join(PROJ, slug(cwd), cli + ".jsonl")
+        if not dry_run:
+            if os.path.exists(dest):          # raced with another writer
+                stems[cli] = dest
+                continue
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                tmp = dest + ".tmp-revive"
+                shutil.copyfile(src, tmp)
+                os.replace(tmp, dest)
+                now = time.time()
+                os.utime(dest, (now, now))    # fresh mtime: cleanup can't insta-prune
+            except OSError:
+                continue
+        stems[cli] = dest
+        revived += 1
+    return revived
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Unify Claude Code sidebars across accounts.")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--prune", action="store_true",
+                    help="also remove dead (transcript-pruned) session copies, keeping one in --dead-home "
+                         "(off by default: the Claude app prunes these itself on load)")
+    ap.add_argument("--dead-home", default=None, metavar="ORG",
+                    help="org folder to keep dead (transcript-pruned) sessions in "
+                         "(default: \"dead_home\" in ~/.claude/cc-mirror.json)")
+    ap.add_argument("--exclude", action="append", default=[], metavar="UUID")
+    ap.add_argument("--no-restore", action="store_true",
+                    help="skip reviving dead sessions from the transcript archive")
+    ap.add_argument("--no-flag-sync", action="store_true",
+                    help="skip syncing isArchived/title across accounts")
+    ap.add_argument("--archive", default=None, metavar="GLOB",
+                    help="recursive glob for archived transcripts (default: \"archive\" "
+                         "in ~/.claude/cc-mirror.json; no archive -> no revive step)")
+    ap.add_argument("--version", action="version", version="cc-mirror-sessions %s" % __version__)
+    args = ap.parse_args()
+    cfg = load_config()
+    if args.dead_home is None:
+        args.dead_home = cfg.get("dead_home") or ""
+    if args.archive is None:
+        args.archive = cfg.get("archive") or ""
+    args.archive = os.path.expanduser(args.archive)
+    args.exclude = list(args.exclude) + [x for x in (cfg.get("exclude") or []) if x]
+
+    if not os.path.isdir(BASE):
+        print(f"No session store found at {BASE}", file=sys.stderr)
+        return 1
+
+    os.makedirs(os.path.dirname(LOCKFILE), exist_ok=True)
+    lock_fd = open(LOCKFILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if not args.quiet:
+            print("Another run is in progress; skipping.")
+        return 0
+
+    labels = resolve_emails() if (args.list or not args.quiet) else {}
+    folders = discover_folders(args.exclude)
+    stems = transcript_stems()
+
+    def label(acct, org):
+        return labels.get(org) or labels.get(acct) or f"{acct[:8]}…/{org[:8]}…"
+
+    def resolvable(d):
+        cli = d.get("cliSessionId") or ""
+        return bool(cli) and cli in stems
+
+    if args.list:
+        print("Claude Code account folders (openable / dead):\n")
+        for acct, org, path in folders:
+            datas = [load(f) for f in glob.glob(os.path.join(path, "local_*.json"))]
+            ok = sum(1 for d in datas if resolvable(d))
+            print(f"  {ok:4d} openable + {len(datas) - ok:4d} dead = {len(datas):4d}   {label(acct, org)}")
+        return 0
+
+    def rank(d):
+        return d.get("lastActivityAt") or d.get("lastFocusedAt") or d.get("createdAt") or 0
+
+    # Index every folder once.
+    folder_files = {}   # path -> {filename: data}
+    folder_clis = {}    # path -> set of non-empty cliSessionIds present in that folder
+    fn_groups = {}      # filename -> {path: data}  (used only by --prune)
+    for acct, org, path in folders:
+        files, clis = {}, set()
+        for fp in glob.glob(os.path.join(path, "local_*.json")):
+            fn = os.path.basename(fp)
+            d = load(fp)
+            files[fn] = d
+            fn_groups.setdefault(fn, {})[path] = d
+            cli = d.get("cliSessionId") or ""
+            if cli:
+                clis.add(cli)
+        folder_files[path] = files
+        folder_clis[path] = clis
+
+    # 0) Revive dead sessions whose transcript survives in the archive. Mutates
+    #    `stems`, so the steps below treat revived sessions as openable and
+    #    spread them to every account.
+    revived = 0
+    if not args.no_restore and args.archive:
+        revived = restore_dead(folder_files, stems, args.archive, args.dry_run)
+
+    canon = {}          # cliSessionId -> (rank, data, filename, src_path)  for OPENABLE sessions
+    for path, files in folder_files.items():
+        for fn, d in files.items():
+            if resolvable(d):
+                cli = d.get("cliSessionId") or ""
+                r = rank(d)
+                if cli not in canon or r > canon[cli][0]:
+                    canon[cli] = (r, d, fn, os.path.join(path, fn))
+
+    added = fixed = pruned = 0
+
+    # 1) Mirror each OPENABLE session (keyed by its globally-unique cliSessionId) into every
+    #    account missing it. local_<id> filenames are NOT unique across accounts, so on a
+    #    filename collision fall back to a cli-derived name instead of clobbering.
+    for cli, (r, data, fn, src) in canon.items():
+        for acct, org, path in folders:
+            if cli in folder_clis[path]:
+                continue                                          # account already has this session
+            existing = folder_files[path].get(fn)
+            if existing is None:                                  # name free -> copy as-is
+                if not args.dry_run:
+                    shutil.copy2(src, os.path.join(path, fn))
+                    folder_files[path][fn] = dict(data)           # flag-sync sees the new copy
+                    folder_clis[path].add(cli)
+                added += 1
+            elif not (existing.get("cliSessionId") or ""):        # stale empty -> repair in place
+                if not args.dry_run:
+                    shutil.copy2(src, os.path.join(path, fn))
+                    folder_files[path][fn] = dict(data)
+                    folder_clis[path].add(cli)
+                fixed += 1
+            else:                                                 # name taken by a different session
+                dst = os.path.join(path, "local_%s.json" % cli)
+                if os.path.exists(dst):
+                    continue
+                if not args.dry_run:
+                    body = dict(data)
+                    body["sessionId"] = "local_%s" % cli          # keep file self-consistent
+                    with open(dst, "w") as f:
+                        json.dump(body, f)
+                    os.utime(dst, (os.path.getmtime(src),) * 2)   # preserve sidebar ordering
+                    folder_files[path]["local_%s.json" % cli] = body
+                    folder_clis[path].add(cli)
+                added += 1
+
+    # 1.6) Sync mutable per-session state (isArchived, title) across every copy.
+    #    The sidecar STATE holds each session's last-synced values (the merge base):
+    #    a copy that differs from base is a user action, so the CHANGE propagates —
+    #    archive and un-archive both work, no mtime guessing (the app rewrites these
+    #    files on mere focus, so mtimes are noise). Bootstrap (no base, e.g. the
+    #    pre-2026-08-05 backlog or a revived dead store): archived-anywhere wins;
+    #    divergent titles prefer a manual rename, then the most recently active copy.
+    flag_synced = retitled = t_retitled = 0
+    if not args.no_flag_sync:
+        try:
+            with open(STATE) as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+        groups = {}
+        for path, files in folder_files.items():
+            for fn, d in files.items():
+                cli = d.get("cliSessionId") or ""
+                if cli:
+                    groups.setdefault(cli, []).append((path, fn, d))
+        new_state = {}
+        dirty = set()
+        for cli, copies in groups.items():
+            base = state.get(cli) or {}
+            title_of = lambda d: d.get("title") or ""
+            src_of = lambda d: d.get("titleSource") or "auto"
+            act_of = lambda d: d.get("lastActivityAt") or d.get("createdAt") or 0
+
+            vals = {bool(d.get("isArchived")) for _, _, d in copies}
+            if len(vals) == 1:
+                arch = vals.pop()
+            else:
+                b = base.get("isArchived")
+                arch = (not b) if isinstance(b, bool) else True
+                for path, fn, d in copies:
+                    if bool(d.get("isArchived")) != arch:
+                        d["isArchived"] = arch
+                        dirty.add((path, fn))
+                flag_synced += 1
+                if not args.quiet:
+                    print("  %s everywhere: %r" % ("archive" if arch else "un-archive",
+                                                   title_of(copies[0][2])[:60]))
+
+            title = None
+            tvals = {(title_of(d), src_of(d)) for _, _, d in copies}
+            if len(tvals) > 1:
+                bt = base.get("title")
+                if bt is not None:
+                    cands = [d for _, _, d in copies if title_of(d) != bt]
+                else:
+                    cands = [d for _, _, d in copies]
+                if cands:
+                    manual = [d for d in cands if src_of(d) == "manual"]
+                    w = max(manual or cands, key=act_of)
+                    title, tsrc = title_of(w), src_of(w)
+                    for path, fn, d in copies:
+                        if (title_of(d), src_of(d)) != (title, tsrc):
+                            d["title"], d["titleSource"] = title, tsrc
+                            dirty.add((path, fn))
+                    retitled += 1
+            elif tvals:
+                title = next(iter(tvals))[0]
+
+            # Transcript anchor (added 2026-08-12): the transcript's last
+            # custom-title record is the newest intended title, account-agnostic
+            # and append-only — it survives index wipes and app builds that skip
+            # the index write (anthropics/claude-code#85794). Same change-vs-base
+            # semantics as above: only a CHANGE in the transcript title since the
+            # last sync propagates; bootstrap just records the base. Tails are
+            # only re-read when the transcript mtime moved.
+            tpath = stems.get(cli)
+            tt, tmt = base.get("ttitle"), base.get("tmt")
+            if tpath:
+                try:
+                    m = os.path.getmtime(tpath)
+                except OSError:
+                    m = None
+                if m is not None and m != tmt:
+                    tmt = m
+                    read = transcript_title(tpath)
+                    if read is not None:
+                        tt = read
+            if (tt is not None and base.get("ttitle") is not None
+                    and tt != base["ttitle"] and tt != (title or "")):
+                w = max((d for _, _, d in copies), key=act_of)
+                tsrc = src_of(w)
+                for path, fn, d in copies:
+                    if (title_of(d), src_of(d)) != (tt, tsrc):
+                        d["title"], d["titleSource"] = tt, tsrc
+                        dirty.add((path, fn))
+                title = tt
+                t_retitled += 1
+                if not args.quiet:
+                    print("  transcript title everywhere: %r" % tt[:60])
+
+            rec = {"isArchived": arch}
+            if title is not None:
+                rec["title"] = title
+            if tt is not None:
+                rec["ttitle"] = tt
+            if tmt is not None:
+                rec["tmt"] = tmt
+            new_state[cli] = rec
+
+        for path, fn in sorted(dirty):
+            fp = os.path.join(path, fn)
+            d = folder_files[path].get(fn)
+            if d is None or args.dry_run:
+                continue
+            try:
+                mt = os.path.getmtime(fp) if os.path.exists(fp) else None
+                tmp = fp + ".tmp-flagsync"
+                with open(tmp, "w") as f:
+                    json.dump(d, f, separators=(",", ":"), ensure_ascii=False)
+                os.replace(tmp, fp)
+                if mt:
+                    os.utime(fp, (mt, mt))        # keep per-account sidebar ordering
+            except OSError:
+                continue
+        if not args.dry_run:
+            try:
+                tmp = STATE + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(new_state, f)
+                os.replace(tmp, STATE)
+            except OSError:
+                pass
+
+    # 2) Optional cleanup: remove DEAD (transcript-pruned) sessions spread to non-home
+    #    accounts. Off by default — the Claude app prunes these itself on load.
+    if args.prune:
+        home_path = next((p for a, o, p in folders if o == args.dead_home), None)
+        for fn, copies in fn_groups.items():
+            if any(resolvable(d) for d in copies.values()):
+                continue                                          # openable somewhere -> not dead
+            keep = home_path if home_path in copies else sorted(copies)[0]
+            for path in list(copies):
+                if path != keep:
+                    if not args.dry_run:
+                        try:
+                            os.remove(os.path.join(path, fn))
+                        except OSError:
+                            pass
+                    pruned += 1
+
+    verb = "Would" if args.dry_run else ""
+    summary = (f"added {added}, repaired {fixed}, revived {revived}, pruned {pruned}, "
+               f"flag-synced {flag_synced}, retitled {retitled}, t-retitled {t_retitled}")
+    if args.quiet:
+        if added or fixed or pruned or revived or flag_synced or retitled or t_retitled:
+            print(f"cc-mirror-sessions: {summary}")
+    else:
+        print(f"\n{(verb + ' ') if verb else ''}{'add/repair/prune' if verb else 'Done'}: {summary}\n")
+        for acct, org, path in folders:
+            files = glob.glob(os.path.join(path, "local_*.json"))
+            ok = sum(1 for f in files if resolvable(load(f)))
+            print(f"  {ok:4d} openable   {label(acct, org)}")
+        if (added or fixed) and not args.dry_run:
+            print("\nRestart the Claude app (⌘Q + reopen) to refresh the sidebar.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
