@@ -1,0 +1,46 @@
+#!/bin/bash
+# codex PATH shim — lane rotation for agent dispatch (ai-quota).
+#
+# Problem (observed week of 2026-08-16): dozens of orchestration lanes call
+# `codex exec` bare, so everything lands on the default ~/.codex home — 69% of
+# the week's runs on one account, which hit 100% of its weekly window while
+# the other three lanes idled at ~28%. Per-session instructions don't hold
+# across lanes; the dispatcher itself has to rotate.
+#
+# Behavior: for non-interactive subcommands (exec/e/review) with CODEX_HOME
+# unset, pick the best lane via codex-pick (distinct-account + window-aware,
+# spares the protected app account) and announce it on stderr. Everything
+# else — interactive TUI, login, resume, an explicitly exported CODEX_HOME —
+# passes through untouched. Opt out entirely with AI_QUOTA_NO_AUTOPICK=1.
+# Lanes that need a FIXED identity (attestation/provenance) must export
+# CODEX_HOME explicitly; the stderr notice makes any rotation visible in logs.
+set -uo pipefail
+
+_real_codex() {
+  for c in "$HOME/.bun/bin/codex" "$HOME/.bun/install/global/node_modules/.bin/codex"; do
+    [ -x "$c" ] && { echo "$c"; return; }
+  done
+  command -v -a codex 2>/dev/null | grep -vF "$HOME/bin/codex" | grep -vF "$HOME/dotfiles/bin/codex" | head -1
+}
+
+REAL="$(_real_codex)"
+if [ -z "$REAL" ]; then
+  echo "codex-shim: real codex binary not found" >&2
+  exit 127
+fi
+
+case "${1:-}" in
+  exec|e|review)
+    if [ -z "${CODEX_HOME:-}" ] && [ -z "${AI_QUOTA_NO_AUTOPICK:-}" ] && [ -x "$HOME/bin/codex-pick" ]; then
+      pick="$("$HOME/bin/codex-pick" 2>/dev/null)" || pick=""
+      if [ -n "$pick" ] && [ -d "$pick" ]; then
+        export CODEX_HOME="$pick"
+        echo "codex-shim: CODEX_HOME unset -> $pick (lane rotation; export CODEX_HOME or AI_QUOTA_NO_AUTOPICK=1 to opt out)" >&2
+        printf '%s\t%s\t%s\n' "$(date -Iseconds)" "$pick" "$PWD" \
+          >> "$HOME/chief-of-staff/state/ai-quota/autopick.log" 2>/dev/null || true
+      fi
+    fi
+    ;;
+esac
+
+exec "$REAL" "$@"
