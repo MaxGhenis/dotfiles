@@ -7,6 +7,7 @@ Config and scripts for my development machine. The interesting part is `bin/`:
 | [`claude-lane`](bin/claude-lane) | Hardened headless Claude Code dispatch pinned to an enrolled account "lane" via `CLAUDE_CODE_OAUTH_TOKEN` — retries transient failures, re-picks a lane on hard limits, salvages work on crash, and flags silent model downgrades. Documented below. |
 | [`claude-model`](bin/claude-model) | Which model is *actually* serving a Claude Code session — reads the transcript's per-message model field; `-e <model>` exits 1 on a silent downgrade. See [docs/model-self-knowledge.md](docs/model-self-knowledge.md). |
 | [`codex-run`](bin/codex-run) | Hardened `codex exec` dispatch — retries transient failures, salvages work on crash, unbreaks git in sandboxed worktrees. Documented below. |
+| [`codex-guard`](bin/codex-guard) | Unscoped-search guard for `codex-run` lanes: builds and trust-pins the Codex PreToolUse hook override, preflights it against the installed codex, dry-runs the hook (`codex-guard check "find / -name x"`). See [bin/README-codex-guard.md](bin/README-codex-guard.md). |
 | [`cc`](bin/cc) | Claude Code pane launcher (superseded by [tmux-claude-code](https://github.com/MaxGhenis/tmux-claude-code)) |
 | [`sweep-worktrees`](bin/sweep-worktrees) | Rescue-and-bundle stale git worktrees before removing them |
 
@@ -22,14 +23,14 @@ A wrapper for dispatching long `codex exec` runs from an orchestrating agent (or
 ### Usage
 
 ```bash
-codex-run -H <codex_home> -m <model> -C <workdir> -p <prompt_file> -o <out_file> \
+codex-run [-H <codex_home>] -m <model> -C <workdir> -p <prompt_file> -o <out_file> \
           [-s read-only|workspace-write] [-b <salvage_branch>] [-R <salvage_remote>] \
           [-r <max_retries>]
 ```
 
 | Flag | Required | Meaning |
 |------|----------|---------|
-| `-H` | yes | `CODEX_HOME` for the run (auth, config) |
+| `-H` | no | Pin a specific lane (`CODEX_HOME`). Omit to auto-assign the best lane via `codex-pick` — orchestrators should not hand-pick lane numbers; pin only for attestation/provenance. On a mid-run usage limit, an auto-assigned run re-picks a different lane |
 | `-m` | yes | Model, e.g. `gpt-5.6-sol` |
 | `-C` | yes | Working directory (repo or worktree) |
 | `-p` | yes | Prompt file — contents become the codex prompt |
@@ -55,6 +56,8 @@ codex-run -H ~/.codex -m gpt-5.6-terra -C ~/src/public-repo \
           -p prompt.md -o out.md -b salvage/run -R mirror
 ```
 
+Every launch also arms the **unscoped-search guard**: `bin/codex-guard-hook` runs as a Codex PreToolUse hook (session-flags `-c hooks=...` override, trust hash pinned; the guard writes nothing to the lane's `CODEX_HOME` — its preflight probes a scratch copy of the lane's config) and denies whole-tree `find`/`rg`/`grep -r` over broad roots (`~`, the mirrors, `/tmp`, caches, `/`, `/Users`) — the 8/8 (load 47) and 8/18 (load 57) incidents. A preflight against the installed codex refuses to launch (exit 2, before the salvage trap is armed) if the hook would be skipped; `CODEX_RUN_GUARD=off` disables it for a run. Details, telemetry, known false positives/gaps, and rollback: [bin/README-codex-guard.md](bin/README-codex-guard.md).
+
 ### The three failure modes it fixes
 
 1. **Sandbox denies git in external worktrees.** Codex's `workspace-write` sandbox scopes writes to the working directory — but an external worktree's git metadata lives in the parent repo's *common* dir, so agents finish their edits and then can't commit (`.git/worktrees/<x>/index.lock: Operation not permitted`). The wrapper resolves `git rev-parse --git-common-dir` and adds it to `sandbox_workspace_write.writable_roots`.
@@ -68,7 +71,7 @@ codex-run -H ~/.codex -m gpt-5.6-terra -C ~/src/public-repo \
 | Code | Meaning |
 |------|---------|
 | 0 | Success: codex exited 0 **and** the output file is non-empty |
-| 2 | Usage error (missing flag, prompt file not found) |
+| 2 | Usage error (missing flag, prompt file not found), or the unscoped-search guard preflight refused to launch |
 | 3 | Content-filtered — rewrite the prompt, don't retry |
 | other | Codex's own exit code after retries were exhausted |
 
