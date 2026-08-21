@@ -1,8 +1,8 @@
 # dotfiles
 
 Config and scripts for my development machine. The interesting part is `bin/` —
-several of these are the dispatch layer of **ai-lanes**, my multi-account AI
-capacity stack (hub: the private ai-quota repo; public snapshot: the ai-lanes repo):
+several of these are the dispatch layer of **laines** (pronounced "lanes"), my
+multi-account AI capacity stack (hub: the private ai-quota repo):
 
 | Script | What it does |
 |--------|--------------|
