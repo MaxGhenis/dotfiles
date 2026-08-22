@@ -1,0 +1,4 @@
+# Python test bytecode / caches (tests/ runs under pytest and unittest)
+__pycache__/
+*.pyc
+.pytest_cache/
