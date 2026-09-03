@@ -1,5 +1,6 @@
 #!/bin/bash
-# openmessage-watchdog — keep OpenMessage's daemon alive AND its platforms honest.
+# openmessage-watchdog — keep OpenMessage's daemon alive AND its platforms
+# honest, and make silent darkness impossible.
 #
 # The macOS app owns the live daemon on 127.0.0.1:7007 (all transports: Google
 # Messages, WhatsApp, Signal). Two distinct failure classes, both handled here:
@@ -9,115 +10,389 @@
 #     reconnect throttling; see ~/openmessage/docs/agent-runbook.md).
 #  B. Daemon up but a platform silently stale (zombie Google session, stalled
 #     v2 projection 7/23-7/25, WhatsApp remote logout, ingest quarantine).
-#     → Alert via macOS notification. NO auto-restart for these: the in-app
-#     supervisors own platform recovery, restarts rarely fix platform-level
-#     death, and hammering reconnects gets the Google account throttled.
+#     → Alert. NO auto-restart for these: the in-app supervisors own platform
+#     recovery, restarts rarely fix platform-level death, and hammering
+#     reconnects gets the Google account throttled.
+#
+# Escalation channels (2026-09-03 hardening; the 8/29-9/3 incident proved
+# macOS banners alone cannot carry an outage — the disable flag sat for 5 days
+# while the watchdog logged "skip" 1,283 times, and the 30+ staleness banners
+# posted 8/21-8/29 did not get the outage fixed):
+#   1. Log — every decision, ~/Library/Logs/openmessage-watchdog.log.
+#   2. health.txt — "$HOME/Library/Application Support/OpenMessage/health.txt",
+#      machine-readable, atomically rewritten EVERY run on EVERY code path
+#      (even while disabled). Agents touching OpenMessage should read it
+#      before trusting sync freshness; updated_epoch older than ~15 min means
+#      the watchdog itself is not running.
+#   3. macOS banner with sound, posted via osascript (Script Editor's
+#      notification identity) by default. terminal-notifier is used only when
+#      OPENMESSAGE_WATCHDOG_NOTIFIER=terminal-notifier, which should be set
+#      only after confirming in System Settings > Notifications that
+#      terminal-notifier is allowed; the script cannot tell whether macOS
+#      shows a notifier's banners, so it does not guess. Best-effort only:
+#      Focus modes and disallowed notifier identities can eat these — never
+#      the sole channel for anything severe.
+#   4. Telegram (`~/bin/tg --alert`, CoS bot → Max's phone; the gateway holds
+#      alerts in quiet hours or over its daily budget for the morning card),
+#      severe tier only, with a
+#      daily per-condition cooldown: platform dark >=48h, global silence,
+#      projection stalled, daemon down >=1h or thrashing (>=3 relaunches in
+#      24h), disable flag held >24h, and flag expiry.
+#
+# Disable flag: ~/Library/Application Support/OpenMessage/watchdog-disabled
+#   - Touch it before intentionally quitting the app (re-pair recipe,
+#     debugging); remove it when done.
+#   - It EXPIRES. Default max age 12h; override by writing a line
+#     "max-age=<N>[s|m|h|d]" into the flag file (e.g. "max-age=48h"), capped at
+#     7d. There is deliberately no forever value. On expiry the flag is archived to
+#     $STATE_DIR/expired-flags/ and full checks resume (banner + telegram
+#     announce the re-enable).
+#   - While the flag is fresh: the daemon is still probed READ-ONLY (no
+#     actions taken) so health.txt stays truthful; a reminder banner posts
+#     every 6h; telegram reminds daily once the flag is >24h old.
+#   - Any other text in the flag file is treated as the reason and surfaced
+#     in the log and health.txt.
 #
 # Class-A behavior:
 #   - Probe /api/status. Dead + no app process: relaunch after 2 consecutive
 #     failed probes. Dead + app process present (hung): quit + relaunch after 3.
-#   - At most one relaunch action per 30 minutes.
+#   - At most one relaunch action per 30 minutes. No reconnect hammering:
+#     probes are read-only GETs; the relaunch is the only action ever taken.
 # Class-B checks (each 5-min run while the daemon responds):
 #   - platform paired but disconnected 3 consecutive checks (~15 min sustained;
-#     ignores sub-minute Google heal-cycle dips)     → notify once per episode
-#   - google.needs_repair 3 consecutive checks       → notify once per episode
+#     ignores sub-minute Google heal-cycle dips) → notify; while it STAYS
+#     disconnected, re-notify every 6h with the running duration (was once per
+#     episode — Signal sat disconnected for 2,700 consecutive checks in Aug '26
+#     with a single banner at minute 15), and telegram daily once >=48h dark
+#   - google.needs_repair 3 consecutive checks   → notify, re-notify 6h while
+#     sustained, telegram daily once >=48h
 #   - google.repairs_paced >= 3 (cookies being revoked faster than the repair
-#     floor — self-heal is losing)                   → notify, re-notify 6h
-#   - projection_stalled (top-level or per-platform) → notify, re-notify 6h
+#     floor — self-heal is losing)               → notify, re-notify 6h
 #   - a platform's latest_received trailing the newest message across all
 #     platforms by > 48h (relative check: other platforms flowing proves the
 #     pipe; one trailing = that platform is broken, not a quiet day)
-#                                                    → notify, re-notify 6h
+#                                                → notify 6h + telegram daily
 #   - newest message on ANY platform > 24h old (global silence; organically
 #     near-impossible at Max's volume — smells like zombie-everything)
-#                                                    → notify, re-notify 6h
-#   - v2 ingest quarantined > 0                      → notify, re-notify 6h
-#   - signal receive_recovery pending_count >= 5     → notify, re-notify 6h
+#                                                → notify 6h + telegram daily
+#   - projection_stalled (top-level or per-platform) — reads go stale while
+#     ingest continues                           → notify 6h + telegram daily
+#   - v2 ingest quarantined > 0                  → notify, re-notify 6h
+#   - signal receive_recovery pending_count >= 5 → notify, re-notify 6h
 #
-# Skips entirely if a manual pairing is in flight (`openmessage pair` process)
-# or the disable flag exists:
-#     ~/Library/Application Support/OpenMessage/watchdog-disabled
-# Touch that flag before intentionally quitting the app (re-pair recipe,
-# debugging); remove it when done.
+# Skips (still writing health.txt) if a manual pairing is in flight
+# (`openmessage pair` process) or the disable flag is fresh.
 #
-# Env overrides (testing): OPENMESSAGE_WATCHDOG_PORT, OPENMESSAGE_WATCHDOG_DRYRUN=1
-# (dryrun: log decisions, no relaunch, no notifications)
+# Env overrides (testing):
+#   OPENMESSAGE_WATCHDOG_PORT        daemon port (default 7007)
+#   OPENMESSAGE_WATCHDOG_DRYRUN=1    log decisions + write state/health, but
+#                                    no relaunch, no banner, no telegram, and
+#                                    never move/archive the flag
+#   OPENMESSAGE_WATCHDOG_STATE       state dir (default ~/.local/state/openmessage-watchdog)
+#   OPENMESSAGE_WATCHDOG_LOG         log file
+#   OPENMESSAGE_WATCHDOG_FLAG        disable-flag path
+#   OPENMESSAGE_WATCHDOG_HEALTH     health.txt path (dryrun default: $STATE_DIR/health.txt)
+#   OPENMESSAGE_WATCHDOG_APP         app bundle path (process name = basename)
+#   OPENMESSAGE_WATCHDOG_BANNER_CMD  command to run instead of the macOS banner
+#   OPENMESSAGE_WATCHDOG_NOTIFIER    banner poster: osascript (default) or
+#                                    terminal-notifier (opt-in; see channel 3)
+#   OPENMESSAGE_WATCHDOG_TERMINAL_NOTIFIER  terminal-notifier binary
+#                                    (default /opt/homebrew/bin/terminal-notifier)
+#   OPENMESSAGE_WATCHDOG_TG_BIN      telegram sender (default ~/bin/tg; called
+#                                    as `<bin> --alert "<message>"`)
+#   OPENMESSAGE_WATCHDOG_TG_TIMEOUT  seconds before a send is killed (default 30)
+# banner() strips quotes and backslashes before splicing into osascript.
 
 set -u
 PORT="${OPENMESSAGE_WATCHDOG_PORT:-7007}"
 DRYRUN="${OPENMESSAGE_WATCHDOG_DRYRUN:-0}"
-APP="/Applications/OpenMessage.app"
-FLAG="$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
+APP="${OPENMESSAGE_WATCHDOG_APP:-/Applications/OpenMessage.app}"
+APPNAME="$(basename "$APP" .app)"
+FLAG="${OPENMESSAGE_WATCHDOG_FLAG:-$HOME/Library/Application Support/OpenMessage/watchdog-disabled}"
 STATE_DIR="${OPENMESSAGE_WATCHDOG_STATE:-$HOME/.local/state/openmessage-watchdog}"
+LOG="${OPENMESSAGE_WATCHDOG_LOG:-$HOME/Library/Logs/openmessage-watchdog.log}"
+HEALTH="${OPENMESSAGE_WATCHDOG_HEALTH:-$HOME/Library/Application Support/OpenMessage/health.txt}"
+if [ "$DRYRUN" = "1" ] && [ -z "${OPENMESSAGE_WATCHDOG_HEALTH:-}" ]; then
+  HEALTH="$STATE_DIR/health.txt"
+fi
+BANNER_CMD="${OPENMESSAGE_WATCHDOG_BANNER_CMD:-}"
+NOTIFIER="${OPENMESSAGE_WATCHDOG_NOTIFIER:-osascript}"
+TN_BIN="${OPENMESSAGE_WATCHDOG_TERMINAL_NOTIFIER:-/opt/homebrew/bin/terminal-notifier}"
+TG_BIN="${OPENMESSAGE_WATCHDOG_TG_BIN:-$HOME/bin/tg}"
+TG_TIMEOUT="${OPENMESSAGE_WATCHDOG_TG_TIMEOUT:-30}"
+case "$TG_TIMEOUT" in ''|*[!0-9]*) TG_TIMEOUT=30 ;; esac
+
 FAILS_F="$STATE_DIR/consecutive_fails"
 LAST_ACTION_F="$STATE_DIR/last_action_epoch"
-LOG="${OPENMESSAGE_WATCHDOG_LOG:-$HOME/Library/Logs/openmessage-watchdog.log}"
-ALERT_COOLDOWN=21600   # 6h between repeat notifications per condition
+DOWN_SINCE_F="$STATE_DIR/down_since"
+RELAUNCHES_F="$STATE_DIR/relaunch_epochs"
+ALERT_COOLDOWN=21600        # 6h between repeat banners per condition
+TG_COOLDOWN=86400           # 24h between telegrams per condition
+FLAG_MAX_AGE_DEFAULT=43200  # 12h
+FLAG_MAX_AGE_CAP=604800     # 7d: the ceiling for any max-age override
+FLAG_REMINDER_EVERY=21600   # 6h reminder banners while disabled
 NOW=$(date +%s)
 mkdir -p "$STATE_DIR"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
-notify() { # $1 = message (keep quote-free)
-  log "NOTIFY: $1"
-  [ "$DRYRUN" = "1" ] && return 0
-  osascript -e "display notification \"$1\" with title \"OpenMessage watchdog\"" >/dev/null 2>&1
+read_state() { # $1 = state file; echo its integer content, else 0
+  local v
+  v=$(cat "$1" 2>/dev/null)
+  case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
 }
 
-[ -e "$FLAG" ] && { log "skip: disable flag present"; exit 0; }
-pgrep -f 'openmessage pair' >/dev/null 2>&1 && { log "skip: pairing in flight"; exit 0; }
-[ -d "$APP" ] || { log "skip: $APP not installed"; exit 0; }
+banner() { # $1 = message
+  log "NOTIFY: $1"
+  [ "$DRYRUN" = "1" ] && return 0
+  if [ -n "$BANNER_CMD" ]; then
+    $BANNER_CMD "$1" >/dev/null 2>&1
+    return 0
+  fi
+  # osascript unless terminal-notifier was explicitly opted into (see the
+  # header, channel 3). A failed opt-in post still falls back to osascript.
+  if [ "$NOTIFIER" = "terminal-notifier" ]; then
+    if [ -x "$TN_BIN" ]; then
+      "$TN_BIN" -title "OpenMessage watchdog" \
+        -message "$1" -sound default >/dev/null 2>&1 && return 0
+      log "terminal-notifier post failed; falling back to osascript"
+    else
+      log "terminal-notifier opted in but $TN_BIN is missing; using osascript"
+    fi
+  elif [ "$NOTIFIER" != "osascript" ]; then
+    log "unknown OPENMESSAGE_WATCHDOG_NOTIFIER=$NOTIFIER; using osascript"
+  fi
+  # The message is spliced into an AppleScript string literal, and some of it
+  # comes from the daemon (e.g. signal last_issue_reason): drop quotes and
+  # backslashes so it cannot end the literal early.
+  local msg
+  msg=${1//\"/}
+  msg=${msg//\\/}
+  osascript -e "display notification \"$msg\" with title \"OpenMessage watchdog\" sound name \"Submarine\"" >/dev/null 2>&1
+}
+
+tg_send() { # $1 = condition key, $2 = cooldown seconds (0 = always), $3 = message
+  local f last pid i
+  f="$STATE_DIR/tg_$1"
+  last=$(read_state "$f")
+  if [ "$2" -gt 0 ] && [ $(( NOW - last )) -lt "$2" ]; then
+    log "tg suppressed (cooldown): $1"
+    return 0
+  fi
+  echo "$NOW" > "$f"
+  log "TG: $3"
+  [ "$DRYRUN" = "1" ] && return 0
+  [ -x "$TG_BIN" ] || { log "tg unavailable ($TG_BIN)"; return 0; }
+  # `tg --alert` delivers through the chief-of-staff gateway (bin/say), which
+  # holds alerts during quiet hours or over its daily budget for the morning
+  # card and exits non-zero only when nothing reached Max; a bare `tg "msg"`
+  # is only logged. say's own network timeouts run past a minute, so cap the
+  # send here: three sends must fit well inside the 5-min launchd cadence.
+  PATH="$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" "$TG_BIN" --alert "$3" >/dev/null 2>&1 &
+  pid=$!
+  i=0
+  timed_out=0
+  while [ "$i" -lt "$TG_TIMEOUT" ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i+1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    # TERM, a short grace, then KILL: a sender that ignores TERM must not
+    # hang the run (and with it health.txt and every later launchd run).
+    kill "$pid" 2>/dev/null
+    i=0
+    while [ "$i" -lt 5 ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i+1)); done
+    kill -9 "$pid" 2>/dev/null
+    timed_out=1
+    log "tg send timed out: $1"
+  fi
+  if ! wait "$pid" 2>/dev/null && [ "$timed_out" = "0" ]; then
+    # Clean failure = nothing delivered: drop the cooldown stamp so the next
+    # run retries instead of going quiet for a day. (Timeouts keep the stamp -
+    # the message may have gone out, and duplicates beat hammering.)
+    log "tg send failed: $1"
+    rm -f "$f"
+  fi
+}
+
+health_lines=()  # current "alert: ..." conditions, cooldowns notwithstanding
+
+write_health() { # $1 watchdog state, $2 watchdog detail, $3 daemon state, $4 daemon detail
+  local dir tmp n i
+  dir=$(dirname "$HEALTH")
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 0
+  tmp="$HEALTH.tmp.$$"
+  n=${#health_lines[@]}
+  {
+    echo "# OpenMessage watchdog health - atomically rewritten each run (5-min cadence)"
+    echo "# by ~/dotfiles/bin/openmessage-watchdog (launchd com.maxghenis.openmessage-watchdog)."
+    echo "# Agents: read this before trusting OpenMessage sync freshness."
+    echo "# If updated_epoch is more than ~15 min old, the watchdog itself is not running."
+    echo "updated=$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "updated_epoch=$NOW"
+    echo "watchdog=$1"
+    echo "watchdog_detail=$2"
+    echo "daemon=$3"
+    echo "daemon_detail=$4"
+    echo "alerts=$n"
+    i=0
+    while [ "$i" -lt "$n" ]; do echo "${health_lines[$i]}"; i=$((i+1)); done
+  } > "$tmp" 2>/dev/null && mv "$tmp" "$HEALTH" 2>/dev/null
+}
+
+flag_max_age() { # parse "max-age=<N>[smhd]" from the flag file; echo seconds
+  local spec num unit secs
+  spec=$(grep -Eio 'max-age[ =:]*[0-9]+[smhd]?' "$FLAG" 2>/dev/null | head -1 \
+           | grep -Eo '[0-9]+[smhd]?' | head -1)
+  if [ -z "$spec" ]; then echo "$FLAG_MAX_AGE_DEFAULT"; return; fi
+  num=$(echo "$spec" | grep -Eo '^[0-9]+')
+  unit=$(echo "$spec" | grep -Eio '[smhd]$' | tr 'SMHD' 'smhd')
+  # Strip leading zeros (bash reads 08 as bad octal) and refuse huge values
+  # before any arithmetic can overflow; either way the result is capped.
+  while [ "${#num}" -gt 1 ] && [ "${num#0}" != "$num" ]; do num=${num#0}; done
+  if [ "${#num}" -gt 7 ]; then echo "$FLAG_MAX_AGE_CAP"; return; fi
+  case "$unit" in
+    m) secs=$(( num * 60 )) ;;
+    h) secs=$(( num * 3600 )) ;;
+    d) secs=$(( num * 86400 )) ;;
+    *) secs=$num ;;
+  esac
+  [ "$secs" -gt "$FLAG_MAX_AGE_CAP" ] && secs=$FLAG_MAX_AGE_CAP
+  echo "$secs"
+}
+
+# ---------- Disable flag: honored while fresh, never forever ----------
+if [ -e "$FLAG" ]; then
+  flag_mtime=$(stat -f %m "$FLAG" 2>/dev/null || echo "$NOW")
+  flag_age=$(( NOW - flag_mtime ))
+  max_age=$(flag_max_age)
+  case "$max_age" in ''|*[!0-9]*) max_age=$FLAG_MAX_AGE_DEFAULT ;; esac
+  age_h=$(( flag_age / 3600 ))
+  max_h=$(( max_age / 3600 ))
+  flag_reason=$(grep -Eiv '^[[:space:]]*(max-age|$)' "$FLAG" 2>/dev/null | head -1 | cut -c1-120)
+  if [ "$flag_age" -ge "$max_age" ]; then
+    log "disable flag expired (age ${age_h}h >= max ${max_h}h) - re-enabling"
+    if [ "$DRYRUN" = "1" ]; then
+      log "DRYRUN: would archive flag to $STATE_DIR/expired-flags/"
+    else
+      mkdir -p "$STATE_DIR/expired-flags"
+      mv "$FLAG" "$STATE_DIR/expired-flags/${NOW}-watchdog-disabled" 2>/dev/null || rm -f "$FLAG"
+    fi
+    rm -f "$STATE_DIR/flag_reminder_epoch" "$STATE_DIR/tg_flag_disabled"
+    banner "Watchdog re-enabled after flag expiry - disable flag was ${age_h}h old, max ${max_h}h. Daemon and platform checks resume now."
+    tg_send flag_expiry 0 "OpenMessage watchdog re-enabled itself after the disable flag expired (disabled ${age_h}h, max ${max_h}h). If you still need it off, re-touch the flag with a line like max-age=24h."
+    # fall through: this run resumes full checks
+  else
+    left_h=$(( (max_age - flag_age + 3599) / 3600 ))
+    # Read-only probe so health.txt and the reminder tell the truth about the
+    # daemon even while we are not acting on it.
+    probe_json=$(curl -s -m 5 "http://127.0.0.1:$PORT/api/status" 2>/dev/null)
+    if echo "$probe_json" | grep -q '"connected"'; then
+      dstate="up"; ddetail="probe ok (read-only while disabled)"
+      rm -f "$DOWN_SINCE_F"  # any earlier outage ended; don't carry its clock
+    else
+      dstate="down"; ddetail="probe failed; nothing will relaunch it until the flag expires (~${left_h}h)"
+      health_lines+=("alert: daemon down while watchdog disabled - messages NOT syncing")
+    fi
+    last_rem=$(read_state "$STATE_DIR/flag_reminder_epoch")
+    if [ $(( NOW - last_rem )) -ge "$FLAG_REMINDER_EVERY" ]; then
+      echo "$NOW" > "$STATE_DIR/flag_reminder_epoch"
+      banner "OpenMessage watchdog disabled ${age_h}h - expires in ~${left_h}h. Daemon ${dstate}. Messages may not be syncing."
+    fi
+    if [ "$flag_age" -ge 86400 ]; then
+      tg_send flag_disabled "$TG_COOLDOWN" "OpenMessage watchdog has been disabled ${age_h}h (daemon ${dstate}); it auto-expires in ~${left_h}h. Messages may not be syncing. Remove the flag if the maintenance is done."
+    fi
+    log "skip: disable flag present (age ${age_h}h, max ${max_h}h${flag_reason:+; reason: $flag_reason})"
+    health_lines+=("alert: watchdog disabled ${age_h}h, expires ~${left_h}h${flag_reason:+ - $flag_reason}")
+    write_health "disabled" "flag age ${age_h}h of ${max_h}h max${flag_reason:+; reason: $flag_reason}" "$dstate" "$ddetail"
+    exit 0
+  fi
+fi
+
+if pgrep -f 'openmessage pair' >/dev/null 2>&1; then
+  log "skip: pairing in flight"
+  write_health "pairing" "manual pairing in flight; checks paused" "unknown" "probe skipped"
+  exit 0
+fi
+if [ ! -d "$APP" ]; then
+  log "skip: $APP not installed"
+  write_health "app-missing" "$APP not installed" "unknown" "probe skipped"
+  exit 0
+fi
 
 STATUS_JSON=$(curl -s -m 5 "http://127.0.0.1:$PORT/api/status" 2>/dev/null)
 
 # ---------- Class A: daemon dead or hung → relaunch ----------
 if ! echo "$STATUS_JSON" | grep -q '"connected"'; then
-  fails=$(( $(cat "$FAILS_F" 2>/dev/null || echo 0) + 1 ))
+  fails=$(( $(read_state "$FAILS_F") + 1 ))
   echo "$fails" > "$FAILS_F"
+  # The outage clock starts at the episode's first failed probe and only a
+  # successful probe clears it. A relaunch resets the fail counter, not the
+  # clock: otherwise every relaunch restarts the outage and the >=1h telegram
+  # below can never fire while relaunches keep failing.
+  [ "$(read_state "$DOWN_SINCE_F")" -eq 0 ] && echo "$NOW" > "$DOWN_SINCE_F"
+  down_since=$(read_state "$DOWN_SINCE_F")
+  [ "$down_since" -eq 0 ] && down_since="$NOW"
+  down_h=$(( (NOW - down_since) / 3600 ))
 
   # App process = the Swift wrapper; its backend child is `openmessage serve --web`.
-  app_pid=$(pgrep -x OpenMessage || true)
+  app_pid=$(pgrep -x "$APPNAME" || true)
   if [ -n "$app_pid" ]; then
     threshold=3; mode="hung (app pid $app_pid, port dead)"
   else
     threshold=2; mode="dead (no app process)"
   fi
   log "probe failed ($fails/$threshold): $mode"
-  [ "$fails" -lt "$threshold" ] && exit 0
+  health_lines+=("alert: daemon down ~${down_h}h ($fails consecutive failed probes) - messages NOT syncing")
 
-  last_action=$(cat "$LAST_ACTION_F" 2>/dev/null || echo 0)
+  if [ $(( NOW - down_since )) -ge 3600 ]; then
+    tg_send daemon_down "$TG_COOLDOWN" "OpenMessage daemon has been down ${down_h}h despite watchdog relaunch attempts - messages NOT syncing. The Mac needs a look."
+  fi
+
+  if [ "$fails" -lt "$threshold" ]; then
+    write_health "active" "" "down" "$mode; $fails/$threshold probes failed, no action yet"
+    exit 0
+  fi
+
+  last_action=$(read_state "$LAST_ACTION_F")
   if [ $(( NOW - last_action )) -lt 1800 ]; then
     log "action throttled ($(( (NOW - last_action) / 60 ))m since last; need 30m)"
+    write_health "active" "" "down" "$mode; relaunch throttled (one action per 30m)"
     exit 0
   fi
 
   if [ "$DRYRUN" = "1" ]; then
     log "DRYRUN: would relaunch ($mode)"
+    write_health "active" "" "down" "$mode; DRYRUN would relaunch"
     exit 0
   fi
 
   if [ -n "$app_pid" ]; then
     log "quitting hung app (pid $app_pid)"
-    osascript -e 'quit app "OpenMessage"' >/dev/null 2>&1
+    osascript -e "quit app \"$APPNAME\"" >/dev/null 2>&1
     sleep 10
-    pgrep -x OpenMessage >/dev/null && { pkill -x OpenMessage; sleep 3; }
+    pgrep -x "$APPNAME" >/dev/null && { pkill -x "$APPNAME"; sleep 3; }
   fi
 
-  log "relaunching OpenMessage.app"
-  open -ga OpenMessage
+  log "relaunching $APPNAME.app"
+  open -ga "$APPNAME"
   echo "$NOW" > "$LAST_ACTION_F"
   echo 0 > "$FAILS_F"
-  notify "Daemon was down - relaunched the app. Messages were not syncing."
+  { awk -v cut=$(( NOW - 86400 )) '$1 >= cut' "$RELAUNCHES_F" 2>/dev/null; echo "$NOW"; } \
+    > "$RELAUNCHES_F.tmp" && mv "$RELAUNCHES_F.tmp" "$RELAUNCHES_F"
+  rcount=$(awk 'END {print NR}' "$RELAUNCHES_F" 2>/dev/null)
+  banner "Daemon was down - relaunched the app. Messages were not syncing."
+  if [ "${rcount:-0}" -ge 3 ]; then
+    tg_send daemon_thrash "$TG_COOLDOWN" "OpenMessage daemon relaunched $rcount times in 24h - it keeps dying, messages likely dropping. Needs a human look, not more relaunches."
+  fi
+  write_health "active" "" "down" "$mode; relaunched just now (attempt $rcount in 24h)"
   exit 0
 fi
 
 # ---------- Class B: daemon healthy → platform staleness sentinel ----------
-if [ -s "$FAILS_F" ] && [ "$(cat "$FAILS_F")" != "0" ]; then
-  log "healthy again (was $(cat "$FAILS_F") fails)"
-fi
+prev_fails=$(read_state "$FAILS_F")
+[ "$prev_fails" -ne 0 ] && log "healthy again (was $prev_fails fails)"
 echo 0 > "$FAILS_F"
+rm -f "$DOWN_SINCE_F"
 
-HEALTH=$(echo "$STATUS_JSON" | /usr/bin/python3 -c '
+HEALTH_OUT=$(echo "$STATUS_JSON" | /usr/bin/python3 -c '
 import json, sys, time
 try:
     d = json.load(sys.stdin)
@@ -137,17 +412,17 @@ if g.get("needs_repair"):
 if (g.get("repairs_paced") or 0) >= 3:
     out.append("ALERT|repairs_paced|Google cookie repairs throttled (repairs_paced=%s) - something revokes cookies fast" % g.get("repairs_paced"))
 if d.get("projection_stalled"):
-    out.append("ALERT|projection_stalled|v2 read projection stalled - reads are stale while ingest continues")
+    out.append("DARK|projection_stalled|v2 read projection stalled - reads are stale while ingest continues")
 for name, f in fresh.items():
     if not isinstance(f, dict):
         continue
     if f.get("projection_stalled"):
-        out.append("ALERT|proj_%s|%s projection stalled" % (name, name))
+        out.append("DARK|proj_%s|%s projection stalled" % (name, name))
     lat = f.get("latest_received_ms") or f.get("latest_ms") or 0
     if lat and newest and newest - lat > 48 * 3600 * 1000:
-        out.append("ALERT|behind_%s|%s received nothing for %.1fd while other platforms flow" % (name, name, (newest - lat) / 86400000.0))
+        out.append("DARK|behind_%s|%s received nothing for %.1fd while other platforms flow" % (name, name, (newest - lat) / 86400000.0))
 if newest and now_ms - newest > 24 * 3600 * 1000:
-    out.append("ALERT|all_quiet|No messages on ANY platform for %dh - likely silent global failure" % int((now_ms - newest) / 3600000))
+    out.append("DARK|all_quiet|No messages on ANY platform for %dh - likely silent global failure" % int((now_ms - newest) / 3600000))
 per = (d.get("v2_ingest") or {}).get("per_account") or {}
 q = sum((a.get("quarantined") or 0) for a in per.values() if isinstance(a, dict))
 if q:
@@ -158,60 +433,115 @@ if (rr.get("pending_count") or 0) >= 5:
 print("\n".join(out))
 ')
 
-alerts=()
+notifies=()
 disc_seen=" "
 repair_seen=0
+
+alert_gate() { # $1 = cooldown key; returns 0 if a banner may fire now (and stamps)
+  local last
+  last=$(read_state "$STATE_DIR/alert_$1")
+  if [ $(( NOW - last )) -ge "$ALERT_COOLDOWN" ]; then
+    echo "$NOW" > "$STATE_DIR/alert_$1"
+    return 0
+  fi
+  log "suppressed (cooldown): $1"
+  return 1
+}
 
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   case "$line" in
     PARSEERR\|*)
-      log "status parse error: ${line#PARSEERR|}" ;;
+      log "status parse error: ${line#PARSEERR|}"
+      health_lines+=("alert: status parse error - ${line#PARSEERR|}") ;;
     DISC\|*)
       name=${line#DISC|}
       disc_seen="$disc_seen$name "
-      c=$(( $(cat "$STATE_DIR/disc_$name" 2>/dev/null || echo 0) + 1 ))
+      c=$(( $(read_state "$STATE_DIR/disc_$name") + 1 ))
       echo "$c" > "$STATE_DIR/disc_$name"
-      log "disconnected: $name ($c/3)"
-      [ "$c" -eq 3 ] && alerts+=("$name disconnected 15+ min - in-app recovery may be stuck") ;;
+      [ "$c" -eq 1 ] && echo "$NOW" > "$STATE_DIR/disc_since_$name"
+      since=$(read_state "$STATE_DIR/disc_since_$name")
+      # Missing since-file mid-episode (state loss/migration): start the clock
+      # now and persist it so duration still accrues toward escalation.
+      [ "$since" -eq 0 ] && { since="$NOW"; echo "$NOW" > "$STATE_DIR/disc_since_$name"; }
+      dur_h=$(( (NOW - since) / 3600 ))
+      log "disconnected: $name ($c consecutive checks, ~${dur_h}h)"
+      if [ "$c" -ge 3 ]; then
+        health_lines+=("alert: $name disconnected ~${dur_h}h ($c consecutive checks) - $name messages NOT syncing")
+        if [ "$c" -eq 3 ]; then
+          msg="$name disconnected 15+ min - in-app recovery may be stuck"
+        else
+          msg="$name still disconnected ~${dur_h}h - in-app recovery is NOT recovering it"
+        fi
+        alert_gate "disc_$name" && notifies+=("$msg")
+        if [ $(( NOW - since )) -ge 172800 ]; then
+          dur_d=$(( (NOW - since) / 86400 ))
+          tg_send "disc_$name" "$TG_COOLDOWN" "OpenMessage: $name has been disconnected ${dur_d}d - $name messages are NOT syncing. In-app recovery is stuck; it needs a re-pair or app restart."
+        fi
+      fi ;;
     REPAIR\|google)
       repair_seen=1
-      c=$(( $(cat "$STATE_DIR/repair_google" 2>/dev/null || echo 0) + 1 ))
+      c=$(( $(read_state "$STATE_DIR/repair_google") + 1 ))
       echo "$c" > "$STATE_DIR/repair_google"
-      log "google needs_repair ($c/3)"
-      [ "$c" -eq 3 ] && alerts+=("Google needs repair 15+ min - cookie self-heal is not recovering it") ;;
+      [ "$c" -eq 1 ] && echo "$NOW" > "$STATE_DIR/repair_since_google"
+      since=$(read_state "$STATE_DIR/repair_since_google")
+      [ "$since" -eq 0 ] && { since="$NOW"; echo "$NOW" > "$STATE_DIR/repair_since_google"; }
+      dur_h=$(( (NOW - since) / 3600 ))
+      log "google needs_repair ($c consecutive checks, ~${dur_h}h)"
+      if [ "$c" -ge 3 ]; then
+        health_lines+=("alert: google needs repair ~${dur_h}h ($c consecutive checks)")
+        if [ "$c" -eq 3 ]; then
+          msg="Google needs repair 15+ min - cookie self-heal is not recovering it"
+        else
+          msg="Google still needs repair ~${dur_h}h - cookie self-heal is NOT recovering it"
+        fi
+        alert_gate repair_google && notifies+=("$msg")
+        if [ $(( NOW - since )) -ge 172800 ]; then
+          dur_d=$(( (NOW - since) / 86400 ))
+          tg_send repair_google "$TG_COOLDOWN" "OpenMessage: Google has needed repair for ${dur_d}d - cookie self-heal is losing. Google Messages sync is at risk."
+        fi
+      fi ;;
+    DARK\|*)
+      rest=${line#DARK|}
+      key=${rest%%|*}
+      msg=${rest#*|}
+      health_lines+=("alert: $msg")
+      alert_gate "$key" && notifies+=("$msg")
+      tg_send "dark_$key" "$TG_COOLDOWN" "OpenMessage: $msg" ;;
     ALERT\|*)
       rest=${line#ALERT|}
       key=${rest%%|*}
       msg=${rest#*|}
-      last=$(cat "$STATE_DIR/alert_$key" 2>/dev/null || echo 0)
-      if [ $(( NOW - last )) -ge "$ALERT_COOLDOWN" ]; then
-        echo "$NOW" > "$STATE_DIR/alert_$key"
-        alerts+=("$msg")
-      else
-        log "suppressed (cooldown): $key"
-      fi ;;
+      health_lines+=("alert: $msg")
+      alert_gate "$key" && notifies+=("$msg") ;;
   esac
-done <<< "$HEALTH"
+done <<< "$HEALTH_OUT"
 
-# Reset consecutive counters for conditions absent this run.
+# Reset consecutive counters (and episode state) for conditions absent this run.
 for p in google whatsapp signal; do
   case "$disc_seen" in
     *" $p "*) ;;
-    *) [ -s "$STATE_DIR/disc_$p" ] && [ "$(cat "$STATE_DIR/disc_$p")" != "0" ] \
-         && { log "reconnected: $p"; echo 0 > "$STATE_DIR/disc_$p"; } ;;
+    *) if [ "$(read_state "$STATE_DIR/disc_$p")" -ne 0 ]; then
+         log "reconnected: $p"
+         echo 0 > "$STATE_DIR/disc_$p"
+       fi
+       rm -f "$STATE_DIR/disc_since_$p" "$STATE_DIR/alert_disc_$p" "$STATE_DIR/tg_disc_$p" ;;
   esac
 done
-if [ "$repair_seen" = "0" ] && [ -s "$STATE_DIR/repair_google" ] \
-     && [ "$(cat "$STATE_DIR/repair_google")" != "0" ]; then
-  log "google repair cleared"
-  echo 0 > "$STATE_DIR/repair_google"
+if [ "$repair_seen" = "0" ]; then
+  if [ "$(read_state "$STATE_DIR/repair_google")" -ne 0 ]; then
+    log "google repair cleared"
+    echo 0 > "$STATE_DIR/repair_google"
+  fi
+  rm -f "$STATE_DIR/repair_since_google" "$STATE_DIR/alert_repair_google" "$STATE_DIR/tg_repair_google"
 fi
 
-if [ "${#alerts[@]}" -gt 0 ]; then
+if [ "${#notifies[@]}" -gt 0 ]; then
   extra=""
-  [ "${#alerts[@]}" -gt 1 ] && extra=" (+$(( ${#alerts[@]} - 1 )) more - see log)"
-  for a in "${alerts[@]}"; do log "ALERT: $a"; done
-  notify "${alerts[0]}$extra"
+  [ "${#notifies[@]}" -gt 1 ] && extra=" (+$(( ${#notifies[@]} - 1 )) more - see log)"
+  for a in "${notifies[@]}"; do log "ALERT: $a"; done
+  banner "${notifies[0]}$extra"
 fi
+
+write_health "active" "" "up" "probe ok"
 exit 0
