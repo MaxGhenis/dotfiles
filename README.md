@@ -7,6 +7,7 @@ Config and scripts for my development machine. The interesting part is `bin/`:
 | [`claude-model`](bin/claude-model) | Which model is *actually* serving a Claude Code session — reads the transcript's per-message model field; `-e <model>` exits 1 on a silent downgrade. See [docs/model-self-knowledge.md](docs/model-self-knowledge.md). |
 | [`cc`](bin/cc) | Claude Code pane launcher (superseded by [tmux-claude-code](https://github.com/MaxGhenis/tmux-claude-code)) |
 | [`sweep-worktrees`](bin/sweep-worktrees) | Rescue-and-bundle stale git worktrees before removing them |
+| [`claude-statusline`](bin/claude-statusline) | Claude Code status line: `model · 5h % · wk % · dir` from the statusLine JSON on stdin. Render-only: writes nothing (the subfleet v1 tap it replaces teed usage to disk). Wire it with `~/.claude/settings.json` `statusLine.command` → `~/bin/claude-statusline` (symlink). Tests: [tests/test_claude_statusline.py](tests/test_claude_statusline.py). |
 
 ## Workflow docs
 
