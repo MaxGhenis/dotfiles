@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""granola-heal — notice when Granola's desktop app has silently stopped taking notes, and restart it.
+
+Context: from 17:13 ET on 2026-09-28 to 12:19 ET on 2026-09-29, Granola 7.595.3
+made no notes, and at least four calendar meetings went unrecorded. What we observed:
+  - Four "Granola Helper" processes (Storage, Audio, MacOSMicAppsWithDevices,
+    MissionControl) started on 2026-09-24 were still alive with PPID 1,
+    older than the running main process (started 2026-09-28 17:09).
+  - The orphaned Storage helper and the live instance's Storage helper both
+    held granola.db and granola.db-wal open.
+  - The live instance logged "full sync already in progress" skips from at
+    least 11:09 to 12:09. The notification window for a noon meeting logged
+    sqlite-init-start at 11:59 and no sqlite-init-success in the next 18
+    minutes, and it showed a blank window. One renderer sat near 100% CPU.
+Killing every Granola process (orphans included) and relaunching fixed it.
+The new instance logged sqlite-init-success and full-sync-complete in the
+same second, and the next meeting transcribed. We did not establish whether
+the orphans caused the wedge or only co-occurred with it, so the guard acts
+on either signal.
+
+Policy (deliberately narrow):
+  - Orphan: a "Granola Helper" process whose parent is launchd (PPID 1).
+    crashpad (PPID 1 in every instance observed) and the Chrome native-messaging host
+    are never orphans. An orphan is killed when it predates the running
+    main process, or when no main process runs and it is ORPHAN_GRACE_S old.
+  - Tainted instance: a main process that ran alongside orphans older than
+    itself. It gets restarted, but only while it is not recording.
+  - Wedge: at least two "sync-already-in-progress" skips WEDGE_SPAN_S apart,
+    with no full-sync-complete after the first. It also gets restarted, but
+    only while not recording.
+  - Recording blocks any restart. Either signal counts: a Granola process
+    holds a sleep-prevention assertion (observed held for exactly the span of
+    a 2026-09-29 recording), or a transcription breadcrumb is under
+    RECORDING_RECENT_S old. A deferred restart sends one notification.
+  - Restart: SIGTERM, then SIGKILL, every Granola process except the Chrome
+    native host (Chrome owns it). Then `open -g -a Granola`, which launches
+    it without stealing focus. Then verify: a new main process, at most one
+    Storage helper, no orphans, and sqlite-init-success or
+    full-sync-complete logged by the new instance.
+  - At most one automatic restart per RESTART_COOLDOWN_S. `fix` ignores the
+    cooldown but still refuses while recording unless given --force.
+
+Granola does not document its breadcrumbs. They are internal Sentry state and
+can change without notice. If they disappear, wedge detection goes quiet (no
+false restarts). Orphan detection needs only `ps` and still works.
+
+Files:
+  ~/Library/Logs/granola-heal.log         one line per action or decision
+  ~/.local/state/granola-heal/state.json  per-instance evidence and cooldowns
+
+Usage: granola-heal tick [--dry-run] | status [--json] | fix [--force] [--dry-run]
+"""
+
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+APP = "/Applications/Granola.app"
+MAIN_EXE = APP + "/Contents/MacOS/Granola"
+SUPPORT = os.path.join(HOME, "Library", "Application Support", "Granola")
+BREADCRUMBS = os.path.join(SUPPORT, "sentry", "scope_v3.json")
+STATE_DIR = os.path.join(HOME, ".local", "state", "granola-heal")
+STATE = os.path.join(STATE_DIR, "state.json")
+LOCK = os.path.join(STATE_DIR, "lock")
+LOG = os.path.join(HOME, "Library", "Logs", "granola-heal.log")
+LOG_MAX_LINES = 5000
+
+ORPHAN_GRACE_S = 180           # a quitting app can leave helpers briefly re-parented
+WEDGE_SPAN_S = 20 * 60         # a healthy full sync took 1.5 s on 2026-09-29
+RECORDING_RECENT_S = 300       # transcription breadcrumbs are sampled, not continuous
+RESTART_COOLDOWN_S = 30 * 60
+NOTIFY_EVERY_S = 60 * 60
+TERM_WAIT_S = 10
+VERIFY_TIMEOUT_S = 120
+MAX_SKIPS_KEPT = 50
+
+LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
+ASSERTION_RE = re.compile(
+    r"pid (\d+)\(Granola.*?\):.*\b(NoDisplaySleepAssertion|PreventUserIdleDisplaySleep|"
+    r"PreventUserIdleSystemSleep|NoIdleSleepAssertion)\b")
+TRANSCRIBING_MARKERS = ("transcription-latency-assembly", "transcription-first-buffer-sent",
+                        "audio-capture-state")
+
+
+# ---------------------------------------------------------------- pure logic
+
+def parse_ps(text):
+    """Rows of `ps -axo pid=,ppid=,lstart=,comm=` as dicts; malformed rows are skipped.
+
+    lstart is five whitespace-separated fields ("Tue Sep 29 12:18:57 2026", day
+    space-padded) and comm, the rest of the line, may itself contain spaces
+    ("Granola Helper (Storage)").
+    """
+    procs = []
+    for line in text.splitlines():
+        parts = line.split(None, 7)
+        if len(parts) < 8:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+            start = time.mktime(time.strptime(" ".join(parts[2:7]), LSTART_FORMAT))
+        except ValueError:
+            continue
+        procs.append({"pid": pid, "ppid": ppid, "start": start, "comm": parts[7].strip()})
+    return procs
+
+
+def is_main(p, app=APP):
+    return p["comm"] == app + "/Contents/MacOS/Granola"
+
+
+def is_granola(p, app=APP):
+    """Belongs to the Granola desktop app (main, helpers, crashpad, native host)."""
+    return p["comm"].startswith(app + "/") or p["comm"].startswith("Granola Helper")
+
+
+def is_native_host(p, app=APP):
+    """Chrome's native-messaging host: Chrome is its parent and owns its lifetime."""
+    return p["comm"].startswith(app + "/Contents/Resources/native-host/")
+
+
+def is_helper(p, app=APP):
+    return (is_granola(p, app) and not is_main(p, app) and not is_native_host(p, app)
+            and "chrome_crashpad_handler" not in p["comm"])
+
+
+def current_main(procs, app=APP):
+    """The newest Granola main process, or None."""
+    mains = [p for p in procs if is_main(p, app)]
+    return max(mains, key=lambda p: (p["start"], p["pid"])) if mains else None
+
+
+def select_orphans(procs, now, app=APP, grace_s=ORPHAN_GRACE_S):
+    """Helpers re-parented to launchd that belong to no running instance.
+
+    With a main process running, only orphans that started before it are selected:
+    they cannot be its children. A PPID-1 helper newer than the main process is
+    left alone because we have never seen one and do not know what it is.
+    """
+    main = current_main(procs, app)
+    out = []
+    for p in procs:
+        if not is_helper(p, app) or p["ppid"] != 1:
+            continue
+        if main is not None:
+            if p["start"] < main["start"]:
+                out.append(p)
+        elif now - p["start"] >= grace_s:
+            out.append(p)
+    return out
+
+
+def restart_targets(procs, app=APP):
+    """Every Granola process a restart signals: all except Chrome's native host."""
+    return [p for p in procs if is_granola(p, app) and not is_native_host(p, app)]
+
+
+def count_storage(procs, app=APP):
+    return sum(1 for p in procs if is_helper(p, app) and p["comm"] == "Granola Helper (Storage)")
+
+
+def _payload(crumb):
+    for arg in (crumb.get("data") or {}).get("arguments") or []:
+        if isinstance(arg, dict):
+            return arg
+    return {}
+
+
+def classify_breadcrumb(crumb):
+    """'sync_complete' | 'sync_stuck' | 'sqlite_ok' | 'transcribing' | None."""
+    msg = crumb.get("message") or ""
+    if not isinstance(msg, str):
+        return None
+    if msg.startswith("full-sync-complete"):
+        return "sync_complete"
+    if msg.startswith("full-sync-skipped"):
+        return "sync_stuck" if _payload(crumb).get("reason") == "sync-already-in-progress" else None
+    if msg.startswith("Full sync already in progress"):
+        return "sync_stuck"
+    if msg.startswith("sqlite-init-success"):
+        return "sqlite_ok"
+    if any(m in msg for m in TRANSCRIBING_MARKERS):
+        return "transcribing"
+    return None
+
+
+def breadcrumb_events(scope, since):
+    """[(timestamp, kind)] for classified breadcrumbs at or after `since`, sorted.
+
+    The Sentry buffer holds 200 crumbs, not in time order. A "Full sync
+    already in progress" line and its structured "full-sync-skipped" twin
+    land in the same second, so events are de-duplicated per whole second
+    and kind.
+    """
+    crumbs = ((scope or {}).get("scope") or {}).get("breadcrumbs") or []
+    seen = set()
+    for crumb in crumbs:
+        if not isinstance(crumb, dict):
+            continue
+        ts = crumb.get("timestamp")
+        if not isinstance(ts, (int, float)) or ts < since:
+            continue
+        kind = classify_breadcrumb(crumb)
+        if kind:
+            seen.add((int(ts), kind))
+    return sorted(seen)
+
+
+def recording_signals(assertions_text, events, now, recent_s=RECORDING_RECENT_S):
+    """Reasons to believe Granola is recording right now (empty list = none seen)."""
+    reasons = []
+    for line in (assertions_text or "").splitlines():
+        m = ASSERTION_RE.search(line)
+        if m:
+            reasons.append("pid %s holds %s" % (m.group(1), m.group(2)))
+    tx = [ts for ts, kind in events if kind == "transcribing"]
+    if tx and now - max(tx) < recent_s:
+        reasons.append("transcription breadcrumb %ds ago" % int(now - max(tx)))
+    return reasons
+
+
+def fresh_instance_state(main):
+    return {"main": [main["pid"], main["start"]] if main else None, "skips": [],
+            "last_complete": 0, "tainted": False}
+
+
+def merge_evidence(state, main, events):
+    """Fold this tick's breadcrumbs into per-instance evidence (survives buffer eviction)."""
+    ident = [main["pid"], main["start"]] if main else None
+    if state.get("main") != ident:
+        state.update(fresh_instance_state(main))
+    if main is None:
+        return state
+    skips = set(state.get("skips") or [])
+    last_complete = state.get("last_complete") or 0
+    for ts, kind in events:
+        if kind == "sync_stuck":
+            skips.add(ts)
+        elif kind in ("sync_complete",):
+            last_complete = max(last_complete, ts)
+    state["skips"] = sorted(s for s in skips if s > last_complete)[-MAX_SKIPS_KEPT:]
+    state["last_complete"] = last_complete
+    return state
+
+
+def wedged(state, span_s=WEDGE_SPAN_S):
+    skips = [s for s in state.get("skips") or [] if s > (state.get("last_complete") or 0)]
+    return len(skips) >= 2 and max(skips) - min(skips) >= span_s
+
+
+def plan(procs, state, recording, now, last_restart, cooldown_s=RESTART_COOLDOWN_S,
+         manual=False, force=False, app=APP):
+    """Decide one tick: which orphans to kill and whether to restart Granola.
+
+    Returns {"kill": [pids], "restart": bool, "reason": str|None, "blocked": str|None}.
+    Invariants (tested): kill holds only PPID-1 helpers, never the main process,
+    its children, crashpad or the native host; restart implies a main process
+    exists and, unless forced, that nothing indicates recording.
+    """
+    main = current_main(procs, app)
+    orphans = select_orphans(procs, now, app)
+    kill = [p["pid"] for p in orphans]
+    reason = None
+    if main is not None:
+        if manual:
+            reason = "manual fix"
+        elif state.get("tainted") or any(p["start"] < main["start"] for p in orphans):
+            reason = "instance ran alongside orphaned helpers"
+        elif wedged(state):
+            reason = "full sync stuck in progress"
+    blocked = None
+    if reason and recording and not force:
+        blocked = "recording (%s)" % "; ".join(recording)
+    elif reason and not manual and now - (last_restart or 0) < cooldown_s:
+        blocked = "cooldown (last automatic restart %ds ago)" % int(now - last_restart)
+    return {"kill": kill, "restart": bool(reason) and blocked is None,
+            "reason": reason, "blocked": blocked}
+
+
+def verify_restart(procs, events, restarted_at, app=APP):
+    """(ok, detail) for a relaunched instance; events must be those since its start."""
+    main = current_main(procs, app)
+    if main is None or main["start"] < restarted_at - 1:
+        return False, "no new Granola main process"
+    if count_storage(procs, app) > 1:
+        return False, "more than one Storage helper"
+    if select_orphans(procs, time.time(), app):
+        return False, "orphaned helpers present"
+    kinds = {kind for _, kind in events}
+    if "sqlite_ok" in kinds or "sync_complete" in kinds:
+        return True, "new instance pid %d opened its database and synced" % main["pid"]
+    return False, "no sqlite-init-success or full-sync-complete yet"
+
+
+def trim_log(path, max_lines=LOG_MAX_LINES):
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    if len(lines) > max_lines:
+        with open(path, "w") as f:
+            f.writelines(lines[-max_lines:])
+
+
+# ---------------------------------------------------------------- side effects
+
+class Guard:
+    def __init__(self, dry=False, echo=False):
+        self.dry = dry
+        self.echo = echo
+
+    def log(self, msg):
+        line = "%s %s%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), "[dry-run] " if self.dry else "", msg)
+        if self.echo:
+            print(msg)
+        if self.dry:
+            return
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+        trim_log(LOG)
+
+    def procs(self):
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,lstart=,comm="], capture_output=True,
+                             text=True, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"}).stdout
+        return parse_ps(out)
+
+    def assertions(self):
+        try:
+            return subprocess.run(["/usr/bin/pmset", "-g", "assertions"], capture_output=True,
+                                  text=True, timeout=20).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    def scope(self):
+        try:
+            with open(BREADCRUMBS) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def load_state(self):
+        try:
+            with open(STATE) as f:
+                state = json.load(f)
+            return state if isinstance(state, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save_state(self, state):
+        if self.dry:
+            return
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=1, sort_keys=True)
+        os.replace(tmp, STATE)
+
+    def notify(self, state, key, msg, now):
+        sent = state.setdefault("notified", {})
+        if now - sent.get(key, 0) < NOTIFY_EVERY_S:
+            return
+        sent[key] = now
+        self.log("notify: " + msg)
+        if self.dry:
+            return
+        try:
+            subprocess.run(["/usr/bin/osascript", "-e", "display notification %s with title %s"
+                            % (json.dumps(msg), json.dumps("Granola guard"))], timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def signal_pids(self, pids, sig):
+        for pid in pids:
+            if self.dry:
+                continue
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                self.log("cannot signal %d: %s" % (pid, exc))
+
+    def alive(self, pids):
+        live = {p["pid"] for p in self.procs()}
+        return [pid for pid in pids if pid in live]
+
+    def terminate(self, pids, wait_s=TERM_WAIT_S):
+        """SIGTERM, wait, SIGKILL survivors; returns pids still alive afterwards."""
+        if not pids:
+            return []
+        self.signal_pids(pids, signal.SIGTERM)
+        if self.dry:
+            return []
+        deadline = time.time() + wait_s
+        while time.time() < deadline and self.alive(pids):
+            time.sleep(1)
+        left = self.alive(pids)
+        if left:
+            self.signal_pids(left, signal.SIGKILL)
+            time.sleep(2)
+            left = self.alive(left)
+        return left
+
+    def describe(self, p):
+        return "%d %s (started %s)" % (p["pid"], p["comm"].replace(APP + "/Contents/", ""),
+                                       time.strftime("%m-%d %H:%M", time.localtime(p["start"])))
+
+    def restart(self):
+        """Kill every Granola process except the native host, relaunch hidden, verify."""
+        procs = self.procs()
+        targets = restart_targets(procs)
+        # The kill loop can spawn replacement helpers while the app shuts down; sweep twice.
+        for _ in range(3):
+            if not targets:
+                break
+            left = self.terminate([p["pid"] for p in targets])
+            if left:
+                return False, "processes survived SIGKILL: %s" % left
+            if self.dry:
+                break
+            targets = restart_targets(self.procs())
+        if targets and not self.dry:
+            return False, "Granola processes keep reappearing: %s" % [p["pid"] for p in targets]
+        restarted_at = time.time()
+        if self.dry:
+            return True, "dry run: would run open -g -a %s" % APP
+        subprocess.run(["/usr/bin/open", "-g", "-a", APP])
+        deadline = restarted_at + VERIFY_TIMEOUT_S
+        detail = "not checked"
+        while time.time() < deadline:
+            time.sleep(5)
+            procs = self.procs()
+            main = current_main(procs)
+            since = main["start"] if main else restarted_at
+            ok, detail = verify_restart(procs, breadcrumb_events(self.scope(), since), restarted_at)
+            if ok:
+                return True, detail
+        return False, detail
+
+    def run(self, manual=False, force=False):
+        if not os.path.isdir(APP):
+            return 0
+        now = time.time()
+        state = self.load_state()
+        procs = self.procs()
+        main = current_main(procs)
+        events = breadcrumb_events(self.scope(), main["start"] if main else now)
+        merge_evidence(state, main, events)
+        recording = recording_signals(self.assertions(), events, now)
+        decision = plan(procs, state, recording, now, state.get("last_restart", 0),
+                        manual=manual, force=force)
+        by_pid = {p["pid"]: p for p in procs}
+        if decision["kill"]:
+            self.log("killing %d orphaned helper(s): %s" % (
+                len(decision["kill"]), "; ".join(self.describe(by_pid[pid]) for pid in decision["kill"])))
+            if main is not None and any(by_pid[pid]["start"] < main["start"] for pid in decision["kill"]):
+                state["tainted"] = True
+            left = self.terminate(decision["kill"])
+            if left:
+                self.log("orphans survived SIGKILL: %s" % left)
+        rc = 0
+        if decision["blocked"] and decision["reason"]:
+            self.log("restart needed (%s) but deferred: %s" % (decision["reason"], decision["blocked"]))
+            if decision["blocked"].startswith("recording") and not manual:
+                self.notify(state, "deferred", "Granola needs a restart (%s). Deferred while it "
+                            "is recording; run granola-fix after the meeting." % decision["reason"], now)
+            rc = 3 if manual else 0
+        elif decision["restart"]:
+            self.log("restarting Granola: %s" % decision["reason"])
+            if not manual:
+                state["last_restart"] = now
+            ok, detail = self.restart()
+            self.log(("VERIFIED: " if ok else "FAILED: ") + detail)
+            if ok:
+                state.update(fresh_instance_state(current_main(self.procs())))
+            else:
+                self.notify(state, "failed", "Granola restart failed: %s. Run granola-fix "
+                            "or quit and reopen Granola." % detail, now)
+                rc = 1
+        elif manual and main is None:
+            self.log("Granola is not running; launching it hidden.")
+            if not self.dry:
+                subprocess.run(["/usr/bin/open", "-g", "-a", APP])
+        self.save_state(state)
+        return rc
+
+
+def status(as_json=False):
+    g = Guard(dry=True)
+    now = time.time()
+    procs = g.procs()
+    main = current_main(procs)
+    scope = g.scope()
+    events = breadcrumb_events(scope, main["start"] if main else now)
+    state = merge_evidence(g.load_state(), main, events)
+    recording = recording_signals(g.assertions(), events, now)
+    decision = plan(procs, state, recording, now, state.get("last_restart", 0))
+    report = {
+        "main": g.describe(main) if main else None,
+        "helpers": [g.describe(p) for p in procs if is_helper(p)],
+        "orphans": [g.describe(p) for p in select_orphans(procs, now)],
+        "storage_helpers": count_storage(procs),
+        "recording": recording,
+        "last_sync_complete": max([ts for ts, k in events if k == "sync_complete"] or [0]) or None,
+        "stuck_sync_skips_since_last_complete": state.get("skips"),
+        "wedged": wedged(state),
+        "breadcrumbs_readable": scope is not None,
+        "plan": decision,
+    }
+    if as_json:
+        print(json.dumps(report, indent=1))
+        return 0
+    print("main:     %s" % (report["main"] or "not running"))
+    print("helpers:  %d (Storage: %d)" % (len(report["helpers"]), report["storage_helpers"]))
+    for line in report["orphans"]:
+        print("ORPHAN:   " + line)
+    print("recording: %s" % ("; ".join(recording) or "no signal"))
+    if report["last_sync_complete"]:
+        print("last full-sync-complete: %s" % time.strftime(
+            "%m-%d %H:%M:%S", time.localtime(report["last_sync_complete"])))
+    print("stuck-sync skips since then: %d%s" % (
+        len(state.get("skips") or []), " (WEDGED)" if report["wedged"] else ""))
+    if not report["breadcrumbs_readable"]:
+        print("breadcrumbs: unreadable (wedge detection off)")
+    verdict = decision["reason"] or "healthy"
+    if decision["blocked"]:
+        verdict += " — blocked: " + decision["blocked"]
+    print("verdict:  %s" % verdict)
+    return 0
+
+
+def locked(fn):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOCK, "w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("granola-heal: another run holds the lock", file=sys.stderr)
+            return 0
+        return fn()
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    cmd = args[0] if args else "status"
+    dry = "--dry-run" in args
+    if cmd == "tick":
+        return locked(lambda: Guard(dry=dry).run())
+    if cmd == "fix":
+        return locked(lambda: Guard(dry=dry, echo=True).run(manual=True, force="--force" in args))
+    if cmd == "status":
+        return status(as_json="--json" in args)
+    print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

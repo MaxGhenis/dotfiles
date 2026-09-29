@@ -1,0 +1,4 @@
+#!/bin/sh
+# Manual Granola recovery: shares granola-heal's lock, recording check, and restart verification.
+# Refuses while Granola is recording; pass --force to restart anyway, --dry-run to preview.
+exec /usr/bin/python3 "$(dirname "$0")/granola-heal" fix "$@"

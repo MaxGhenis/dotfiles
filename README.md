@@ -9,6 +9,8 @@ Config and scripts for my development machine. The interesting part is `bin/`:
 | [`codex-run`](bin/codex-run) | Hardened `codex exec` dispatch — retries transient failures, salvages work on crash, unbreaks git in sandboxed worktrees. Documented below. |
 | [`cc`](bin/cc) | Claude Code pane launcher (superseded by [tmux-claude-code](https://github.com/MaxGhenis/tmux-claude-code)) |
 | [`sweep-worktrees`](bin/sweep-worktrees) | Rescue-and-bundle stale git worktrees before removing them |
+| [`granola-heal`](bin/granola-heal) | Granola desktop watchdog (launchd, every 60s). Kills "Granola Helper" processes orphaned by an earlier instance. Restarts the app when the running instance coexisted with them or its full sync has been stuck for 20+ min, but never while it is recording. Verifies the relaunch opened its database and synced. Born 2026-09-29, when four helpers orphaned since 9/24 (one of them holding `granola.db` open) coincided with 19 hours of no meeting notes. Install: copy `granola-heal` and `granola-fix` to `~/.local/bin`, and [docs/com.maxghenis.granola-heal.plist](docs/com.maxghenis.granola-heal.plist) to `~/Library/LaunchAgents`. Tests: [tests/test_granola_heal.py](tests/test_granola_heal.py). |
+| [`granola-fix`](bin/granola-fix) | Manual Granola restart through `granola-heal fix`: same lock and checks, refuses while recording unless `--force`. `granola-heal status` shows orphans, recording signals, and sync evidence. |
 
 ## Workflow docs
 
