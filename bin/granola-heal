@@ -21,43 +21,62 @@ still recorded meetings normally with them present, including four on
 2026-09-28 before 17:09. So the guard kills orphans as cleanup but restarts
 Granola only on the symptom: a full sync that stays stuck.
 
-Policy (deliberately narrow):
-  - Orphan: a Granola helper (an allow-listed "Granola Helper" process of
-    this user) whose parent is launchd. crashpad, the Chrome native-messaging
-    host, the updater (Squirrel's ShipIt, a launchd job) and the bundled CLI
-    are never orphans. An orphan is killed once the main process that
-    replaced it has run for ORPHAN_GRACE_S, or, when no main process runs,
-    once the orphan is ORPHAN_GRACE_S old.
-  - Wedge: a "sync-already-in-progress" skip followed by no full-sync-complete
-    for WEDGE_AWAKE_S of awake time. Awake time is measured with
-    time.monotonic(), which stops while the Mac sleeps, so a sync interrupted
-    by closing the lid does not count.
-  - A wedge restarts Granola unless a blocker applies. Blockers: the app is
-    recording, the recording state is unknown, the updater (ShipIt) is
-    running, or the last automatic restart was under RESTART_COOLDOWN_S ago.
-    Recording means a Granola process holds a sleep-prevention assertion
-    (held for exactly the span of a 2026-09-29 recording and released within
-    minutes of its end), or transcription breadcrumbs newer than the last
-    stop breadcrumb and under RECORDING_RECENT_S old. The state is unknown
-    when pmset fails or the breadcrumb file exists but cannot be parsed.
-    The guard fails closed. A blocked restart sends at most one
-    notification an hour.
-  - Restart: re-check recording, then SIGTERM and later SIGKILL the
-    instance's processes (main, helpers, crashpad). A process is identified
-    by (pid, start time, comm), so a recycled PID is never signalled. Then
-    `open -g -a Granola`, which launches without stealing focus. Verify a
-    new main process, at most one Storage helper, no orphans, and
-    sqlite-init-success or full-sync-complete from the new instance. If the
-    breadcrumb file does not exist, verify on processes alone. If the main
-    process died but the relaunch did not happen, later ticks retry `open`
-    up to 3 times.
-  - `fix` restarts on demand. It uses the same lock and blockers, except
-    cooldown. --force overrides the recording and updater blockers.
+How Granola's full sync behaves (read from its app.asar, 7.595.3):
+  - A sync logs full-sync-started and sets an in-progress flag. The flag is
+    cleared in a `finally` block.
+  - On success it logs full-sync-complete. On failure the caller logs
+    "Error during sync operations".
+  - A trigger that arrives while the flag is set logs
+    full-sync-skipped {reason: "sync-already-in-progress"}.
+  - Triggers are hourly polling, window visibility, wake and launch.
 
-Granola does not document its breadcrumbs: they are internal Sentry state
-and can change without notice. If they change, wedge detection goes quiet (no
-false restarts). Orphan cleanup and the pmset recording check need only ps
-and pmset.
+Policy (deliberately narrow):
+  - Wedge: two or more stuck-sync skips spanning WEDGE_AWAKE_S of awake time,
+    with no full-sync-started, full-sync-complete or sync error after the
+    first. The flag stayed set across both skips. A single skip is
+    ambiguous, because a failed sync logs no completion. Awake time is
+    time.monotonic() at the tick that first saw each skip; it stops while
+    the Mac sleeps.
+  - A wedge restarts Granola. These block it: the app is recording, or its
+    recording state is unknown (pmset failed, or the breadcrumbs are
+    unparseable, so the guard fails closed); a recording ended under
+    POST_RECORDING_GRACE_S ago (the transcript and notes are still
+    uploading); or the last automatic restart was under RESTART_COOLDOWN_S
+    ago. Recording means a Granola process holds a sleep-prevention
+    assertion (held for exactly the span of a 2026-09-29 recording), or
+    transcription breadcrumbs newer than the last stop breadcrumb and under
+    RECORDING_RECENT_S old. A blocked restart notifies at most hourly.
+  - Updates: Squirrel's ShipIt (a launchd job, PPID 1) often waits hours for
+    Granola to quit, then installs and relaunches it. Opening Granola
+    mid-install aborts the install ("App Still Running", 2026-09-28 17:07).
+    So a restart while ShipIt waits only stops Granola and lets ShipIt
+    install and relaunch. The guard never launches Granola while ShipIt
+    runs, except as a fallback when nothing is up UPDATER_WAIT_S after the
+    stop.
+  - Restart: re-check recording and that the main process is the same one
+    judged wedged, then SIGTERM and later SIGKILL the instance's processes
+    (main, helpers, crashpad). A process is identified by (pid, start time,
+    comm), so a recycled PID is never signalled. Then `open -g -a Granola`
+    (no focus steal), unless ShipIt will relaunch it. Verify a new main
+    process, one Storage helper, no orphans, and sqlite-init-success or
+    full-sync-complete from it (processes alone when no breadcrumb file
+    exists). A relaunch the guard owes stays pending until a new main
+    process has run PENDING_STABLE_S. Later ticks retry `open` up to
+    RELAUNCH_ATTEMPTS times.
+  - Orphan: an allow-listed "Granola Helper" process of this user whose
+    parent is launchd. It is killed, as cleanup, once the main process that
+    replaced it has run ORPHAN_GRACE_S (or, with no main process, once it is
+    that old). crashpad, ShipIt, the bundled CLI and Chrome's
+    native-messaging host are never orphans. A helper that survives SIGKILL
+    is remembered and left alone.
+  - `fix` restarts on demand: same lock and blockers, no cooldown. --force
+    overrides the recording blockers. With Granola not running, fix
+    launches it, but not while ShipIt is installing (unless --force).
+
+Granola does not document these breadcrumbs. They are internal Sentry state
+and can change without notice. If they change, wedge detection goes quiet
+(no false restarts). Orphan cleanup and the pmset check need only ps and
+pmset.
 
 Files:
   ~/Library/Logs/granola-heal.log         one line per action or decision
@@ -90,12 +109,15 @@ LOG_MAX_LINES = 5000
 ORPHAN_GRACE_S = 180            # helpers of a quitting instance exit within seconds
 WEDGE_AWAKE_S = 15 * 60         # a healthy full sync took 1.5 s on 2026-09-29
 RECORDING_RECENT_S = 300        # transcription breadcrumbs are sampled, not continuous
+POST_RECORDING_GRACE_S = 180    # 2026-09-29: transcript sync and notes finished within 14 s of the stop
 RESTART_COOLDOWN_S = 30 * 60
 NOTIFY_EVERY_S = 60 * 60
 TERM_WAIT_S = 10
 VERIFY_TIMEOUT_S = 120
 RELAUNCH_ATTEMPTS = 3
 RELAUNCH_SPACING_S = 60
+PENDING_STABLE_S = 120
+UPDATER_WAIT_S = 20 * 60        # observed installs took 10 s to 10 min
 MAX_SKIPS_KEPT = 50
 CMD_TIMEOUT_S = 30
 
@@ -103,6 +125,7 @@ LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
 ASSERTION_RE = re.compile(
     r"pid (\d+)\(Granola.*?\):.*\b(NoDisplaySleepAssertion|PreventUserIdleDisplaySleep|"
     r"PreventUserIdleSystemSleep|NoIdleSleepAssertion)\b")
+CLEARS_SKIPS = ("sync_started", "sync_complete", "sync_error")
 USAGE = __doc__.strip().splitlines()[-1]
 
 
@@ -132,7 +155,7 @@ def parse_ps(text, uid=None):
 
 
 def ident(p):
-    return (p["pid"], p["start"], p["comm"])
+    return [p["pid"], p["start"], p["comm"]]
 
 
 def is_main(p, app=APP):
@@ -160,19 +183,20 @@ def current_main(procs, app=APP):
     return max(mains, key=lambda p: (p["start"], p["pid"])) if mains else None
 
 
-def select_orphans(procs, now, app=APP, grace_s=ORPHAN_GRACE_S):
+def select_orphans(procs, now, skip=(), app=APP, grace_s=ORPHAN_GRACE_S):
     """Helpers re-parented to launchd that no running instance owns.
 
     With a main process: only helpers older than it, and only once it has run for
     grace_s. A PPID-1 helper newer than the main process is left alone: we have
     never seen one and do not know what it is. Without one: helpers grace_s old.
+    `skip` holds identities of helpers that already survived SIGKILL.
     """
     main = current_main(procs, app)
     if main is not None and now - main["start"] < grace_s:
         return []
     out = []
     for p in procs:
-        if not is_helper(p, app) or p["ppid"] != 1:
+        if not is_helper(p, app) or p["ppid"] != 1 or ident(p) in skip:
             continue
         if main is not None:
             if p["start"] < main["start"]:
@@ -188,8 +212,8 @@ def restart_targets(procs, app=APP):
     return [p for p in procs if is_main(p, app) or is_helper(p, app) or is_crashpad(p, app)]
 
 
-def count_storage(procs, app=APP):
-    return sum(1 for p in procs if p["comm"] == "Granola Helper (Storage)")
+def count_storage(procs, skip=(), app=APP):
+    return sum(1 for p in procs if p["comm"] == "Granola Helper (Storage)" and ident(p) not in skip)
 
 
 def _finite(x):
@@ -206,12 +230,17 @@ def _payload(crumb):
 
 
 def classify_breadcrumb(crumb):
-    """'sync_complete' | 'sync_stuck' | 'sqlite_ok' | 'transcribing' | 'transcription_stopped' | None."""
+    """One of 'sync_started' | 'sync_complete' | 'sync_error' | 'sync_stuck' | 'sqlite_ok' |
+    'transcribing' | 'transcription_stopped', or None."""
     msg = crumb.get("message")
     if not isinstance(msg, str):
         return None
+    if msg.startswith("full-sync-started"):
+        return "sync_started"
     if msg.startswith("full-sync-complete"):
         return "sync_complete"
+    if msg.startswith("Error during sync operations"):
+        return "sync_error"
     if msg.startswith("full-sync-skipped"):
         return "sync_stuck" if _payload(crumb).get("reason") == "sync-already-in-progress" else None
     if msg.startswith("Full sync already in progress"):
@@ -272,24 +301,25 @@ def recording_signals(assertions_text, events, now, breadcrumbs_status="ok", rec
 
 
 def fresh_instance_state(main):
-    return {"main": [main["pid"], main["start"]] if main else None, "skips": [], "last_complete": 0}
+    return {"main": [main["pid"], main["start"]] if main else None, "skips": [], "last_clear": 0}
 
 
 def merge_evidence(state, main, events, now_mono):
     """Fold this tick's breadcrumbs into per-instance evidence (survives buffer eviction).
 
     Each uncleared stuck-sync skip is stored as [timestamp, monotonic time first seen].
-    A full-sync-complete clears every skip at or before it.
+    A later full-sync-started, full-sync-complete or sync error clears it: the
+    in-progress flag was released.
     """
     who = [main["pid"], main["start"]] if main else None
     if state.get("main") != who:
         state.update(fresh_instance_state(main))
     if main is None:
         return state
-    last_complete = state.get("last_complete") or 0
+    last_clear = state.get("last_clear") or 0
     for ts, kind in events:
-        if kind == "sync_complete":
-            last_complete = max(last_complete, ts)
+        if kind in CLEARS_SKIPS:
+            last_clear = max(last_clear, ts)
     skips = {}
     for pair in state.get("skips") or []:
         if isinstance(pair, list) and len(pair) == 2 and all(_finite(x) for x in pair):
@@ -297,36 +327,43 @@ def merge_evidence(state, main, events, now_mono):
     for ts, kind in events:
         if kind == "sync_stuck" and ts not in skips:
             skips[ts] = now_mono
-    kept = sorted([ts, mono] for ts, mono in skips.items() if ts > last_complete)
+    kept = sorted([ts, mono] for ts, mono in skips.items() if ts > last_clear)
     if len(kept) > MAX_SKIPS_KEPT:
         kept = kept[:1] + kept[-(MAX_SKIPS_KEPT - 1):]   # the earliest skip anchors the span
     state["skips"] = kept
-    state["last_complete"] = last_complete
+    state["last_clear"] = last_clear
     return state
 
 
-def wedged(state, now, now_mono, awake_s=WEDGE_AWAKE_S):
-    """The earliest uncleared skip is awake_s old in both wall-clock and awake time."""
-    last_complete = state.get("last_complete") or 0
-    skips = [s for s in state.get("skips") or [] if s[0] > last_complete]
-    if not skips:
+def wedged(state, span_s=WEDGE_AWAKE_S):
+    """Two or more uncleared skips spanning span_s in wall-clock and in awake time."""
+    last_clear = state.get("last_clear") or 0
+    skips = sorted(s for s in state.get("skips") or [] if s[0] > last_clear)
+    if len(skips) < 2:
         return False
-    first_ts, first_seen = min(skips)
-    return now - first_ts >= awake_s and now_mono - first_seen >= awake_s
+    (first_ts, _), (last_ts, _) = skips[0], skips[-1]
+    monos = [s[1] for s in skips]
+    return last_ts - first_ts >= span_s and max(monos) - min(monos) >= span_s
 
 
-def plan(procs, wedge, recording, now, last_restart, manual=False, force=False,
-         cooldown_s=RESTART_COOLDOWN_S, app=APP):
-    """Decide one tick: which orphans to kill and whether to restart Granola.
+def plan(procs, wedge, recording, now, last_restart, last_recording=0, manual=False, force=False,
+         skip=(), cooldown_s=RESTART_COOLDOWN_S, grace_s=POST_RECORDING_GRACE_S, app=APP):
+    """Decide one tick. Returns a dict:
+      kill        pids of orphans to kill
+      restart     stop (and relaunch) this instance now
+      via_updater stop only; ShipIt waits for the quit and relaunches after installing
+      launch      open Granola (manual fix while it is not running)
+      reason, blocked
 
-    Returns {"kill": [pids], "restart": bool, "reason": str|None, "blocked": str|None}.
     Invariants (property-tested): kill holds only this app's PPID-1 helpers, never a
     main process, crashpad, ShipIt, the native host or another app; restart implies a
-    main process, no recording signal and no running updater unless forced, and an
-    elapsed cooldown unless manual.
+    main process, no recording signal and no recent recording unless forced, and a
+    wedge plus an elapsed cooldown unless manual; launch never happens while ShipIt
+    runs unless forced.
     """
     main = current_main(procs, app)
-    kill = [p["pid"] for p in select_orphans(procs, now, app)]
+    updater = any(is_updater(p, app) for p in procs)
+    kill = [p["pid"] for p in select_orphans(procs, now, skip, app)]
     reason = None
     if main is not None:
         if manual:
@@ -337,22 +374,32 @@ def plan(procs, wedge, recording, now, last_restart, manual=False, force=False,
     if reason:
         if recording and not force:
             blocked = "recording (%s)" % "; ".join(recording)
-        elif any(is_updater(p, app) for p in procs) and not force:
-            blocked = "Granola's updater (ShipIt) is running; a restart would race its install"
-        elif not manual and now - (last_restart or 0) < cooldown_s:
+        elif last_recording and now - last_recording < grace_s and not force:
+            blocked = "a recording ended %ds ago; letting Granola finish uploading" % int(now - last_recording)
+        elif not manual and last_restart and now - last_restart < cooldown_s:
             blocked = "cooldown (last automatic restart %ds ago)" % int(now - last_restart)
-    return {"kill": kill, "restart": bool(reason) and blocked is None,
+    launch = False
+    if manual and main is None:
+        if updater and not force:
+            reason = "manual fix"
+            blocked = "Granola's updater (ShipIt) is installing an update and will relaunch it"
+        else:
+            launch = True
+    return {"kill": kill, "restart": bool(reason) and main is not None and blocked is None,
+            "via_updater": main is not None and updater, "launch": launch,
             "reason": reason, "blocked": blocked}
 
 
-def verify_restart(procs, events, restarted_at, now, breadcrumbs_status="ok", app=APP):
-    """(ok, detail) for a relaunched instance; events must be those since its start."""
+def verify_restart(procs, events, restarted_at, now, breadcrumbs_status="ok", skip=(), app=APP):
+    """(ok, detail) for a relaunched instance; events must be those since its start.
+    `skip` holds identities of helpers that survived SIGKILL (reported separately)."""
     main = current_main(procs, app)
     if main is None or main["start"] < restarted_at - 1:
         return False, "no new Granola main process"
-    if count_storage(procs, app) > 1:
+    if count_storage(procs, skip, app) > 1:
         return False, "more than one Storage helper"
-    if any(is_helper(p, app) and p["ppid"] == 1 and p["start"] < main["start"] for p in procs):
+    if any(is_helper(p, app) and p["ppid"] == 1 and p["start"] < main["start"] and ident(p) not in skip
+           for p in procs):
         return False, "orphaned helpers present"
     kinds = {kind for _, kind in events}
     if "sqlite_ok" in kinds or "sync_complete" in kinds:
@@ -362,12 +409,26 @@ def verify_restart(procs, events, restarted_at, now, breadcrumbs_status="ok", ap
     return False, "no sqlite-init-success or full-sync-complete yet"
 
 
-def relaunch_due(pending, now, attempts=RELAUNCH_ATTEMPTS, spacing_s=RELAUNCH_SPACING_S):
-    """Whether a tick should retry `open` for a relaunch the guard owes."""
+def pending_action(pending, procs, now, attempts=RELAUNCH_ATTEMPTS, spacing_s=RELAUNCH_SPACING_S,
+                   stable_s=PENDING_STABLE_S, updater_wait_s=UPDATER_WAIT_S, app=APP):
+    """What to do about a relaunch the guard owes: 'clear' | 'wait' | 'open' | 'give_up'."""
     if not isinstance(pending, dict):
-        return False
-    return (pending.get("attempts", 0) < attempts
-            and now - (pending.get("last_attempt") or 0) >= spacing_s)
+        return "clear"
+    since = pending.get("since") or 0
+    main = current_main(procs, app)
+    if main is not None:
+        if main["start"] >= since - 1 and now - main["start"] >= stable_s:
+            return "clear"
+        if main["start"] < since - 1 and now - since >= updater_wait_s:
+            return "clear"            # the old instance survived and is still up: nothing owed
+        return "wait"
+    if any(is_updater(p, app) for p in procs) and now - since < updater_wait_s:
+        return "wait"                 # ShipIt is installing and will relaunch
+    if pending.get("attempts", 0) >= attempts:
+        return "give_up"
+    if now - (pending.get("last_attempt") or 0) >= spacing_s:
+        return "open"
+    return "wait"
 
 
 def trim_log(path, max_lines=LOG_MAX_LINES):
@@ -445,13 +506,14 @@ class Guard:
         os.replace(tmp, STATE)
 
     def notify(self, state, key, msg, now):
+        if self.dry:
+            self.log("would notify: " + msg)
+            return
         sent = state.setdefault("notified", {})
         if now - sent.get(key, 0) < NOTIFY_EVERY_S:
             return
         sent[key] = now
         self.log("notify: " + msg)
-        if self.dry:
-            return
         try:
             subprocess.run(["/usr/bin/osascript", "-e", "display notification %s with title %s"
                             % (json.dumps(msg), json.dumps("Granola guard"))], timeout=CMD_TIMEOUT_S)
@@ -471,7 +533,7 @@ class Guard:
 
     def alive(self, targets):
         """The targets still running as the same process: (pid, start, comm) all match."""
-        live = {ident(p) for p in self.procs()}
+        live = [ident(p) for p in self.procs()]
         return [t for t in targets if ident(t) in live]
 
     def signal_procs(self, targets, sig):
@@ -501,7 +563,9 @@ class Guard:
         left = self.alive(targets)
         if left:
             self.signal_procs(left, signal.SIGKILL)
-            time.sleep(2)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and self.alive(left):
+                time.sleep(1)
             left = self.alive(left)
         return left
 
@@ -523,53 +587,83 @@ class Guard:
                 time.sleep(3)
         return False
 
-    def restart(self, state):
-        """Stop this instance, relaunch it hidden, verify. Returns (ok, detail)."""
+    def restart(self, state, expected_main, automatic):
+        """Stop this instance, relaunch it hidden (or let ShipIt), verify.
+
+        Returns (status, detail); status is 'ok', 'handed_off', 'aborted' (nothing was
+        signalled), 'failed' or 'dry'.
+        """
         obs = self.observe()
         if obs["recording"] and not self.force:
-            return False, "aborted: recording started (%s)" % "; ".join(obs["recording"])
+            return "aborted", "recording started (%s)" % "; ".join(obs["recording"])
         if obs["main"] is None:
-            return False, "aborted: Granola is no longer running"
+            return "aborted", "Granola is no longer running"
+        if [obs["main"]["pid"], obs["main"]["start"]] != expected_main:
+            return "aborted", "Granola restarted in the meantime (now pid %d)" % obs["main"]["pid"]
+        via_updater = any(is_updater(p) for p in obs["procs"])
         targets = restart_targets(obs["procs"])
-        if not self.dry:
-            state["relaunch_pending"] = {"since": obs["now"], "attempts": 0, "last_attempt": 0}
-            self.save_state(state)
+        if self.dry:
+            return "dry", "would stop %d process(es) and %s" % (
+                len(targets), "let ShipIt relaunch" if via_updater else "run open -g -a Granola")
+        state["relaunch_pending"] = {"since": obs["now"], "attempts": 0, "last_attempt": 0,
+                                     "via_updater": via_updater}
+        if automatic:
+            state["last_restart"] = obs["now"]
+        self.save_state(state)        # a crash from here on still leaves the cooldown and the owed relaunch
         survivors = self.terminate(targets)
+        seen = [ident(t) for t in targets]
         # Shutdown can spawn fresh helpers: sweep the stragglers a few times.
         for _ in range(3):
-            if self.dry:
-                break
-            extra = [p for p in restart_targets(self.procs()) if ident(p) not in {ident(t) for t in survivors}]
+            extra = [p for p in restart_targets(self.procs()) if ident(p) not in seen]
             if not extra:
                 break
+            seen += [ident(p) for p in extra]
             survivors += self.terminate(extra)
+        helpers_left = [p for p in survivors if not is_main(p)]
+        if helpers_left:
+            state["unkillable"] = (state.get("unkillable") or []) + [ident(p) for p in helpers_left]
+            self.log("helpers survived SIGKILL (left alone from now on): %s" % [p["pid"] for p in helpers_left])
         if any(is_main(p) for p in survivors):
-            state.pop("relaunch_pending", None)
-            return False, "the main process survived SIGKILL: %s" % [p["pid"] for p in survivors]
-        if survivors:
-            self.log("helpers survived SIGKILL (relaunching anyway): %s" % [p["pid"] for p in survivors])
+            return "failed", "the main process survived SIGKILL; later ticks relaunch Granola if it exits"
+        if via_updater:
+            return "handed_off", ("stopped Granola; ShipIt installs the pending update and relaunches it "
+                                  "(the guard relaunches it itself if nothing is up in %d min)" % (UPDATER_WAIT_S // 60))
         restarted_at = time.time()
-        if self.dry:
-            return True, "dry run: would run open -g -a %s" % APP
         opened = self.launch()
-        state["relaunch_pending"]["attempts"] = 1
-        state["relaunch_pending"]["last_attempt"] = restarted_at
+        state["relaunch_pending"].update(attempts=1, last_attempt=restarted_at)
         if not opened:
-            return False, "open -g -a Granola failed; later ticks will retry"
+            return "failed", "open -g -a Granola failed; later ticks retry"
+        skip = state.get("unkillable") or []
         deadline = time.monotonic() + VERIFY_TIMEOUT_S
         detail = "not checked"
         while time.monotonic() < deadline:
             time.sleep(5)
             procs = self.procs()
             main = current_main(procs)
-            if main is not None and main["start"] >= restarted_at - 1:
-                state.pop("relaunch_pending", None)
             scope, status = self.scope()
             events = breadcrumb_events(scope, main["start"] if main else restarted_at)
-            ok, detail = verify_restart(procs, events, restarted_at, time.time(), status)
-            if ok:
-                return True, detail
-        return False, detail
+            ok, detail = verify_restart(procs, events, restarted_at, time.time(), status, skip)
+            if ok:          # the owed relaunch clears once this instance has run PENDING_STABLE_S
+                return "ok", detail
+        return "failed", detail
+
+    def settle_pending(self, state, procs, now):
+        action = pending_action(state.get("relaunch_pending"), procs, now)
+        pending = state.get("relaunch_pending")
+        if pending is None:
+            return
+        if action == "clear":
+            state.pop("relaunch_pending", None)
+        elif action == "open":
+            pending["attempts"] = pending.get("attempts", 0) + 1
+            pending["last_attempt"] = now
+            self.log("Granola is still down after a guard restart; open attempt %d of %d"
+                     % (pending["attempts"], RELAUNCH_ATTEMPTS))
+            self.launch()
+        elif action == "give_up":
+            self.notify(state, "down", "Granola is not running after a guard restart and %d relaunches "
+                        "failed. Open Granola." % RELAUNCH_ATTEMPTS, now)
+            state.pop("relaunch_pending", None)
 
     def run(self, manual=False):
         if not os.path.isdir(APP):
@@ -578,56 +672,54 @@ class Guard:
         obs = self.observe()
         now, procs, main = obs["now"], obs["procs"], obs["main"]
         merge_evidence(state, main, obs["events"], time.monotonic())
+        if obs["recording"]:
+            state["last_recording"] = now
+        stops = [ts for ts, kind in obs["events"] if kind == "transcription_stopped"]
+        last_recording = max([state.get("last_recording") or 0] + stops)
+        live = [ident(p) for p in procs]
+        skip = [s for s in state.get("unkillable") or [] if s in live]   # forget ones that exited
+        state["unkillable"] = skip
+        self.settle_pending(state, procs, now)
+
+        decision = plan(procs, wedged(state), obs["recording"], now, state.get("last_restart", 0),
+                        last_recording, manual=manual, force=self.force, skip=skip)
         rc = 0
-
-        pending = state.get("relaunch_pending")
-        if pending is not None and main is not None:
-            state.pop("relaunch_pending", None)
-        elif pending is not None and not any(is_updater(p) for p in procs):
-            if relaunch_due(pending, now):
-                pending["attempts"] = pending.get("attempts", 0) + 1
-                pending["last_attempt"] = now
-                self.log("Granola is still down after a guard restart; open attempt %d of %d"
-                         % (pending["attempts"], RELAUNCH_ATTEMPTS))
-                self.launch()
-            elif pending.get("attempts", 0) >= RELAUNCH_ATTEMPTS:
-                self.notify(state, "down", "Granola is not running after a guard restart and "
-                            "3 relaunches failed. Open Granola.", now)
-                state.pop("relaunch_pending", None)
-
-        decision = plan(procs, wedged(state, now, time.monotonic()), obs["recording"], now,
-                        state.get("last_restart", 0), manual=manual, force=self.force)
         if decision["kill"]:
             victims = [p for p in procs if p["pid"] in set(decision["kill"])]
             self.log("killing %d orphaned helper(s): %s" % (
                 len(victims), "; ".join(self.describe(p) for p in victims)))
             left = self.terminate(victims)
             if left:
-                self.log("orphans survived SIGKILL: %s" % [p["pid"] for p in left])
+                state["unkillable"] = skip + [ident(p) for p in left]
+                self.log("orphans survived SIGKILL (left alone from now on): %s" % [p["pid"] for p in left])
 
-        if decision["blocked"]:
-            self.log("restart needed (%s) but blocked: %s" % (decision["reason"], decision["blocked"]))
-            if not manual and not decision["blocked"].startswith("cooldown"):
-                self.notify(state, "blocked", "Granola looks stuck (%s) but was not restarted: %s. "
-                            "Run granola-fix when it is safe." % (decision["reason"], decision["blocked"]), now)
-            rc = 3 if manual else 0
-        elif decision["restart"]:
-            self.log("restarting Granola: %s" % decision["reason"])
-            if not manual:
-                state["last_restart"] = now
-            ok, detail = self.restart(state)
-            self.log(("VERIFIED: " if ok else "FAILED: ") + detail)
-            if ok and not self.dry:
-                state.update(fresh_instance_state(current_main(self.procs())))
-            elif not ok:
-                self.notify(state, "failed", "Granola restart failed: %s. Run granola-fix or "
-                            "quit and reopen Granola." % detail, now)
-                rc = 1
-        elif manual and main is None:
+        blocked = decision["blocked"]
+        if decision["restart"]:
+            self.log("restarting Granola: %s%s" % (decision["reason"],
+                                                   " (ShipIt will relaunch it)" if decision["via_updater"] else ""))
+            status, detail = self.restart(state, [main["pid"], main["start"]], automatic=not manual)
+            if status == "aborted":
+                blocked = "restart aborted: " + detail
+            else:
+                self.log({"ok": "VERIFIED: ", "handed_off": "STOPPED: ", "failed": "FAILED: ", "dry": ""}[status] + detail)
+                if status == "ok" and not self.dry:
+                    state.update(fresh_instance_state(current_main(self.procs())))
+                elif status == "failed":
+                    self.notify(state, "failed", "Granola restart failed: %s. Quit and reopen Granola "
+                                "when you are not recording." % detail, now)
+                    rc = 1
+        elif decision["launch"]:
             self.log("Granola is not running; launching it hidden.")
             if not self.launch():
                 self.log("FAILED: open -g -a Granola")
                 rc = 1
+        if blocked:
+            self.log("restart needed (%s) but blocked: %s" % (decision["reason"], blocked))
+            if manual:
+                rc = 3
+            elif not blocked.startswith("cooldown"):
+                self.notify(state, "blocked", "Granola looks stuck (%s) but was not restarted: %s. "
+                            "Run granola-fix when it is safe." % (decision["reason"], blocked), now)
         self.save_state(state)
         return rc
 
@@ -638,13 +730,16 @@ def status(as_json=False):
     obs = g.observe()
     now, procs, main = obs["now"], obs["procs"], obs["main"]
     state = merge_evidence(g.load_state(), main, obs["events"], time.monotonic())
-    wedge = wedged(state, now, time.monotonic())
-    decision = plan(procs, wedge, obs["recording"], now, state.get("last_restart", 0))
+    wedge = wedged(state)
+    stops = [ts for ts, kind in obs["events"] if kind == "transcription_stopped"]
+    last_recording = max([now if obs["recording"] else 0, state.get("last_recording") or 0] + stops)
+    decision = plan(procs, wedge, obs["recording"], now, state.get("last_restart", 0), last_recording,
+                    skip=state.get("unkillable") or [])
     completes = [ts for ts, kind in obs["events"] if kind == "sync_complete"]
     report = {
         "main": g.describe(main) if main else None,
         "helpers": [g.describe(p) for p in procs if is_helper(p)],
-        "orphans": [g.describe(p) for p in select_orphans(procs, now)],
+        "orphans": [g.describe(p) for p in select_orphans(procs, now, state.get("unkillable") or [])],
         "updater_running": any(is_updater(p) for p in procs),
         "storage_helpers": count_storage(procs),
         "recording": obs["recording"],
@@ -700,7 +795,7 @@ def main(argv=None):
     if cmd == "status":
         return status(as_json="--json" in flags)
     dry = "--dry-run" in flags
-    guard = Guard(dry=dry, echo=(cmd == "fix"), force="--force" in flags)
+    guard = Guard(dry=dry, echo=(cmd == "fix"), force=(cmd == "fix" and "--force" in flags))
     run = (lambda: guard.run(manual=(cmd == "fix")))
     if dry:
         return run()          # read-only: no lock, no state, no signals
