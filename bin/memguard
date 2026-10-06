@@ -29,6 +29,13 @@ Policy (deliberately narrow):
     approach zero under heavy file IO while inactive pages stay reclaimable
     (memguard v1 mis-killed the dense build on exactly that, 2026-07-29
     20:28, rc=143 — level was 1 and free% was 91 the whole time).
+  - Optional compressor clause, OFF by default (a kill policy change is
+    Max's call): compressor occupancy >= min_gib on every tick for
+    sustain_s also counts as critical. Enable it in
+    ~/.config/memguard/config.json:
+      {"compressor_clause": {"enabled": true, "min_gib": 60, "sustain_s": 180}}
+    While off it runs in shadow: ticks where it alone would have fired are
+    logged to memguard-shadow.log with what would have been signaled.
   - TERM first; if the same pid survives 25s+ and we're still critical, KILL.
   - 60s cooldown between distinct kills; warn-level events notify at most
     every 30 min.
@@ -36,6 +43,8 @@ Policy (deliberately narrow):
 Files:
   ~/Library/Logs/memguard.log        CSV, one line per tick (self-trimming)
   ~/Library/Logs/memguard-kills.log  JSON lines, one per signal sent, with argv
+  ~/Library/Logs/memguard-shadow.log JSON lines, compressor clause would-fire
+  ~/.config/memguard/config.json     optional; enables the compressor clause
   ~/.local/state/memguard/           strike counter / last-action / rate limits
 
 Usage: memguard tick [--dry-run] | status | test [--dry-run]
@@ -59,6 +68,8 @@ UID = os.getuid()
 STATE_DIR = os.path.join(HOME, ".local", "state", "memguard")
 LOG = os.path.join(HOME, "Library", "Logs", "memguard.log")
 KILL_LOG = os.path.join(HOME, "Library", "Logs", "memguard-kills.log")
+SHADOW_LOG = os.path.join(HOME, "Library", "Logs", "memguard-shadow.log")
+CONFIG = os.path.join(HOME, ".config", "memguard", "config.json")
 
 GB = 1024 ** 3
 MIN_TARGET_FOOTPRINT = 20 * GB    # never signal anything smaller
@@ -73,6 +84,9 @@ ESCALATE_AFTER_S = 25             # TERM -> KILL if still alive and critical
 WARN_NOTIFY_EVERY_S = 30 * 60
 NOCAND_NOTIFY_EVERY_S = 10 * 60
 LOG_MAX_BYTES = 8 * 1024 * 1024
+CMPR_MIN_GIB = 60                 # compressor clause defaults (clause is off
+CMPR_SUSTAIN_S = 180              # unless config.json enables it)
+CMPR_MAX_GAP_S = 300              # a longer gap between ticks restarts the hold
 DENY_PREFIXES = ("claude", "windowserver", "loginwindow", "launchd",
                  "kernel_task", "finder", "dock")
 
@@ -126,17 +140,53 @@ def free_percentage():
         return -1
 
 
-def classify(level, free_pct, raw_free, swap_gb):
-    """Return (critical, warn). Pure so tests can pin the 7/29 profiles."""
+def classify(level, free_pct, raw_free, swap_gb, compressor_held=False):
+    """Return (critical, warn). Pure so tests can pin the 7/29 profiles.
+
+    compressor_held is the optional compressor clause's verdict; the caller
+    passes True only when config.json enables the clause.
+    """
     critical = (
         level >= 4
         or (0 <= free_pct <= FREE_PCT_CRIT)
         or (0 <= free_pct <= THRASH_FREE_PCT
             and swap_gb > THRASH_SWAP_GB
             and 0 <= raw_free < THRASH_RAW_FREE)
+        or compressor_held
     )
     warn = level >= 2 or (0 <= free_pct <= FREE_PCT_WARN)
     return critical, warn
+
+
+def compressor_clause_settings(path=None):
+    """(enabled, min_bytes, sustain_s). Disabled unless the config says
+    "enabled": true; a missing or malformed file leaves it off."""
+    off = (False, CMPR_MIN_GIB * GB, float(CMPR_SUSTAIN_S))
+    try:
+        with open(path or CONFIG) as f:
+            cfg = json.load(f)["compressor_clause"]
+        min_gib = float(cfg.get("min_gib", CMPR_MIN_GIB))
+        sustain_s = float(cfg.get("sustain_s", CMPR_SUSTAIN_S))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return off
+    if min_gib <= 0 or sustain_s < 0:
+        return off
+    return cfg.get("enabled") is True, min_gib * GB, sustain_s
+
+
+def compressor_hold(comp, min_bytes, now, prev):
+    """(state, held_s): how long every tick has seen comp >= min_bytes.
+
+    prev is the last tick's state {"since": t0, "last": t1}. A tick below
+    the line or with an unreadable compressor (-1) resets the hold, and so
+    does a gap over CMPR_MAX_GAP_S, since nothing was observed in it. Pure.
+    """
+    if comp < 0 or comp < min_bytes:
+        return {}, 0.0
+    since = prev.get("since")
+    if since is None or now - prev.get("last", now) > CMPR_MAX_GAP_S:
+        since = now
+    return {"since": since, "last": now}, now - since
 
 
 def parse_vm_stat(text):
@@ -371,10 +421,13 @@ def log_kill(entry):
         f.write(json.dumps(entry) + "\n")
 
 
-def send_signal(pid, sig, cmd, footprint=0, rss=0, dry=False):
+def send_signal(pid, sig, cmd, footprint=0, rss=0, dry=False,
+                compressor_clause=False):
     entry = {"ts": now_iso(), "pid": pid, "sig": sig,
              "footprint_gb": round(footprint / GB, 2),
              "rss_gb": round(rss / GB, 2), "cmd": cmd, "dry_run": dry}
+    if compressor_clause:
+        entry["compressor_clause"] = True
     if not dry:
         try:
             os.kill(pid, getattr(signal, sig))
@@ -385,6 +438,41 @@ def send_signal(pid, sig, cmd, footprint=0, rss=0, dry=False):
         log_kill(entry)
         write_state("last_action.json",
                     {"pid": pid, "ts": time.time(), "sig": sig})
+    return entry
+
+
+def shadow(comp, held_s, level, free_pct, swap, dry=False):
+    """Record a tick the compressor clause alone would have made critical.
+
+    Read-only: nothing is signaled. The clause is off; this is the evidence
+    for deciding whether to turn it on.
+    """
+    try:
+        target, giants = pick_target(big_processes())
+    except Exception as exc:
+        target, giants = None, []
+        error = type(exc).__name__
+    else:
+        error = None
+    def brief(r):
+        return {"pid": r["pid"], "footprint_gb": round(r["footprint"] / GB, 1),
+                "rss_gb": round(r["rss"] / GB, 1), "cmd": r["cmd"][:300]}
+
+    entry = {"ts": now_iso(), "compressor_gb": round(comp / GB, 2),
+             "held_s": round(held_s), "level": level, "free_pct": free_pct,
+             "swap_gb": round(swap, 2),
+             "would_target": brief(target) if target else None,
+             "giants": [brief(g) for g in giants[:3]]}
+    if error:
+        entry["lookup_error"] = error
+    if dry:
+        sys.stdout.write("SHADOW " + json.dumps(entry) + "\n")
+        return entry
+    try:
+        with open(SHADOW_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
     return entry
 
 
@@ -428,7 +516,16 @@ def tick(dry=False):
     swap = swap_used_gb()
     free_pct = free_percentage()
 
-    critical, warn = classify(level, free_pct, free, swap)
+    enabled, cmpr_min, cmpr_sustain = compressor_clause_settings()
+    cmpr_state, held_s = compressor_hold(
+        comp, cmpr_min, time.time(), read_state("cmpr.json", {}))
+    if not dry:
+        write_state("cmpr.json", cmpr_state)
+    cmpr_held = bool(cmpr_state) and held_s >= cmpr_sustain
+    critical, warn = classify(level, free_pct, free, swap,
+                              compressor_held=enabled and cmpr_held)
+    if cmpr_held and not enabled and not critical:
+        shadow(comp, held_s, level, free_pct, swap, dry)
 
     strikes = read_state("strikes.json", {"n": 0})["n"]
     strikes = strikes + 1 if critical else 0
@@ -453,7 +550,8 @@ def tick(dry=False):
                    .format(last["pid"]), dry)
         elif target and (not last or age >= KILL_COOLDOWN_S):
             send_signal(target["pid"], "SIGTERM", target["cmd"],
-                        target["footprint"], target["rss"], dry)
+                        target["footprint"], target["rss"], dry,
+                        compressor_clause=enabled and cmpr_held)
             action = "SIGTERM:{}".format(target["pid"])
             notify("Memory critical (free {:.1f}GB): SIGTERM pid {} "
                    "({:.0f}GB python footprint). argv in memguard-kills.log"
@@ -496,6 +594,10 @@ def describe(row):
 
 def status():
     print("state dir:", STATE_DIR)
+    enabled, cmpr_min, cmpr_sustain = compressor_clause_settings()
+    print("compressor clause: {} (>= {:.0f}GB for {:.0f}s; {})".format(
+        "ON" if enabled else "off, shadow only", cmpr_min / GB, cmpr_sustain,
+        CONFIG))
     for name in ("strikes.json", "last_action.json"):
         print(" ", name, read_state(name, {}))
     try:
@@ -530,16 +632,18 @@ def test(live_signal=True):
     The real last_action.json drives the daemon's SIGKILL escalation, so the
     live-signal check must never write there.
     """
-    global STATE_DIR, LOG, KILL_LOG
-    saved = STATE_DIR, LOG, KILL_LOG
+    global STATE_DIR, LOG, KILL_LOG, SHADOW_LOG, CONFIG
+    saved = STATE_DIR, LOG, KILL_LOG, SHADOW_LOG, CONFIG
     with tempfile.TemporaryDirectory() as tmp:
         STATE_DIR = os.path.join(tmp, "state")
         LOG = os.path.join(tmp, "memguard.log")
         KILL_LOG = os.path.join(tmp, "memguard-kills.log")
+        SHADOW_LOG = os.path.join(tmp, "memguard-shadow.log")
+        CONFIG = os.path.join(tmp, "config.json")
         try:
             return _self_test(live_signal)
         finally:
-            STATE_DIR, LOG, KILL_LOG = saved
+            STATE_DIR, LOG, KILL_LOG, SHADOW_LOG, CONFIG = saved
 
 
 def _row(pid, footprint_gb, rss_gb, argv, uid=UID, exe=""):
@@ -654,6 +758,31 @@ def _self_test(live_signal):
     check("swap-thrash clause is critical", c)
     c, w = classify(1, 12, 30 * GB, 0.0)
     check("free% 12 warns without killing", (not c) and w)
+
+    # Compressor clause: off unless config.json says "enabled": true.
+    check("compressor clause is off without a config",
+          compressor_clause_settings()[0] is False)
+    with open(CONFIG, "w") as f:
+        json.dump({"compressor_clause": {"enabled": "yes"}}, f)
+    check("only a JSON true enables it", compressor_clause_settings()[0] is False)
+    with open(CONFIG, "w") as f:
+        json.dump({"compressor_clause": {"enabled": True, "min_gib": 65,
+                                         "sustain_s": 120}}, f)
+    check("config enables it with its own line and hold",
+          compressor_clause_settings() == (True, 65 * GB, 120.0))
+    os.remove(CONFIG)
+    # 2026-10-01 11:30 shape: level 1, free% far above 8, compressor full.
+    c, _ = classify(1, 60, int(0.05 * GB), 11.6, compressor_held=False)
+    check("10/01 11:30 profile is not critical without the clause", not c)
+    c, _ = classify(1, 60, int(0.05 * GB), 11.6, compressor_held=True)
+    check("... and is critical with it", c)
+    st, held = compressor_hold(70 * GB, 60 * GB, 1000.0, {})
+    st, held = compressor_hold(71 * GB, 60 * GB, 1180.0, st)
+    check("hold accumulates across ticks at/above the line", held == 180.0)
+    _, held = compressor_hold(71 * GB, 60 * GB, 1600.0, st)
+    check("a 420s gap restarts the hold", held == 0.0)
+    st2, held = compressor_hold(59 * GB, 60 * GB, 1200.0, st)
+    check("a tick below the line resets it", st2 == {} and held == 0.0)
 
     if live_signal:
         child = subprocess.Popen([sys.executable, "-c",

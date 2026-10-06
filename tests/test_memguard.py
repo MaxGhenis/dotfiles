@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import itertools
+import json
 import os
 from pathlib import Path
 import re
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -377,6 +379,167 @@ class CommandTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("would target:", result.stdout)
+
+
+
+def old_classify(level, free_pct, raw_free, swap_gb):
+    """memguard v2's predicate as of origin/master e89fc73, verbatim logic."""
+    critical = (
+        level >= 4
+        or (0 <= free_pct <= 8)
+        or (0 <= free_pct <= 20 and swap_gb > 4 and 0 <= raw_free < 1.5 * GB)
+    )
+    warn = level >= 2 or (0 <= free_pct <= 15)
+    return critical, warn
+
+
+class CompressorClauseTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.config = Path(self.temporary_directory.name) / "config.json"
+
+    def settings_for(self, text):
+        if text is not None:
+            self.config.write_text(text)
+        return memguard.compressor_clause_settings(str(self.config))
+
+    def test_clause_is_off_unless_the_config_says_true(self):
+        default = (False, memguard.CMPR_MIN_GIB * GB, float(memguard.CMPR_SUSTAIN_S))
+        for text in (None, "", "{", "[]", "{}", '{"compressor_clause": 1}',
+                     '{"compressor_clause": {}}',
+                     '{"compressor_clause": {"enabled": "yes"}}',
+                     '{"compressor_clause": {"enabled": 1}}',
+                     '{"compressor_clause": {"enabled": true, "min_gib": -5}}',
+                     '{"compressor_clause": {"enabled": true, "sustain_s": "x"}}'):
+            with self.subTest(text=text):
+                self.assertFalse(self.settings_for(text)[0])
+        self.assertEqual(self.settings_for(None), default)
+
+    def test_config_sets_line_and_hold(self):
+        settings = self.settings_for(
+            '{"compressor_clause": {"enabled": true, "min_gib": 65, "sustain_s": 120}}')
+
+        self.assertEqual(settings, (True, 65 * GB, 120.0))
+
+    def test_without_the_clause_classify_matches_the_old_predicate(self):
+        levels = (-1, 0, 1, 2, 3, 4, 5)
+        free_pcts = (-1, 0, 1, 7, 8, 9, 14, 15, 16, 19, 20, 21, 50, 100)
+        raw_frees = (-1, 0, int(1.4 * GB), int(1.5 * GB), 30 * GB)
+        swaps = (-1.0, 0.0, 4.0, 4.1, 70.0)
+        for args in itertools.product(levels, free_pcts, raw_frees, swaps):
+            self.assertEqual(memguard.classify(*args), old_classify(*args), args)
+            self.assertEqual(memguard.classify(*args, compressor_held=False),
+                             old_classify(*args), args)
+            critical, warn = memguard.classify(*args, compressor_held=True)
+            self.assertTrue(critical, args)
+            self.assertEqual(warn, old_classify(*args)[1], args)
+
+    def test_hold_matches_its_definition_on_every_short_tick_sequence(self):
+        line = 60 * GB
+        values = (-1, 59 * GB, 60 * GB, 73 * GB)
+        steps = (20, 130, memguard.CMPR_MAX_GAP_S + 1)
+        for length in range(1, 5):
+            for comps in itertools.product(values, repeat=length):
+                for gaps in itertools.product(steps, repeat=length - 1):
+                    times = [1000.0]
+                    for gap in gaps:
+                        times.append(times[-1] + gap)
+                    state = {}
+                    for comp, now in zip(comps, times):
+                        state, held = memguard.compressor_hold(comp, line, now, state)
+                    # Reference: the hold starts at the first tick of the
+                    # trailing run of at-or-above ticks with no long gap.
+                    start = None
+                    for i, (comp, now) in enumerate(zip(comps, times)):
+                        if comp < line:
+                            start = None
+                        elif start is None or now - times[i - 1] > memguard.CMPR_MAX_GAP_S:
+                            start = now
+                    expected = 0.0 if start is None else times[-1] - start
+                    self.assertEqual(held, expected, (comps, gaps))
+                    self.assertEqual(bool(state), start is not None, (comps, gaps))
+
+
+class TickCompressorClauseTests(unittest.TestCase):
+    """Whole ticks with samplers, process lookup and notify replaced.
+
+    The process lookup returns nothing and send_signal fails the test if it
+    is ever called, so no signal can be sent.
+    """
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        root = Path(self.temporary_directory.name)
+        self.paths = {
+            "STATE_DIR": str(root / "state"),
+            "LOG": str(root / "memguard.log"),
+            "KILL_LOG": str(root / "memguard-kills.log"),
+            "SHADOW_LOG": str(root / "memguard-shadow.log"),
+            "CONFIG": str(root / "config.json"),
+        }
+        self.clock = [1000.0]
+        replacements = dict(
+            self.paths,
+            # 2026-10-01 11:30-ish: level 1, plenty "free", compressor full.
+            pressure_level=lambda: 1,
+            free_percentage=lambda: 60,
+            vm_stat=lambda: {"free": int(0.05 * GB), "compressor": 72 * GB},
+            swap_used_gb=lambda: 11.6,
+            big_processes=lambda *a, **k: [],
+            notify=lambda *a, **k: None,
+            send_signal=self.fail_on_signal,
+        )
+        for name, value in replacements.items():
+            patcher = unittest.mock.patch.object(memguard, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = unittest.mock.patch.object(memguard.time, "time", lambda: self.clock[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fail_on_signal(self, *args, **kwargs):
+        raise AssertionError("send_signal called in a test: {} {}".format(args, kwargs))
+
+    def write_config(self, enabled):
+        Path(self.paths["CONFIG"]).write_text(
+            '{"compressor_clause": {"enabled": %s, "min_gib": 60, "sustain_s": 40}}'
+            % ("true" if enabled else "false"))
+
+    def run_ticks(self, count):
+        lines = []
+        for _ in range(count):
+            lines.append(memguard.tick().strip().split(","))
+            self.clock[0] += 20
+        return lines
+
+    def test_enabled_clause_goes_critical_after_the_hold_and_then_acts(self):
+        self.write_config(True)
+
+        lines = self.run_ticks(4)
+
+        self.assertEqual([l[7] for l in lines], ["0", "0", "1", "1"])
+        self.assertEqual([l[9] for l in lines], ["-", "-", "-", "no-candidate"])
+        self.assertFalse(Path(self.paths["SHADOW_LOG"]).exists())
+
+    def test_disabled_clause_never_goes_critical_and_logs_shadow_ticks(self):
+        self.write_config(False)
+
+        lines = self.run_ticks(4)
+
+        self.assertEqual([l[7] for l in lines], ["0", "0", "0", "0"])
+        shadow = Path(self.paths["SHADOW_LOG"]).read_text().splitlines()
+        self.assertEqual(len(shadow), 2)
+        entry = json.loads(shadow[-1])
+        self.assertEqual(entry["held_s"], 60)
+        self.assertEqual(entry["level"], 1)
+        self.assertIsNone(entry["would_target"])
+
+    def test_no_config_behaves_like_disabled(self):
+        lines = self.run_ticks(12)
+
+        self.assertEqual({l[7] for l in lines}, {"0"})
 
 
 if __name__ == "__main__":
