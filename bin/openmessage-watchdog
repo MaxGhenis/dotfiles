@@ -23,6 +23,17 @@
 #   - google.needs_repair 3 consecutive checks       → notify once per episode
 #   - google.repairs_paced >= 3 (cookies being revoked faster than the repair
 #     floor — self-heal is losing)                   → notify, re-notify 6h
+#   - google.pull_health.empty_with_local_history: the latest INBOX listing
+#     or targeted lookup returned no data although the store holds >= threshold
+#     Google conversations, so catch-up is broken while push may still flow.
+#     2026-10-08: the phone had switched to Google-account pairing and answered
+#     every pull with an account-switch notice; with account_switch set the
+#     alert says so and points at d1088. The daemon updates the flag when a
+#     counted pull completes, so after a fix it can repeat until the next one.
+#     The text gives the time since the last pull attempt of any kind: a large
+#     value means nothing has re-tested the flag; a small one does not mean it
+#     was re-confirmed. Skipped when google says paired=false; absent on
+#     daemons before openmessage PR #193             → notify, re-notify 6h
 #   - projection_stalled (top-level or per-platform) → notify, re-notify 6h
 #   - a platform's latest_received trailing the newest message across all
 #     platforms by > 48h (relative check: other platforms flowing proves the
@@ -364,6 +375,21 @@ if g.get("needs_repair"):
     out.append("REPAIR|google")
 if (g.get("repairs_paced") or 0) >= 3:
     out.append("ALERT|repairs_paced|Google cookie repairs throttled (repairs_paced=%s) - something revokes cookies fast" % g.get("repairs_paced"))
+# Catch-up pulls answered without data (openmessage PR #193). Older daemons
+# have no pull_health, and the daemon omits it before the first pull. Only an
+# explicit paired=false silences it: paired means the Google session file
+# exists, and without a session no pulls run, so pull_health would be stale.
+ph = g.get("pull_health")
+if isinstance(ph, dict) and ph.get("empty_with_local_history") is True and g.get("paired") is not False:
+    n = ph.get("local_conversations")
+    held = "%d conversations" % n if isinstance(n, int) and not isinstance(n, bool) else "its Google conversations"
+    last = ph.get("last_attempt_ms")
+    age = ""
+    if isinstance(last, (int, float)) and not isinstance(last, bool) and 0 < last <= now_ms:
+        mins = int((now_ms - last) / 60000)
+        age = " (last pull %s ago)" % ("%dm" % mins if mins < 60 else "%dh" % (mins // 60))
+    why = " - phone switched to Google-account pairing; re-link or switch back to QR (d1088)" if ph.get("account_switch") is True else ""
+    out.append("ALERT|pull_empty|Google pulls return no data while the store holds %s%s%s" % (held, age, why))
 if d.get("projection_stalled"):
     out.append("ALERT|projection_stalled|v2 read projection stalled - reads are stale while ingest continues")
 # Pairing as the daemon reports it (bash alerts on a paired -> unpaired change).
