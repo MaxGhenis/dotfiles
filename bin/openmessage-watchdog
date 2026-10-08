@@ -44,6 +44,13 @@
 #     near-impossible at Max's volume — smells like zombie-everything)
 #                                                    → notify, re-notify 6h
 #   - v2 ingest quarantined > 0                      → notify, re-notify 6h
+#   - v2 ingest append_errors (summed over accounts) above the count already
+#     reported: failed attempts to append a captured frame to the v2 inbox
+#     (counted only since openmessage PR #195). The daemon keeps the
+#     count for the life of its process, so a flat count never re-alerts; a
+#     backend restart (new listener on the port, or a falling sum) resets the
+#     baseline and carries unreported errors into the next alert. Deferred
+#     while another alert leads the banner      → notify, again on growth (6h cooldown)
 #   - signal receive_recovery pending_count >= 5     → notify, re-notify 6h
 #   - a paired, connected platform silent for longer than its own two-week
 #     hour-of-day baseline explains. 2026-10-06: Google relayed nothing for 38h
@@ -61,7 +68,9 @@
 #
 # The counters and epochs in the state dir are canonical decimals, and the
 # epochs are no later than the run clock. A file that is anything else is
-# logged, removed and read as missing (read_state).
+# logged, removed and read as missing (read_state). The exception is
+# append_errors, five fields on one line; its arm logs a bad field and reads
+# that field as 0.
 #
 # Every run past the clock check rewrites <state dir>/health.txt from an EXIT
 # trap, skipped runs included: what the run did and every condition it
@@ -373,10 +382,21 @@ for name, f in fresh.items():
         out.append("ALERT|behind_%s|%s received nothing for %.1fd while other platforms flow" % (name, name, (newest - lat) / 86400000.0))
 if newest and now_ms - newest > 24 * 3600 * 1000:
     out.append("ALERT|all_quiet|No messages on ANY platform for %dh - likely silent global failure" % int((now_ms - newest) / 3600000))
-per = (d.get("v2_ingest") or {}).get("per_account") or {}
+v2i = d.get("v2_ingest")
+per = v2i.get("per_account") if isinstance(v2i, dict) else None
+per = per if isinstance(per, dict) else {}
 q = sum((a.get("quarantined") or 0) for a in per.values() if isinstance(a, dict))
 if q:
     out.append("ALERT|quarantine|%d ingested frame(s) quarantined" % q)
+# append_errors and appended only grow while the daemon process lives. Print
+# their sums on every run that sees accounts; the APPEND arm below keeps the
+# baseline. An empty per_account is a fresh daemon with no ingest yet.
+accts = dict((k, a) for k, a in per.items() if isinstance(a, dict))
+if accts:
+    num = lambda v: min(v, 10 ** 15) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+    errs = sorted(("".join(c if c.isalnum() or c in "._:@+-" else "?" for c in str(k)), num(a.get("append_errors"))) for k, a in accts.items())
+    out.append("APPEND|%d|%d|%s" % (min(sum(n for _, n in errs), 10 ** 15), min(sum(num(a.get("appended")) for a in accts.values()), 10 ** 15),
+                                    ", ".join("%s %d" % (k, n) for k, n in errs if n)))
 rr = plats["signal"].get("receive_recovery") or {}
 if (rr.get("pending_count") or 0) >= 5:
     out.append("ALERT|signal_recovery|Signal receive-recovery backlog: %s pending (%s)" % (rr.get("pending_count"), rr.get("last_issue_reason")))
@@ -395,7 +415,7 @@ for name, f in fresh.items():
     if s.get("stalled") and f.get("stale_reason") == "silent" and p.get("paired") and p.get("connected"):
         silent_alerts.append("NOTE|%s" % silent_msg(name, (s.get("silent_ms") or 0) / 3600000.0, s.get("expected_active_hours") or 0))
 g = plats["google"]
-if not reported and g.get("paired") and g.get("connected") and d.get("v2_ingest", {}).get("enabled"):
+if not reported and g.get("paired") and g.get("connected") and isinstance(v2i, dict) and v2i.get("enabled"):
     data_dir = (d.get("auth") or {}).get("data_dir") or os.path.expanduser("~/Library/Application Support/OpenMessage")
     try:
         v = inbox_silence(os.path.join(data_dir, "v2", "store.sqlite3"), "google.protobuf", now_ms / 1000.0)
@@ -421,6 +441,7 @@ alerts=()
 unlinked=""
 disc_seen=" "
 repair_seen=0
+append_seen=0
 
 while IFS= read -r line; do
   [ -z "$line" ] && continue
@@ -493,8 +514,101 @@ while IFS= read -r line; do
       else
         log "suppressed (cooldown): $key"
       fi ;;
+    APPEND\|*)
+      # v2 ingest append_errors: failed attempts to append a captured frame
+      # to the v2 inbox. The daemon counts them for the life of its
+      # process, so alert when the sum passes the count already reported, and
+      # go back to 0 when the backend restarts: a new process listening on the
+      # port, or either sum falling when lsof can't tell. Errors seen but not
+      # yet reported when it restarts carry over into the next alert.
+      append_seen=1
+      IFS='|' read -r _ errs appended detail <<< "$line"
+      for v in errs appended; do   # the python sums, capped at 10^15
+        case "${!v:-}" in ''|*[!0-9]*|0?*) printf -v "$v" 0 ;; esac
+      done
+      saved=$(head -c 200 "$STATE_DIR/append_errors" 2>/dev/null)
+      read -r last_errs last_appended alerted carry last_ident <<< "$saved"
+      damaged=0
+      for v in last_errs last_appended alerted carry; do
+        x=${!v:-}
+        case "$x" in ''|*[!0-9]*|0?*) [ -n "$x" ] && damaged=1; x=0 ;; esac   # see read_state
+        [ "${#x}" -gt 18 ] && { damaged=1; x=0; }
+        printf -v "$v" %s "$x"
+      done
+      if [ -n "${last_ident:-}" ] && ! [[ "$last_ident" =~ ^[1-9][0-9]*@[A-Za-z0-9:]+$ ]]; then
+        damaged=1 last_ident=""
+      fi
+      [ "$damaged" = 1 ] && log "state file append_errors was damaged ('$(printf %s "$saved" | tr -cd '[:alnum:] ._:@-' | cut -c1-60)') - bad fields read as 0"
+      [ "$alerted" -gt "$last_errs" ] && alerted=$last_errs   # damaged state file
+      # Who listens on the port: exactly one PID, and its start time in a
+      # fixed zone and locale (ps prints local time, so a time-zone change
+      # would otherwise look like a new process). No listener or several,
+      # or a failed lsof, is unknown: keep the last identity and rely on the
+      # sums this run.
+      ident=""
+      listener=$(lsof -bnPw -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | sort -nu)
+      case "$listener" in ''|*[!0-9]*) listener="" ;; esac
+      if [ -n "$listener" ]; then
+        started=$(TZ=UTC0 LC_ALL=C ps -o lstart= -p "$listener" 2>/dev/null | tr -d ' ')
+        [ -n "$started" ] && ident="$listener@$started"
+      fi
+      if { [ -n "$ident" ] && [ -n "${last_ident:-}" ] && [ "$ident" != "$last_ident" ]; } \
+           || [ "$errs" -lt "$last_errs" ] || [ "$appended" -lt "$last_appended" ]; then
+        carry=$(( carry + last_errs - alerted ))
+        if [ "$last_errs" -gt 0 ]; then
+          log "append_errors baseline reset: backend restarted ($carry seen before it and not yet reported)"
+        fi
+        alerted=0
+        last_ident=""   # a restart seen through the sums makes the old identity stale
+      fi
+      # health.txt lists what this backend has counted, reported or not
+      [ "$errs" -gt 0 ] && health_alerts+=("$errs failed attempt(s) to append to v2 ingest in this backend process ($detail)")
+      [ "$carry" -gt 0 ] && health_alerts+=("$carry failed attempt(s) to append to v2 ingest before the backend restarted")
+      new=$(( errs - alerted ))
+      if [ "$new" -gt 0 ] || [ "$carry" -gt 0 ]; then
+        last=$(read_state "$STATE_DIR/alert_append_errors" epoch)
+        if [ $(( NOW - last )) -lt "$ALERT_COOLDOWN" ]; then
+          x=""
+          [ "$carry" -gt 0 ] && x=", $carry from before a restart"
+          log "suppressed (cooldown): append_errors ($errs, last alert reported $alerted$x)"
+        elif [ "${#alerts[@]}" -gt 0 ] || [ -n "${unlinked:-}" ]; then
+          # The banner shows only the first alert, and this one does not
+          # repeat for a flat count: wait for a run where it leads.
+          log "deferred: append_errors - another alert leads this run's notification"
+        else
+          if [ "$new" -gt 0 ]; then
+            msg="$errs failed attempt(s) to append to v2 ingest"
+            [ "$alerted" -gt 0 ] && msg="$msg, $new since the last alert"
+            msg="$msg ($detail)"
+            [ "$carry" -gt 0 ] && msg="$msg, and $carry more seen before the backend restarted"
+          else
+            msg="$carry failed attempt(s) to append to v2 ingest before the backend restarted"
+          fi
+          echo "$NOW" > "$STATE_DIR/alert_append_errors"
+          alerts+=("$msg")
+          alerted=$errs
+          carry=0
+        fi
+      fi
+      echo "$errs $appended $alerted $carry ${ident:-${last_ident:-}}" > "$STATE_DIR/append_errors" ;;
   esac
 done <<< "$HEALTH"
+
+# A run that saw no ingest accounts (a backend that has ingested nothing yet,
+# say after a restart) leaves the append_errors state alone; health.txt still
+# lists what that state holds unreported.
+if [ "$append_seen" = 0 ] && [ -s "$STATE_DIR/append_errors" ]; then
+  read -r last_errs _ alerted carry _ <<< "$(head -c 200 "$STATE_DIR/append_errors" 2>/dev/null)"
+  for v in last_errs alerted carry; do
+    x=${!v:-}
+    case "$x" in ''|*[!0-9]*|0?*) x=0 ;; esac
+    [ "${#x}" -gt 18 ] && x=0
+    printf -v "$v" %s "$x"
+  done
+  [ "$alerted" -gt "$last_errs" ] && alerted=$last_errs
+  x=$(( last_errs - alerted + carry ))
+  [ "$x" -gt 0 ] && health_alerts+=("$x failed attempt(s) to append to v2 ingest not yet reported (no ingest accounts this run)")
+fi
 
 # Reset consecutive counters for conditions absent this run. A run without
 # status data (python3 failed, or the JSON did not parse) saw nothing absent.
