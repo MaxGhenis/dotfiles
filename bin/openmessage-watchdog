@@ -28,6 +28,16 @@
 #     platforms by > 48h (relative check: other platforms flowing proves the
 #     pipe; one trailing = that platform is broken, not a quiet day)
 #                                                    → notify, re-notify 6h
+#     Both per-platform checks skip a platform whose status block says
+#     paired=false, since unlinking freezes its freshness. (2026-10-07:
+#     unlinked WhatsApp and Signal had re-notified every 6h for ~45 days and
+#     buried a real 4-day SMS outage.) A missing block or key keeps alerting.
+#   - a platform last seen paired=true now says paired=false
+#                                    → notify once (6h cooldown against flaps)
+#     Unlinking can be involuntary: Google's server-side logout deletes the
+#     session file that paired reads, and WhatsApp's device_removed deletes
+#     its device store. A platform first seen unpaired is only logged; each
+#     pause and resume is logged once.
 #   - newest message on ANY platform > 24h old (global silence; organically
 #     near-impossible at Max's volume — smells like zombie-everything)
 #                                                    → notify, re-notify 6h
@@ -40,20 +50,36 @@
 # Touch that flag before intentionally quitting the app (re-pair recipe,
 # debugging); remove it when done.
 #
-# Env overrides (testing): OPENMESSAGE_WATCHDOG_PORT, OPENMESSAGE_WATCHDOG_DRYRUN=1
-# (dryrun: log decisions, no relaunch, no notifications)
+# Env overrides (testing; tests/test_openmessage_watchdog.py):
+#   OPENMESSAGE_WATCHDOG_PORT   daemon port (default 7007)
+#   OPENMESSAGE_WATCHDOG_APP    app bundle that must exist (default
+#                               /Applications/OpenMessage.app); the relaunch
+#                               still opens the app by name
+#   OPENMESSAGE_WATCHDOG_NOW    epoch seconds for this run's clock: cooldowns,
+#                               throttles and the python block's now_ms (log
+#                               line timestamps stay wall-clock)
+#   OPENMESSAGE_WATCHDOG_STATE  state dir, OPENMESSAGE_WATCHDOG_LOG  log file
+#   OPENMESSAGE_WATCHDOG_DRYRUN=1  log decisions, no relaunch, no notifications.
+#                               It still writes counters and cooldown epochs,
+#                               so point _STATE and _LOG at temp paths.
 
 set -u
 PORT="${OPENMESSAGE_WATCHDOG_PORT:-7007}"
 DRYRUN="${OPENMESSAGE_WATCHDOG_DRYRUN:-0}"
-APP="/Applications/OpenMessage.app"
+APP="${OPENMESSAGE_WATCHDOG_APP:-/Applications/OpenMessage.app}"
 FLAG="$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
 STATE_DIR="${OPENMESSAGE_WATCHDOG_STATE:-$HOME/.local/state/openmessage-watchdog}"
 FAILS_F="$STATE_DIR/consecutive_fails"
 LAST_ACTION_F="$STATE_DIR/last_action_epoch"
 LOG="${OPENMESSAGE_WATCHDOG_LOG:-$HOME/Library/Logs/openmessage-watchdog.log}"
 ALERT_COOLDOWN=21600   # 6h between repeat notifications per condition
-NOW=$(date +%s)
+NOW="${OPENMESSAGE_WATCHDOG_NOW:-$(date +%s)}"
+case "$NOW" in  # digits only; no leading zero (bash reads it as octal); < 12 digits
+  *[!0-9]*|0?*|????????????*)
+    echo "openmessage-watchdog: OPENMESSAGE_WATCHDOG_NOW must be epoch seconds, got '$NOW'" >&2
+    exit 2 ;;
+esac
+export OPENMESSAGE_WATCHDOG_NOW="$NOW"   # one clock per run; the python block reads it
 mkdir -p "$STATE_DIR"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
@@ -65,7 +91,10 @@ notify() { # $1 = message (keep quote-free)
 }
 
 [ -e "$FLAG" ] && { log "skip: disable flag present"; exit 0; }
-pgrep -f 'openmessage pair' >/dev/null 2>&1 && { log "skip: pairing in flight"; exit 0; }
+# `openmessage pair` run by path or name. The [ ] keeps the literal phrase out
+# of this pattern, so a process that merely passes it on (a test's pgrep stub)
+# or greps for the phrase does not match.
+pgrep -f '(^|/)openmessage[ ]pair( |$)' >/dev/null 2>&1 && { log "skip: pairing in flight"; exit 0; }
 [ -d "$APP" ] || { log "skip: $APP not installed"; exit 0; }
 
 STATUS_JSON=$(curl -s -m 5 "http://127.0.0.1:$PORT/api/status" 2>/dev/null)
@@ -123,7 +152,8 @@ try:
     d = json.load(sys.stdin)
 except Exception as e:
     print("PARSEERR|%s" % str(e)[:60]); sys.exit(0)
-now_ms = time.time() * 1000
+import os
+now_ms = float(os.environ.get("OPENMESSAGE_WATCHDOG_NOW") or time.time()) * 1000
 plats = {n: (d.get(n) or {}) for n in ("google", "whatsapp", "signal")}
 fresh = d.get("freshness") or {}
 newest = fresh.get("newest_ms") or 0
@@ -138,8 +168,14 @@ if (g.get("repairs_paced") or 0) >= 3:
     out.append("ALERT|repairs_paced|Google cookie repairs throttled (repairs_paced=%s) - something revokes cookies fast" % g.get("repairs_paced"))
 if d.get("projection_stalled"):
     out.append("ALERT|projection_stalled|v2 read projection stalled - reads are stale while ingest continues")
+# Pairing as the daemon reports it (bash alerts on a paired -> unpaired change).
+# An unlinked platform has frozen freshness, so its staleness checks are
+# skipped; only an explicit boolean false counts.
+pairing = {n: d[n]["paired"] for n in set(plats) | set(fresh)
+           if isinstance(d.get(n), dict) and isinstance(d[n].get("paired"), bool)}
+out.extend("%s|%s" % ("PAIRED" if pairing[n] else "UNPAIRED", n) for n in sorted(pairing))
 for name, f in fresh.items():
-    if not isinstance(f, dict):
+    if not isinstance(f, dict) or pairing.get(name) is False:
         continue
     if f.get("projection_stalled"):
         out.append("ALERT|proj_%s|%s projection stalled" % (name, name))
@@ -180,6 +216,26 @@ while IFS= read -r line; do
       echo "$c" > "$STATE_DIR/repair_google"
       log "google needs_repair ($c/3)"
       [ "$c" -eq 3 ] && alerts+=("Google needs repair 15+ min - cookie self-heal is not recovering it") ;;
+    PAIRED\|*|UNPAIRED\|*)
+      name=${line#*|}
+      paired=1; [ "${line%%|*}" = "UNPAIRED" ] && paired=0
+      was=$(cat "$STATE_DIR/paired_$name" 2>/dev/null)
+      [ "$was" = "$paired" ] && continue
+      echo "$paired" > "$STATE_DIR/paired_$name"
+      if [ "$paired" = "1" ]; then
+        [ "$was" = "0" ] && log "paired again: $name - staleness alerts resume"
+      elif [ "$was" = "1" ]; then
+        log "unpaired: $name - was paired; staleness alerts paused until it is relinked"
+        last=$(cat "$STATE_DIR/alert_unlinked_$name" 2>/dev/null || echo 0)
+        if [ $(( NOW - last )) -ge "$ALERT_COOLDOWN" ]; then
+          echo "$NOW" > "$STATE_DIR/alert_unlinked_$name"
+          alerts+=("$name is no longer paired - relink it unless that was intended")
+        else
+          log "suppressed (cooldown): unlinked_$name"
+        fi
+      else
+        log "unpaired: $name - staleness alerts paused until it is relinked"
+      fi ;;
     ALERT\|*)
       rest=${line#ALERT|}
       key=${rest%%|*}
