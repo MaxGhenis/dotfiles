@@ -34,10 +34,12 @@
 #   - v2 ingest quarantined > 0                      → notify, re-notify 6h
 #   - signal receive_recovery pending_count >= 5     → notify, re-notify 6h
 #   - a paired, connected platform silent for longer than its own two-week
-#     hour-of-day baseline explains (freshness.<p>.silence from the daemon; for
-#     daemons that predate it, the same rule computed here from the v2 inbox for
-#     Google). 2026-10-06: Google relayed nothing for 38h while connected and
-#     phone_responding; a phone restart fixed it.    → notify first, re-notify 6h
+#     hour-of-day baseline explains. 2026-10-06: Google relayed nothing for 38h
+#     while connected and phone_responding; a phone restart fixed it. When the
+#     daemon reports freshness.<p>.silence (openmessage PR #190), the app and
+#     the chief-of-staff Telegram watcher notify and this only logs it; for
+#     older daemons it computes the same rule for Google from the v2 inbox
+#                                                    → notify first, re-notify 6h
 #
 # Skips entirely if a manual pairing is in flight (`openmessage pair` process)
 # or the disable flag exists:
@@ -126,10 +128,10 @@ HEALTH=$(echo "$STATUS_JSON" | /usr/bin/python3 -c '
 import datetime, json, os, sqlite3, sys, time, urllib.parse
 
 # Mirror of internal/freshness.EvaluateSilence with DefaultSilenceConfig in
-# ~/openmessage (keep the constants in step). Only used when the daemon does
-# not report freshness.<platform>.silence itself.
+# ~/openmessage (keep the constants and rules in step). Only used when the
+# daemon does not report freshness.<platform>.silence itself.
 BASELINE_DAYS, MIN_ACTIVE_DAYS, MIN_EVENTS_PER_DAY = 14, 7, 20
-EXPECTED_HOURS_LIMIT, MAX_SILENCE_H = 6.0, 16.0
+EXPECTED_HOURS_LIMIT, MAX_SILENCE_H, LONG_SILENCE_H = 6.0, 16.0, 72.0
 
 def inbox_silence(store_path, codec, now):
     con = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(store_path), uri=True, timeout=2)
@@ -140,11 +142,11 @@ def inbox_silence(store_path, codec, now):
         day0 = datetime.datetime.fromtimestamp(last / 1000).replace(hour=0, minute=0, second=0, microsecond=0)
         frm = day0 - datetime.timedelta(days=BASELINE_DAYS)
         lo, hi = int(time.mktime(frm.timetuple()) * 1000), int(time.mktime(day0.timetuple()) * 1000)
-        days, events = {}, 0
+        days, counts = {}, {}
         for (ms,) in con.execute("select received_at_ms from inbox where codec = ? and received_at_ms >= ? and received_at_ms < ?", (codec, lo, hi)):
             d = datetime.datetime.fromtimestamp(ms / 1000)
             days.setdefault(d.date(), set()).add(d.hour)
-            events += 1
+            counts[d.date()] = counts.get(d.date(), 0) + 1
     finally:
         con.close()
     start = last / 1000
@@ -157,9 +159,15 @@ def inbox_silence(store_path, codec, now):
         nxt = min(now, t + 3600 - d.minute * 60 - d.second - d.microsecond / 1e6)
         expected += (nxt - t) / 3600 * p[d.hour]
         t = nxt
-    if active < MIN_ACTIVE_DAYS or events / active < MIN_EVENTS_PER_DAY:
-        return None
-    return (expected >= EXPECTED_HOURS_LIMIT or silent_h >= MAX_SILENCE_H, silent_h, expected)
+    daily = sorted(counts.values())
+    median = 0.0
+    if daily:
+        mid = len(daily) // 2
+        median = float(daily[mid]) if len(daily) % 2 else (daily[mid - 1] + daily[mid]) / 2.0
+    busy = active > 0 and median >= MIN_EVENTS_PER_DAY
+    evaluated = busy and active >= MIN_ACTIVE_DAYS
+    stalled = (evaluated and expected >= EXPECTED_HOURS_LIMIT) or (busy and silent_h >= MAX_SILENCE_H) or silent_h >= LONG_SILENCE_H
+    return (stalled, silent_h, expected, evaluated)
 
 def silent_msg(name, hours, expected, note=""):
     advice = " - check or restart the phone" if name == "google" else ""
@@ -201,8 +209,11 @@ if q:
 rr = plats["signal"].get("receive_recovery") or {}
 if (rr.get("pending_count") or 0) >= 5:
     out.append("ALERT|signal_recovery|Signal receive-recovery backlog: %s pending (%s)" % (rr.get("pending_count"), rr.get("last_issue_reason")))
-# Silence past the platform own baseline goes first: it is the actionable one,
-# and only the first fresh alert of a run reaches the notification text.
+# Silence past the platform own baseline. When the daemon reports it, the app
+# notifies once per episode and the Telegram watcher in chief-of-staff relays
+# it, so this script only logs it (NOTE). For older daemons this script is
+# the only channel: compute it from the v2 inbox and alert, ahead of the other
+# alerts, since only the first fresh alert of a run reaches the notification.
 silent_alerts, reported = [], False
 for name, f in fresh.items():
     s = f.get("silence") if isinstance(f, dict) else None
@@ -211,7 +222,7 @@ for name, f in fresh.items():
     reported = True
     p = plats.get(name) or {}
     if s.get("stalled") and f.get("stale_reason") == "silent" and p.get("paired") and p.get("connected"):
-        silent_alerts.append("ALERT|silent_%s|%s" % (name, silent_msg(name, (s.get("silent_ms") or 0) / 3600000.0, s.get("expected_active_hours") or 0)))
+        silent_alerts.append("NOTE|%s" % silent_msg(name, (s.get("silent_ms") or 0) / 3600000.0, s.get("expected_active_hours") or 0))
 g = plats["google"]
 if not reported and g.get("paired") and g.get("connected") and d.get("v2_ingest", {}).get("enabled"):
     data_dir = (d.get("auth") or {}).get("data_dir") or os.path.expanduser("~/Library/Application Support/OpenMessage")
@@ -234,6 +245,8 @@ while IFS= read -r line; do
   case "$line" in
     PARSEERR\|*)
       log "status parse error: ${line#PARSEERR|}" ;;
+    NOTE\|*)
+      log "note: ${line#NOTE|}" ;;
     DISC\|*)
       name=${line#DISC|}
       disc_seen="$disc_seen$name "
