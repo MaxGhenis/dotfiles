@@ -3,7 +3,7 @@ once when a paired platform becomes unlinked, and the alerts it keeps still
 respect their 6 h cooldown.
 
 On 2026-10-07 /api/status reported WhatsApp and Signal as paired=false, yet
-behind_<name> and proj_<name> had re-notified every 6 h for ~45 days and
+behind_<name> and proj_<name> had re-notified every 6 h since 2026-09-03 and
 drowned the channel during a real 4-day SMS outage. paired=false is also what
 an involuntary logout looks like, so losing a pairing is announced once.
 
@@ -183,8 +183,8 @@ def status(at: int = T0, **platforms: dict) -> dict:
     return body
 
 
-# The 2026-10-07 shape: WhatsApp and Signal unlinked ~7 weeks, Signal's
-# projection stalled, Google healthy (plus the daemon's aggregate flag).
+# The 2026-10-07 shape: WhatsApp and Signal unlinked and ~7 weeks behind,
+# Signal's projection stalled, Google healthy (plus the daemon's aggregate flag).
 UNLINKED = {"paired": False, "connected": False}
 LIVE_2026_10_07 = status(
     whatsapp={**UNLINKED, "behind": 48 * DAY},
@@ -196,7 +196,7 @@ PAIRED = {"paired": True, "connected": True}
 
 # ---------- the unpaired gate ----------
 
-UNLINK_BANNER = "whatsapp is no longer paired - relink it unless that was intended"
+UNLINK_BANNER = "No longer paired: whatsapp - check the app; relink unless that was intended"
 PAUSED = "staleness alerts paused until it is relinked"
 
 
@@ -257,14 +257,33 @@ def test_losing_a_pairing_is_announced_once(box):
     assert box.stored("alert_unlinked_whatsapp") == str(T0 + 300)
 
 
-def test_a_flapping_pairing_is_announced_at_most_every_six_hours(box):
-    schedule = [(0, PAIRED), (300, UNLINKED), (600, PAIRED), (900, UNLINKED),
-                (COOLDOWN + 300, PAIRED), (COOLDOWN + 600, UNLINKED)]
-    for dt, spec in schedule:
-        box.run(status(T0 + dt, whatsapp=spec), at=T0 + dt)
+def test_a_loss_inside_the_cooldown_waits_and_is_still_announced(box):
+    """A second loss within 6 h of the first banner is not dropped: it stays
+    pending and is announced on the first run 6 h after that banner, if the
+    platform is still unpaired then."""
+    first = T0 + 300
+    schedule = [(T0, PAIRED), (first, UNLINKED), (T0 + 600, PAIRED), (T0 + 900, UNLINKED),
+                (T0 + 1200, PAIRED), (T0 + 1500, UNLINKED), (first + COOLDOWN - 1, UNLINKED)]
+    for at, spec in schedule:
+        box.run(status(at, whatsapp=spec), at=at)
+    assert box.banners() == [UNLINK_BANNER]
+    assert box.log_lines("suppressed") == ["suppressed (cooldown): unlinked_whatsapp"] * 3
+    box.run(status(first + COOLDOWN, whatsapp=UNLINKED), at=first + COOLDOWN)  # exactly 6 h
+    box.run(status(first + COOLDOWN + 300, whatsapp=UNLINKED), at=first + COOLDOWN + 300)
     assert box.banners() == [UNLINK_BANNER, UNLINK_BANNER]
-    assert box.log_lines("suppressed") == ["suppressed (cooldown): unlinked_whatsapp"]
-    assert len(box.log_lines("paired again: whatsapp")) == 2
+    assert box.stored("alert_unlinked_whatsapp") == str(first + COOLDOWN)
+    assert len(box.log_lines("paired again: whatsapp")) == 1
+
+
+def test_a_lost_pairing_leads_the_banner(box):
+    """Only the first alert reaches the banner and the loss is not repeated,
+    so it goes ahead of the run's other alerts and names every platform lost."""
+    box.run(status(whatsapp=PAIRED, signal=PAIRED))
+    both_lost = status(T0 + 300, whatsapp=UNLINKED, signal=UNLINKED)
+    both_lost["projection_stalled"] = True
+    box.run(both_lost, at=T0 + 300)
+    assert box.banners() == [
+        "No longer paired: signal, whatsapp - check the app; relink unless that was intended (+1 more - see log)"]
 
 
 def test_relinking_resumes_alerts_at_once(box):
@@ -345,6 +364,12 @@ def test_rejects_a_clock_that_is_not_epoch_seconds(box, daemon, clock):
     assert daemon.hits == 0 and not box.log.exists() and not box.state.exists()
 
 
+def test_accepts_the_longest_allowed_clock(box, daemon):
+    at = int("9" * 11)
+    box.run(status(at), at=at)
+    assert daemon.hits == 1 and box.banners() == []
+
+
 def test_missing_app_bundle_skips_the_run(box, daemon):
     missing = box.app.parent / "Missing.app"
     box.run(status(whatsapp={**PAIRED, "behind": 3 * DAY}), OPENMESSAGE_WATCHDOG_APP=str(missing))
@@ -386,14 +411,15 @@ PAIRING_PATTERN = re.search(r"pgrep -f '([^']*)'", SCRIPT.read_text()).group(1)
     ("openmessage pair --google", True),
     ("/usr/bin/python3 /tmp/x/stubs/pgrep -f " + PAIRING_PATTERN, False),  # a test's own stub
     ("pgrep -f openmessage pair", False),
-    ("grep -rn openmessage pair /Users/me/openmessage", False),
+    ("grep -rn openmessage pair /Users/me/notes", False),
     ("/Applications/OpenMessage.app/Contents/MacOS/openmessage serve --web", False),
     ("openmessage pairing-helper", False),
-])
+], ids=["relative-path", "absolute-path-with-flag", "bare-name", "stub-passing-the-pattern",
+        "old-pgrep", "grep-for-the-phrase", "serve", "longer-word"])  # ids keep the phrase out of pytest argv
 def test_pairing_guard_matches_only_the_pair_command(cmdline, matches):
     """Checked with grep -E (the same POSIX ERE as macOS pgrep -f) against
     command lines, without starting any process the live watchdog could see.
-    A stub whose argv held the literal phrase made the live watchdog skip two
+    A stub whose argv held the literal phrase made the live watchdog skip
     runs on 2026-10-08."""
     assert "openmessage pair" not in PAIRING_PATTERN
     hit = subprocess.run(["/usr/bin/grep", "-Eq", PAIRING_PATTERN], input=cmdline, text=True).returncode == 0

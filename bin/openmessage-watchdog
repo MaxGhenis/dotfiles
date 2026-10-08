@@ -29,15 +29,17 @@
 #     pipe; one trailing = that platform is broken, not a quiet day)
 #                                                    → notify, re-notify 6h
 #     Both per-platform checks skip a platform whose status block says
-#     paired=false, since unlinking freezes its freshness. (2026-10-07:
-#     unlinked WhatsApp and Signal had re-notified every 6h for ~45 days and
-#     buried a real 4-day SMS outage.) A missing block or key keeps alerting.
+#     paired=false, since unlinking freezes its freshness. (Unlinked WhatsApp
+#     and Signal re-notified every 6h from 2026-09-03 and buried a real
+#     4-day SMS outage in October.) A missing block or key keeps alerting.
 #   - a platform last seen paired=true now says paired=false
-#                                    → notify once (6h cooldown against flaps)
-#     Unlinking can be involuntary: Google's server-side logout deletes the
-#     session file that paired reads, and WhatsApp's device_removed deletes
-#     its device store. A platform first seen unpaired is only logged; each
-#     pause and resume is logged once.
+#                      → notify once, ahead of the run's other alerts; a loss
+#                        within 6h of that platform's last one waits it out
+#     paired=false is not always a deliberate unlink: Google's server-side
+#     logout deletes the session file that paired reads, WhatsApp's
+#     device_removed deletes its device store, and a WhatsApp or Signal
+#     bridge that fails to start reports it too. A platform first seen
+#     unpaired is only logged.
 #   - newest message on ANY platform > 24h old (global silence; organically
 #     near-impossible at Max's volume — smells like zombie-everything)
 #                                                    → notify, re-notify 6h
@@ -91,9 +93,10 @@ notify() { # $1 = message (keep quote-free)
 }
 
 [ -e "$FLAG" ] && { log "skip: disable flag present"; exit 0; }
-# `openmessage pair` run by path or name. The [ ] keeps the literal phrase out
-# of this pattern, so a process that merely passes it on (a test's pgrep stub)
-# or greps for the phrase does not match.
+# `openmessage pair` run by path or name. The (^|/) anchor skips a bare
+# mention of the phrase (a grep for it). The [ ] keeps the phrase out of this
+# pattern, so a process that passes the pattern on (a test's pgrep stub, or
+# another run's copy of this pgrep) does not match either.
 pgrep -f '(^|/)openmessage[ ]pair( |$)' >/dev/null 2>&1 && { log "skip: pairing in flight"; exit 0; }
 [ -d "$APP" ] || { log "skip: $APP not installed"; exit 0; }
 
@@ -195,6 +198,7 @@ print("\n".join(out))
 ')
 
 alerts=()
+unlinked=""
 disc_seen=" "
 repair_seen=0
 
@@ -221,21 +225,23 @@ while IFS= read -r line; do
       paired=1; [ "${line%%|*}" = "UNPAIRED" ] && paired=0
       was=$(cat "$STATE_DIR/paired_$name" 2>/dev/null)
       [ "$was" = "$paired" ] && continue
-      echo "$paired" > "$STATE_DIR/paired_$name"
       if [ "$paired" = "1" ]; then
         [ "$was" = "0" ] && log "paired again: $name - staleness alerts resume"
       elif [ "$was" = "1" ]; then
-        log "unpaired: $name - was paired; staleness alerts paused until it is relinked"
+        # Inside the cooldown the stored state stays paired, so the next run
+        # tries again: a loss is never recorded without its banner.
         last=$(cat "$STATE_DIR/alert_unlinked_$name" 2>/dev/null || echo 0)
-        if [ $(( NOW - last )) -ge "$ALERT_COOLDOWN" ]; then
-          echo "$NOW" > "$STATE_DIR/alert_unlinked_$name"
-          alerts+=("$name is no longer paired - relink it unless that was intended")
-        else
+        if [ $(( NOW - last )) -lt "$ALERT_COOLDOWN" ]; then
           log "suppressed (cooldown): unlinked_$name"
+          continue
         fi
+        echo "$NOW" > "$STATE_DIR/alert_unlinked_$name"
+        unlinked="$unlinked, $name"
+        log "unpaired: $name - was paired; staleness alerts paused until it is relinked"
       else
         log "unpaired: $name - staleness alerts paused until it is relinked"
-      fi ;;
+      fi
+      echo "$paired" > "$STATE_DIR/paired_$name" ;;
     ALERT\|*)
       rest=${line#ALERT|}
       key=${rest%%|*}
@@ -263,6 +269,9 @@ if [ "$repair_seen" = "0" ] && [ -s "$STATE_DIR/repair_google" ] \
   log "google repair cleared"
   echo 0 > "$STATE_DIR/repair_google"
 fi
+# A lost pairing goes first: only the first alert reaches the banner, and this
+# one is not repeated.
+[ -n "$unlinked" ] && alerts=("No longer paired: ${unlinked#, } - check the app; relink unless that was intended" ${alerts[@]+"${alerts[@]}"})
 
 if [ "${#alerts[@]}" -gt 0 ]; then
   extra=""
