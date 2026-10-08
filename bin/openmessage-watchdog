@@ -130,7 +130,7 @@ import datetime, json, os, sqlite3, sys, time, urllib.parse
 # Mirror of internal/freshness.EvaluateSilence with DefaultSilenceConfig in
 # ~/openmessage (keep the constants and rules in step). Only used when the
 # daemon does not report freshness.<platform>.silence itself.
-BASELINE_DAYS, MIN_ACTIVE_DAYS, MIN_EVENTS_PER_DAY = 14, 7, 20
+BASELINE_DAYS, MIN_ACTIVE_DAYS, MIN_EVENTS_PER_DAY, MIN_BUSY_DAYS = 14, 7, 20, 3
 EXPECTED_HOURS_LIMIT, MAX_SILENCE_H, LONG_SILENCE_H = 6.0, 16.0, 72.0
 
 def inbox_silence(store_path, codec, now):
@@ -164,7 +164,7 @@ def inbox_silence(store_path, codec, now):
     if daily:
         mid = len(daily) // 2
         median = float(daily[mid]) if len(daily) % 2 else (daily[mid - 1] + daily[mid]) / 2.0
-    busy = active > 0 and median >= MIN_EVENTS_PER_DAY
+    busy = active > 0 and active >= MIN_BUSY_DAYS and median >= MIN_EVENTS_PER_DAY
     evaluated = busy and active >= MIN_ACTIVE_DAYS
     stalled = (evaluated and expected >= EXPECTED_HOURS_LIMIT) or (busy and silent_h >= MAX_SILENCE_H) or silent_h >= LONG_SILENCE_H
     return (stalled, silent_h, expected, evaluated)
