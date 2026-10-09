@@ -20,11 +20,14 @@ A damaged counter or cooldown file, or an epoch later than the run clock,
 reads as missing (read_state, from the parked watchdog-hardening branch and
 extended), and banner text from the daemon stays inside its AppleScript
 string literal.
+Every run, skipped ones included, rewrites health.txt in the state dir with
+what it did and every condition it currently sees.
 """
 from __future__ import annotations
 
 import copy
 import json
+import os
 import random
 import re
 import shutil
@@ -32,6 +35,7 @@ import socket
 import sqlite3
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -128,9 +132,9 @@ class Sandbox:
         for name in STUBS:
             assert shutil.which(name, path=self.env["PATH"]) == str(self.stubs / name), name
 
-    def launch(self, clock: str, **env) -> subprocess.CompletedProcess:
+    def launch(self, clock: str, script: Path = SCRIPT, **env) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["/bin/bash", str(SCRIPT)],
+            ["/bin/bash", str(script)],
             env={**self.env, "OPENMESSAGE_WATCHDOG_NOW": clock, **env},
             cwd=self.home, capture_output=True, text=True, timeout=60,
         )
@@ -608,9 +612,9 @@ def test_a_damaged_relaunch_counter_no_longer_blocks_relaunches(box, name):
 
 
 DAMAGED = st.binary(max_size=24).filter(lambda b: not canonical(as_bash_reads(b)))
-EPOCH_FILES = ("last_action_epoch", "alert_unlinked_signal", "alert_all_quiet", "alert_behind_whatsapp")
-STATE_FILES = ("consecutive_fails", "last_action_epoch", "disc_google", "disc_whatsapp", "disc_signal",
-               "repair_google", "alert_unlinked_signal", "alert_all_quiet", "alert_behind_whatsapp")
+EPOCH_FILES = ("last_action_epoch", "alert_unlinked_signal", "alert_all_quiet", "alert_behind_whatsapp",
+               "down_since", "disc_since_whatsapp", "repair_since_google")
+STATE_FILES = ("consecutive_fails", "disc_google", "disc_whatsapp", "disc_signal", "repair_google") + EPOCH_FILES
 
 
 def run_every_state_read(box: Sandbox) -> tuple:
@@ -871,3 +875,330 @@ def test_rule_skips_exactly_the_unpaired_staleness_alerts(tmp_path):
         assert not any(l.startswith("UNPAIRED|") for l in ungated), ctx
         gated_somewhere += any(gated(line) for line in ungated)
     assert gated_somewhere > 300, gated_somewhere  # the property is not vacuous
+
+
+# ---------- health.txt ----------
+
+def health(box: Sandbox) -> dict:
+    """health.txt as {key: value}, plus its "alert" and "note" lines. Lines
+    end in \n only (a value may hold U+2028, which str.splitlines would
+    split), alerts come before notes, and the file ends with "# end"."""
+    out: dict = {"alert": [], "note": []}
+    lines = (box.state / "health.txt").read_bytes().decode().split("\n")
+    assert lines[-2:] == ["# end", ""], lines[-3:]
+    kinds = []
+    for line in lines[:-2]:
+        assert not any(ord(ch) < 32 or ord(ch) == 127 for ch in line), repr(line)
+        if line.startswith("#"):
+            continue
+        if line.startswith(("alert: ", "note: ")):
+            kind, _, text = line.partition(": ")
+            out[kind].append(text)
+            kinds.append(kind)
+            continue
+        key, sep, value = line.partition("=")
+        assert sep and key not in out, line
+        out[key] = value
+    assert kinds == sorted(kinds)  # "alert" < "note": every alert line first
+    assert int(out["alerts"]) == len(out["alert"])
+    assert not list(box.state.glob("health.txt.tmp.*"))  # written through a temp file and mv
+    return out
+
+
+def utc(at: int, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    return time.strftime(fmt, time.gmtime(at))
+
+
+def test_a_clean_run_leaves_health_as_its_only_trace(box):
+    box.run(status(), TZ="UTC")
+    assert box.log_lines() == []
+    assert health(box) == {"updated": utc(T0, "%Y-%m-%d %H:%M:%S"), "updated_epoch": str(T0),
+                           "watchdog": "active", "watchdog_detail": "no banner this run",
+                           "daemon": "up", "daemon_detail": "answered /api/status",
+                           "alerts": "0", "alert": [], "note": []}
+
+
+def test_health_keeps_listing_a_condition_the_cooldown_keeps_off_the_banner(box):
+    def body(at):
+        return status(at, whatsapp={**PAIRED, "behind": 3 * DAY}, signal={**UNLINKED, "behind": 50 * DAY})
+
+    box.run(body(T0))
+    first = health(box)
+    assert first["watchdog_detail"] == "banner: whatsapp received nothing for 3.0d while other platforms flow"
+    box.run(body(T0 + HOUR), at=T0 + HOUR)
+    assert len(box.banners()) == 1
+    h = health(box)
+    assert h["alert"] == first["alert"] == ["whatsapp received nothing for 3.0d while other platforms flow"]
+    assert h["note"] == ["signal unpaired - its staleness checks are paused"]
+    assert (h["watchdog_detail"], h["updated_epoch"]) == ("no banner this run", str(T0 + HOUR))
+    box.run(body(T0 + 7 * HOUR), at=T0 + 7 * HOUR, OPENMESSAGE_WATCHDOG_DRYRUN="1")
+    assert health(box)["watchdog_detail"] == "would banner: whatsapp received nothing for 3.0d while other platforms flow"
+
+
+def test_health_lists_a_disconnect_or_repair_with_its_start_from_the_third_check_on(box):
+    for i in range(5):
+        at = T0 + 300 * i
+        body = status(at, whatsapp={"paired": True, "connected": False})
+        body["google"]["needs_repair"] = True
+        box.run(body, at=at, TZ="UTC")
+        h = health(box)
+        if i < 2:
+            assert h["alert"] == [] and "disconnected_since_whatsapp" not in h
+            continue
+        assert h["alert"] == [f"whatsapp disconnected since {utc(T0)} ({i + 1} checks in a row)",
+                              f"Google needs repair since {utc(T0)} ({i + 1} checks in a row)"]
+        assert (h["disconnected_since_whatsapp"], h["repair_since_google"]) == (str(T0), str(T0))
+    assert len(box.banners()) == 1  # the banner itself still fires once, on the third
+    box.run(status(T0 + 1500), at=T0 + 1500)  # both clear
+    assert box.stored("disc_since_whatsapp") is None and box.stored("repair_since_google") is None
+    assert health(box)["alert"] == []
+
+
+def test_an_episode_already_running_without_a_start_starts_its_clock_now(box):
+    """A watchdog upgraded mid-episode finds a counter but no since-file; the
+    episode is then timed from that run."""
+    box.state.mkdir()
+    (box.state / "disc_whatsapp").write_text("4")
+    (box.state / "repair_google").write_text("7")
+    body = status(whatsapp={"paired": True, "connected": False})
+    body["google"]["needs_repair"] = True
+    box.run(body, TZ="UTC")
+    h = health(box)
+    assert h["alert"] == [f"whatsapp disconnected since {utc(T0)} (5 checks in a row)",
+                          f"Google needs repair since {utc(T0)} (8 checks in a row)"]
+    assert (box.stored("disc_since_whatsapp"), box.stored("repair_since_google")) == (str(T0), str(T0))
+
+
+def test_a_parked_watchdog_reports_the_flag_age_and_reason_without_probing(box, daemon):
+    flag = box.home / "Library" / "Application Support" / "OpenMessage" / "watchdog-disabled"
+    flag.parent.mkdir(parents=True)
+    flag.write_text("\n   re-pairing Google\nsecond line\n")
+    set_at = T0 - 3 * HOUR - 60
+    os.utime(flag, (set_at, set_at))
+    box.run(status(), TZ="UTC")
+    assert daemon.hits == 0
+    assert box.log_lines("skip") == ["skip: disable flag present (set 3h ago; reason: re-pairing Google)"]
+    h = health(box)
+    assert (h["watchdog"], h["daemon"], h["daemon_detail"], h["alert"]) == ("disabled", "unknown", "not probed", [])
+    assert h["paused_since"] == str(set_at)
+    assert h["watchdog_detail"] == (f"disable flag set {utc(set_at)} (3h ago); reason: re-pairing Google;"
+                                    " no probe, relaunch or alert until it is removed")
+    flag.write_text("")  # an empty flag, touched after the pinned clock
+    box.run(status(), TZ="UTC")
+    assert box.log_lines("skip")[-1] == "skip: disable flag present (set 0h ago)"
+
+
+def test_a_pairing_in_flight_or_a_missing_app_reports_why_checks_paused(box, daemon):
+    (box.stubs / "pgrep").write_text(STUB.format(code="0 if sys.argv[1:2] == ['-f'] else 1"))
+    box.run(status())
+    h = health(box)
+    assert (h["watchdog"], h["watchdog_detail"], h["daemon"]) == (
+        "pairing", "a pairing process is running; checks paused", "unknown")
+    (box.stubs / "pgrep").write_text(STUB.format(code=1))
+    missing = box.app.parent / "Missing.app"
+    box.run(status(), OPENMESSAGE_WATCHDOG_APP=str(missing))
+    assert health(box)["watchdog"] == "app-missing"
+    assert health(box)["watchdog_detail"] == f"{missing} not installed; checks paused"
+    assert daemon.hits == 0
+
+
+def test_the_outage_clock_runs_from_the_first_failed_probe_to_the_first_answer(box):
+    def down(at, fails):
+        box.run({}, at=at, TZ="UTC")
+        h = health(box)
+        assert (h["watchdog"], h["daemon"]) == ("active", "down"), h
+        assert h["alert"] == [f"daemon not answering since {utc(T0)} ({fails} failed probe(s) in a row)"
+                              " - messages are not syncing"]
+        assert h["daemon_down_since"] == str(T0)
+        return h
+
+    assert down(T0, 1)["daemon_detail"] == "dead (no app process); 1/2 failed probes, no action yet"
+    assert health(box)["watchdog_detail"] == "no banner this run"
+    h = down(T0 + 300, 2)
+    assert box.calls("open") == [["-ga", "OpenMessage"]]
+    assert (h["daemon_detail"], h["watchdog_detail"]) == (
+        "dead (no app process); relaunched the app",
+        "banner: Daemon was down - relaunched the app. Messages were not syncing.")
+    down(T0 + 2 * HOUR, 1)  # still dead: the fail count restarted, the clock did not
+    down(T0 + 2 * HOUR + 60, 2)  # a second relaunch
+    down(T0 + 2 * HOUR + 120, 1)
+    h = down(T0 + 2 * HOUR + 180, 2)
+    assert len(box.calls("open")) == 2
+    assert h["daemon_detail"] == "dead (no app process); relaunch throttled (2m since the last; one per 30m)"
+    assert h["watchdog_detail"] == "no banner this run"
+    box.run(status(T0 + 3 * HOUR), at=T0 + 3 * HOUR, TZ="UTC")  # answered right after a relaunch (fails 0)
+    assert box.stored("down_since") is None
+    h = health(box)
+    assert (h["daemon"], h["alert"], "daemon_down_since" in h) == ("up", [], False)
+
+
+def test_a_relaunch_then_an_answer_clears_the_clock(box):
+    box.run({}, at=T0)
+    box.run({}, at=T0 + 300)  # relaunch: consecutive_fails back to 0
+    box.run(status(T0 + 600), at=T0 + 600)
+    assert box.stored("down_since") is None
+    box.run({}, at=T0 + DAY)
+    assert box.stored("down_since") == str(T0 + DAY)
+
+
+@pytest.mark.parametrize("skip", ["disabled", "pairing", "app-missing"])
+def test_a_skipped_run_clears_the_outage_clock(box, skip):
+    """The daemon is not watched while a run is skipped, so an outage seen
+    after the skip is timed from its own first failed probe."""
+    box.run({}, at=T0)
+    assert box.stored("down_since") == str(T0)
+    flag = box.home / "Library" / "Application Support" / "OpenMessage" / "watchdog-disabled"
+    env = {}
+    if skip == "disabled":
+        flag.parent.mkdir(parents=True)
+        flag.write_text("")
+    elif skip == "pairing":
+        (box.stubs / "pgrep").write_text(STUB.format(code="0 if sys.argv[1:2] == ['-f'] else 1"))
+    else:
+        env["OPENMESSAGE_WATCHDOG_APP"] = str(box.app.parent / "Missing.app")
+    box.run({}, at=T0 + HOUR, **env)
+    assert health(box)["watchdog"] == skip
+    assert box.stored("down_since") is None
+    flag.unlink(missing_ok=True)
+    (box.stubs / "pgrep").write_text(STUB.format(code=1))
+    box.run({}, at=T0 + 2 * HOUR)
+    assert box.stored("down_since") == str(T0 + 2 * HOUR)
+
+
+def test_a_dry_class_a_run_says_what_it_would_have_done(box):
+    for at in (T0, T0 + 300):
+        box.run({}, at=at, OPENMESSAGE_WATCHDOG_DRYRUN="1")
+    h = health(box)
+    assert (h["watchdog"], h["watchdog_detail"]) == ("active", "DRYRUN: no relaunch, no banner")
+    assert h["daemon_detail"] == "dead (no app process); DRYRUN: would relaunch"
+    assert box.calls("open") == [] and box.calls("osascript") == []
+
+
+def test_a_python_failure_is_logged_listed_and_leaves_the_counters_alone(box):
+    """9/15-9/20: /usr/bin/python3 refused to run, every class-B check was off
+    and the main log said nothing. A JSON array that mentions "connected"
+    passes the class-A probe and then crashes the block (d.get on a list);
+    if the block learns to handle it, use another payload that makes it exit
+    non-zero. With no data, the run must not read every platform as
+    reconnected."""
+    box.state.mkdir()
+    for name, value in (("disc_whatsapp", "2"), ("disc_since_whatsapp", str(T0 - 600)), ("repair_google", "4")):
+        (box.state / name).write_text(value)
+    box.daemon.payload = b'["connected"]'
+    proc = box.launch(str(T0))
+    assert proc.returncode == 0
+    assert "AttributeError" in proc.stderr  # the traceback still reaches the launchd log
+    why = "staleness checks did not run: python3 exited 1 (AttributeError: 'list' object has no attribute 'get')"
+    assert box.log_lines() == [why]
+    assert health(box)["alert"] == [why]
+    assert [box.stored(n) for n in ("disc_whatsapp", "disc_since_whatsapp", "repair_google")] == ["2", str(T0 - 600), "4"]
+
+
+def test_a_garbled_status_leaves_the_counters_alone(box):
+    box.state.mkdir()
+    (box.state / "disc_whatsapp").write_text("2")
+    box.run(b'{"connected": true, "freshness": ')  # passes the class-A probe, fails JSON
+    assert [a.split(":")[0] for a in health(box)["alert"]] == ["status parse error"]
+    assert box.stored("disc_whatsapp") == "2" and box.log_lines("reconnected") == []
+
+
+@pytest.mark.parametrize("where, daemon_state", [
+    ('\nH_WATCHDOG=active H_WATCHDOG_DETAIL="no banner this run"\n', "up"),  # class B, before its last lines
+    ('\n  log "relaunching OpenMessage.app"\n', "down"),                     # class A, before the relaunch
+])
+def test_a_run_that_dies_partway_leaves_watchdog_error(box, tmp_path, where, daemon_state):
+    source = SCRIPT.read_text()
+    assert source.count(where) == 1
+    broken = tmp_path / "openmessage-watchdog-broken"
+    broken.write_text(source.replace(where, '\n: "$WATCHDOG_TEST_UNSET"' + where))  # set -u ends the run here
+    box.daemon.payload = status() if daemon_state == "up" else {}
+    for at in (T0, T0 + 300):
+        proc = box.launch(str(at), script=broken)
+    assert "WATCHDOG_TEST_UNSET" in proc.stderr
+    h = health(box)
+    assert (h["watchdog"], h["daemon"]) == ("error", daemon_state)
+    assert h["watchdog_detail"] == "the run stopped before it finished; its stderr is in the launchd log"
+
+
+def test_a_lost_pairing_is_a_health_alert_until_it_is_announced(box):
+    lost = "whatsapp no longer paired - check the app; relink unless that was intended"
+    note = "whatsapp unpaired - its staleness checks are paused"
+    box.run(status(whatsapp=PAIRED))
+    box.run(status(T0 + 300, whatsapp=UNLINKED), at=T0 + 300)
+    h = health(box)
+    assert (h["alert"], h["note"]) == ([lost], [note])
+    assert h["watchdog_detail"] == "banner: No longer paired: whatsapp - check the app; relink unless that was intended"
+    box.run(status(T0 + 600, whatsapp=UNLINKED), at=T0 + 600)  # announced: now only the note
+    assert (health(box)["alert"], health(box)["note"]) == ([], [note])
+    box.run(status(T0 + 900, whatsapp=PAIRED), at=T0 + 900)
+    box.run(status(T0 + 1200, whatsapp=UNLINKED), at=T0 + 1200)  # lost again inside the 6 h cooldown
+    assert box.log_lines("suppressed (cooldown): unlinked") != []
+    assert (health(box)["alert"], health(box)["note"]) == ([lost], [note])
+
+
+def test_daemon_text_cannot_break_a_health_line(box):
+    """ASCII control characters in daemon text become spaces (C1 controls and
+    U+2028 stay: lines split on \\n only), and two OpenMessage processes (a
+    multi-line pgrep) stay on one daemon_detail line."""
+    reason = "a\rb\x0bc\x1cd\te\x7ff\u2028g\u0085h"
+    body = status(signal=PAIRED)
+    body["signal"]["receive_recovery"] = {"pending_count": 6, "last_issue_reason": reason}
+    box.run(body)
+    assert health(box)["alert"] == ["Signal receive-recovery backlog: 6 pending (a b c d e f\u2028g\u0085h)"]
+    (box.stubs / "pgrep").write_text(STUB.format(code="0 if sys.argv[1:2] == ['-x'] else 1").replace(
+        "sys.exit(", "print('111\\n222') if sys.argv[1:2] == ['-x'] else None\nsys.exit("))
+    box.run({}, at=T0 + 300)
+    assert health(box)["daemon_detail"] == "hung (app pid 111 222, port dead); 1/3 failed probes, no action yet"
+
+
+def test_the_python_block_still_closes_with_a_bare_quote_paren():
+    """Sibling test files (pull_health) find the block by its closing "\n')";
+    stderr is redirected around the assignment instead."""
+    assert re.search(r"/usr/bin/python3 -c '\n(.*?)\n'\)", SCRIPT.read_text(), re.S)
+
+
+def test_health_alerts_do_not_depend_on_cooldowns(tmp_path, daemon):
+    """For generated payloads P: a fresh run lists, as health alerts, exactly
+    the alert texts it logs, in order; and a second run of P one second later,
+    with every cooldown now running and no banner, lists the same alerts and
+    notes."""
+    rng = random.Random(20261011)
+    listed = 0
+    for i in range(12):
+        box = Sandbox(tmp_path / f"case{i}", daemon)
+        body = random_status(rng, T0)
+        box.run(body, at=T0)
+        first = health(box)
+        assert first["alert"] == [l[len("ALERT: "):] for l in box.log_lines("ALERT: ")], body
+        banners = len(box.banners())
+        box.run(body, at=T0 + 1)
+        second = health(box)
+        assert len(box.banners()) == banners, body
+        assert (second["alert"], second["note"]) == (first["alert"], first["note"]), body
+        listed += len(first["alert"])
+    assert listed >= 10  # not vacuous
+
+
+def test_a_daemon_reported_silence_is_a_health_note(box):
+    body = status()
+    body["freshness"]["google"].update(stale_reason="silent", silence={
+        "stalled": True, "silent_ms": 20 * HOUR * 1000, "expected_active_hours": 9})
+    box.run(body)
+    h = health(box)
+    assert h["alert"] == [] and box.banners() == []  # the app and the Telegram watcher own this one
+    assert h["note"] == ["google silent 20h while connected (normally active in 9 of those hours)"
+                         " - check or restart the phone"]
+
+
+def test_a_write_that_does_not_finish_keeps_the_previous_health(box):
+    """A full disk cuts the write short. A tr stub that writes three lines
+    and fails stands in for it: the previous health.txt stays, and no temp
+    file is left behind."""
+    box.run(status(), at=T0)
+    before = (box.state / "health.txt").read_bytes()
+    (box.stubs / "tr").write_text("#!/usr/bin/python3\nimport sys\n"
+                                  "sys.stdout.write(''.join(sys.stdin.readlines()[:3]))\nsys.exit(1)\n")
+    (box.stubs / "tr").chmod(0o755)
+    box.run(status(T0 + 300), at=T0 + 300)
+    assert (box.state / "health.txt").read_bytes() == before
+    assert health(box)["updated_epoch"] == str(T0)

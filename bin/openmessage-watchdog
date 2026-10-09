@@ -63,6 +63,32 @@
 # epochs are no later than the run clock. A file that is anything else is
 # logged, removed and read as missing (read_state).
 #
+# Every run past the clock check rewrites <state dir>/health.txt from an EXIT
+# trap, skipped runs included: what the run did and every condition it
+# currently sees, whether or not a cooldown kept it off the banner. A clean run
+# logs nothing, so this is the proof of life. The file is replaced whole (temp
+# file + mv, only once its last line "# end" is written); lines end in \n, and
+# ASCII control characters inside values become spaces (C1 controls and U+2028
+# stay; split on \n only). Keys, one per line:
+#   updated, updated_epoch   the run clock. Runs stop while the Mac sleeps, so
+#                            judge staleness only across the reader's own runs
+#   watchdog                 active | disabled | pairing | app-missing | error
+#                            (error: the run stopped before its last lines)
+#   watchdog_detail          the banner as logged, before notify() drops quotes
+#                            (dry run: "would banner"), or why checks paused
+#   daemon, daemon_detail    up | down | unknown, and what class A did
+#   paused_since             the disable flag's mtime (touching it restarts this)
+#   daemon_down_since        the outage's first failed probe (down runs)
+#   disconnected_since_<p>, repair_since_google   the episode's first check,
+#                            once it is listed as an alert. Like the counters,
+#                            these run on through skipped and data-less runs
+#   alerts=N, then N "alert: <text>" lines, then any "note: <text>" lines
+# All since values are epoch seconds. A python3 failure (2026-09-15 to 09-20
+# every class-B check died on an unaccepted Xcode license, and the main log
+# said nothing) is logged and listed as an alert, and that run leaves the
+# disconnect and repair counters as they were. A skipped run clears the
+# outage clock: the daemon is not watched while the run is skipped.
+#
 # Env overrides (testing; tests/test_openmessage_watchdog.py):
 #   OPENMESSAGE_WATCHDOG_PORT   daemon port (default 7007)
 #   OPENMESSAGE_WATCHDOG_APP    app bundle that must exist (default
@@ -73,8 +99,8 @@
 #                               line timestamps stay wall-clock)
 #   OPENMESSAGE_WATCHDOG_STATE  state dir, OPENMESSAGE_WATCHDOG_LOG  log file
 #   OPENMESSAGE_WATCHDOG_DRYRUN=1  log decisions, no relaunch, no notifications.
-#                               It still writes counters and cooldown epochs,
-#                               so point _STATE and _LOG at temp paths.
+#                               It still writes counters, cooldown epochs and
+#                               health.txt, so point _STATE and _LOG at temp paths.
 
 set -u
 PORT="${OPENMESSAGE_WATCHDOG_PORT:-7007}"
@@ -84,6 +110,8 @@ FLAG="$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
 STATE_DIR="${OPENMESSAGE_WATCHDOG_STATE:-$HOME/.local/state/openmessage-watchdog}"
 FAILS_F="$STATE_DIR/consecutive_fails"
 LAST_ACTION_F="$STATE_DIR/last_action_epoch"
+DOWN_SINCE_F="$STATE_DIR/down_since"   # first failed probe of the current outage
+HEALTH_F="$STATE_DIR/health.txt"
 LOG="${OPENMESSAGE_WATCHDOG_LOG:-$HOME/Library/Logs/openmessage-watchdog.log}"
 ALERT_COOLDOWN=21600   # 6h between repeat notifications per condition
 NOW="${OPENMESSAGE_WATCHDOG_NOW:-$(date +%s)}"
@@ -134,13 +162,63 @@ notify() { # $1 = message
   osascript -e "display notification \"$msg\" with title \"OpenMessage watchdog\"" >/dev/null 2>&1
 }
 
-[ -e "$FLAG" ] && { log "skip: disable flag present"; exit 0; }
+H_WATCHDOG=error H_WATCHDOG_DETAIL="the run stopped before it finished; its stderr is in the launchd log"
+H_DAEMON=unknown H_DAEMON_DETAIL="not probed"
+health_keys=() health_alerts=() health_notes=()
+# shellcheck disable=SC2329  # runs from the EXIT trap
+write_health() {
+  local tmp="$HEALTH_F.tmp.$$" nl=$'\n' a
+  # Values carry daemon text: a newline in one becomes a space here and any
+  # other control character in tr, so each value stays on its own line. The
+  # file is replaced only when its closing line made it to disk.
+  {
+    echo "# openmessage-watchdog health, rewritten by each run (launchd, every 5 min while the Mac is awake)"
+    for a in "updated=$(date -r "$NOW" '+%Y-%m-%d %H:%M:%S')" "updated_epoch=$NOW" \
+             "watchdog=$H_WATCHDOG" "watchdog_detail=$H_WATCHDOG_DETAIL" \
+             "daemon=$H_DAEMON" "daemon_detail=$H_DAEMON_DETAIL" \
+             ${health_keys[@]+"${health_keys[@]}"} "alerts=${#health_alerts[@]}"; do
+      printf '%s\n' "${a//$nl/ }"
+    done
+    for a in ${health_alerts[@]+"${health_alerts[@]}"}; do printf 'alert: %s\n' "${a//$nl/ }"; done
+    for a in ${health_notes[@]+"${health_notes[@]}"}; do printf 'note: %s\n' "${a//$nl/ }"; done
+    echo "# end"
+  } | LC_ALL=C tr '\000-\011\013-\037\177' ' ' > "$tmp" 2>/dev/null
+  if [ "$(tail -n 1 "$tmp" 2>/dev/null)" = "# end" ]; then
+    mv -f "$tmp" "$HEALTH_F" 2>/dev/null && return 0
+  fi
+  rm -f "$tmp"
+}
+trap write_health EXIT
+
+if [ -e "$FLAG" ]; then
+  flag_since=$(stat -f %m "$FLAG" 2>/dev/null)
+  case "$flag_since" in ''|*[!0-9]*) flag_since=$NOW ;; esac
+  flag_h=0; [ "$NOW" -gt "$flag_since" ] && flag_h=$(( (NOW - flag_since) / 3600 ))
+  flag_reason=$(head -c 512 "$FLAG" 2>/dev/null | tr -c '[:print:]\n' ' ' | grep -m 1 '[^ ]' | sed 's/^ *//' | cut -c1-120)
+  log "skip: disable flag present (set ${flag_h}h ago${flag_reason:+; reason: $flag_reason})"
+  rm -f "$DOWN_SINCE_F"
+  H_WATCHDOG=disabled
+  health_keys+=("paused_since=$flag_since")
+  H_WATCHDOG_DETAIL="disable flag set $(date -r "$flag_since" '+%Y-%m-%d %H:%M') (${flag_h}h ago)${flag_reason:+; reason: $flag_reason}; no probe, relaunch or alert until it is removed"
+  exit 0
+fi
+
 # `openmessage pair` run by path or name. The (^|/) anchor skips a bare
 # mention of the phrase (a grep for it). The [ ] keeps the phrase out of this
 # pattern, so a process that passes the pattern on (a test's pgrep stub, or
 # another run's copy of this pgrep) does not match either.
-pgrep -f '(^|/)openmessage[ ]pair( |$)' >/dev/null 2>&1 && { log "skip: pairing in flight"; exit 0; }
-[ -d "$APP" ] || { log "skip: $APP not installed"; exit 0; }
+pgrep -f '(^|/)openmessage[ ]pair( |$)' >/dev/null 2>&1 && {
+  log "skip: pairing in flight"
+  rm -f "$DOWN_SINCE_F"
+  H_WATCHDOG=pairing H_WATCHDOG_DETAIL="a pairing process is running; checks paused"
+  exit 0
+}
+[ -d "$APP" ] || {
+  log "skip: $APP not installed"
+  rm -f "$DOWN_SINCE_F"
+  H_WATCHDOG=app-missing H_WATCHDOG_DETAIL="$APP not installed; checks paused"
+  exit 0
+}
 
 STATUS_JSON=$(curl -s -m 5 "http://127.0.0.1:$PORT/api/status" 2>/dev/null)
 
@@ -148,6 +226,13 @@ STATUS_JSON=$(curl -s -m 5 "http://127.0.0.1:$PORT/api/status" 2>/dev/null)
 if ! echo "$STATUS_JSON" | grep -q '"connected"'; then
   fails=$(( $(read_state "$FAILS_F") + 1 ))
   echo "$fails" > "$FAILS_F"
+  # The outage clock starts at the first failed probe; an answered probe or a
+  # skipped run clears it. A relaunch resets the fail count, not the clock.
+  down_since=$(read_state "$DOWN_SINCE_F" epoch)
+  [ "$down_since" -eq 0 ] && { down_since=$NOW; echo "$NOW" > "$DOWN_SINCE_F"; }
+  H_DAEMON=down
+  health_keys+=("daemon_down_since=$down_since")
+  health_alerts+=("daemon not answering since $(date -r "$down_since" '+%Y-%m-%d %H:%M') ($fails failed probe(s) in a row) - messages are not syncing")
 
   # App process = the Swift wrapper; its backend child is `openmessage serve --web`.
   app_pid=$(pgrep -x OpenMessage || true)
@@ -157,16 +242,21 @@ if ! echo "$STATUS_JSON" | grep -q '"connected"'; then
     threshold=2; mode="dead (no app process)"
   fi
   log "probe failed ($fails/$threshold): $mode"
-  [ "$fails" -lt "$threshold" ] && exit 0
+  H_DAEMON_DETAIL="$mode; $fails/$threshold failed probes, no action yet"
+  [ "$fails" -lt "$threshold" ] && { H_WATCHDOG=active H_WATCHDOG_DETAIL="no banner this run"; exit 0; }
 
   last_action=$(read_state "$LAST_ACTION_F" epoch)
   if [ $(( NOW - last_action )) -lt 1800 ]; then
     log "action throttled ($(( (NOW - last_action) / 60 ))m since last; need 30m)"
+    H_DAEMON_DETAIL="$mode; relaunch throttled ($(( (NOW - last_action) / 60 ))m since the last; one per 30m)"
+    H_WATCHDOG=active H_WATCHDOG_DETAIL="no banner this run"
     exit 0
   fi
 
   if [ "$DRYRUN" = "1" ]; then
     log "DRYRUN: would relaunch ($mode)"
+    H_DAEMON_DETAIL="$mode; DRYRUN: would relaunch"
+    H_WATCHDOG=active H_WATCHDOG_DETAIL="DRYRUN: no relaunch, no banner"
     exit 0
   fi
 
@@ -182,6 +272,8 @@ if ! echo "$STATUS_JSON" | grep -q '"connected"'; then
   echo "$NOW" > "$LAST_ACTION_F"
   echo 0 > "$FAILS_F"
   notify "Daemon was down - relaunched the app. Messages were not syncing."
+  H_DAEMON_DETAIL="$mode; relaunched the app"
+  H_WATCHDOG=active H_WATCHDOG_DETAIL="banner: Daemon was down - relaunched the app. Messages were not syncing."
   exit 0
 fi
 
@@ -189,7 +281,13 @@ fi
 prev_fails=$(read_state "$FAILS_F")
 [ "$prev_fails" -ne 0 ] && log "healthy again (was $prev_fails fails)"
 echo 0 > "$FAILS_F"
+rm -f "$DOWN_SINCE_F"
+H_DAEMON=up H_DAEMON_DETAIL="answered /api/status"
 
+# The block's stderr goes to a file (and on to the launchd log below), so a
+# failure can be named. Redirecting around the assignment keeps the block's
+# closing `')` as it is; tests find the block by it.
+exec 3>&2 2>"$STATE_DIR/python.stderr"
 HEALTH=$(echo "$STATUS_JSON" | /usr/bin/python3 -c '
 import datetime, json, os, sqlite3, sys, time, urllib.parse
 
@@ -308,6 +406,16 @@ if not reported and g.get("paired") and g.get("connected") and d.get("v2_ingest"
         silent_alerts.append("ALERT|silent_google|%s" % silent_msg("google", v[1], v[2], " (watchdog estimate)"))
 print("\n".join(silent_alerts + out))
 ')
+py_rc=$?
+exec 2>&3 3>&-
+[ -s "$STATE_DIR/python.stderr" ] && cat "$STATE_DIR/python.stderr" >&2  # still reaches the launchd log
+checked=1  # 0 = no status data this run, so the resets below must not run
+if [ "$py_rc" -ne 0 ]; then
+  checked=0
+  py_err=$(tail -n 1 "$STATE_DIR/python.stderr" 2>/dev/null | tr -cd '[:print:]' | cut -c1-160)
+  log "staleness checks did not run: python3 exited $py_rc${py_err:+ ($py_err)}"
+  health_alerts+=("staleness checks did not run: python3 exited $py_rc${py_err:+ ($py_err)}")
+fi
 
 alerts=()
 unlinked=""
@@ -318,25 +426,41 @@ while IFS= read -r line; do
   [ -z "$line" ] && continue
   case "$line" in
     PARSEERR\|*)
-      log "status parse error: ${line#PARSEERR|}" ;;
+      checked=0
+      log "status parse error: ${line#PARSEERR|}"
+      health_alerts+=("status parse error: ${line#PARSEERR|}") ;;
     NOTE\|*)
-      log "note: ${line#NOTE|}" ;;
+      log "note: ${line#NOTE|}"
+      health_notes+=("${line#NOTE|}") ;;
     DISC\|*)
       name=${line#DISC|}
       disc_seen="$disc_seen$name "
       c=$(( $(read_state "$STATE_DIR/disc_$name") + 1 ))
       echo "$c" > "$STATE_DIR/disc_$name"
+      since=$(read_state "$STATE_DIR/disc_since_$name" epoch)
+      if [ "$c" -eq 1 ] || [ "$since" -eq 0 ]; then since=$NOW; echo "$NOW" > "$STATE_DIR/disc_since_$name"; fi
       log "disconnected: $name ($c/3)"
+      if [ "$c" -ge 3 ]; then
+        health_keys+=("disconnected_since_$name=$since")
+        health_alerts+=("$name disconnected since $(date -r "$since" '+%Y-%m-%d %H:%M') ($c checks in a row)")
+      fi
       [ "$c" -eq 3 ] && alerts+=("$name disconnected 15+ min - in-app recovery may be stuck") ;;
     REPAIR\|google)
       repair_seen=1
       c=$(( $(read_state "$STATE_DIR/repair_google") + 1 ))
       echo "$c" > "$STATE_DIR/repair_google"
+      since=$(read_state "$STATE_DIR/repair_since_google" epoch)
+      if [ "$c" -eq 1 ] || [ "$since" -eq 0 ]; then since=$NOW; echo "$NOW" > "$STATE_DIR/repair_since_google"; fi
       log "google needs_repair ($c/3)"
+      if [ "$c" -ge 3 ]; then
+        health_keys+=("repair_since_google=$since")
+        health_alerts+=("Google needs repair since $(date -r "$since" '+%Y-%m-%d %H:%M') ($c checks in a row)")
+      fi
       [ "$c" -eq 3 ] && alerts+=("Google needs repair 15+ min - cookie self-heal is not recovering it") ;;
     PAIRED\|*|UNPAIRED\|*)
       name=${line#*|}
       paired=1; [ "${line%%|*}" = "UNPAIRED" ] && paired=0
+      [ "$paired" = "0" ] && health_notes+=("$name unpaired - its staleness checks are paused")
       was=$(cat "$STATE_DIR/paired_$name" 2>/dev/null)
       [ "$was" = "$paired" ] && continue
       if [ "$paired" = "1" ]; then
@@ -344,6 +468,7 @@ while IFS= read -r line; do
       elif [ "$was" = "1" ]; then
         # Inside the cooldown the stored state stays paired, so the next run
         # tries again: a loss is never recorded without its banner.
+        health_alerts+=("$name no longer paired - check the app; relink unless that was intended")
         last=$(read_state "$STATE_DIR/alert_unlinked_$name" epoch)
         if [ $(( NOW - last )) -lt "$ALERT_COOLDOWN" ]; then
           log "suppressed (cooldown): unlinked_$name"
@@ -360,6 +485,7 @@ while IFS= read -r line; do
       rest=${line#ALERT|}
       key=${rest%%|*}
       msg=${rest#*|}
+      health_alerts+=("$msg")
       last=$(read_state "$STATE_DIR/alert_$key" epoch)
       if [ $(( NOW - last )) -ge "$ALERT_COOLDOWN" ]; then
         echo "$NOW" > "$STATE_DIR/alert_$key"
@@ -370,17 +496,24 @@ while IFS= read -r line; do
   esac
 done <<< "$HEALTH"
 
-# Reset consecutive counters for conditions absent this run.
-for p in google whatsapp signal; do
-  case "$disc_seen" in
-    *" $p "*) ;;
-    *) [ "$(read_state "$STATE_DIR/disc_$p")" -ne 0 ] \
-         && { log "reconnected: $p"; echo 0 > "$STATE_DIR/disc_$p"; } ;;
-  esac
-done
-if [ "$repair_seen" = "0" ] && [ "$(read_state "$STATE_DIR/repair_google")" -ne 0 ]; then
-  log "google repair cleared"
-  echo 0 > "$STATE_DIR/repair_google"
+# Reset consecutive counters for conditions absent this run. A run without
+# status data (python3 failed, or the JSON did not parse) saw nothing absent.
+if [ "$checked" = 1 ]; then
+  for p in google whatsapp signal; do
+    case "$disc_seen" in
+      *" $p "*) ;;
+      *) [ "$(read_state "$STATE_DIR/disc_$p")" -ne 0 ] \
+           && { log "reconnected: $p"; echo 0 > "$STATE_DIR/disc_$p"; }
+         rm -f "$STATE_DIR/disc_since_$p" ;;
+    esac
+  done
+  if [ "$repair_seen" = "0" ]; then
+    if [ "$(read_state "$STATE_DIR/repair_google")" -ne 0 ]; then
+      log "google repair cleared"
+      echo 0 > "$STATE_DIR/repair_google"
+    fi
+    rm -f "$STATE_DIR/repair_since_google"
+  fi
 fi
 # A lost pairing goes first: only the first alert reaches the banner, and this
 # one is not repeated.
@@ -391,5 +524,10 @@ if [ "${#alerts[@]}" -gt 0 ]; then
   [ "${#alerts[@]}" -gt 1 ] && extra=" (+$(( ${#alerts[@]} - 1 )) more - see log)"
   for a in "${alerts[@]}"; do log "ALERT: $a"; done
   notify "${alerts[0]}$extra"
+fi
+H_WATCHDOG=active H_WATCHDOG_DETAIL="no banner this run"
+if [ "${#alerts[@]}" -gt 0 ]; then
+  H_WATCHDOG_DETAIL="banner: ${alerts[0]}${extra}"
+  [ "$DRYRUN" = "1" ] && H_WATCHDOG_DETAIL="would banner: ${alerts[0]}${extra}"
 fi
 exit 0
