@@ -15,6 +15,10 @@ first on PATH that record their argv instead of posting banners or touching
 the real app. DRYRUN would not be enough on its own, since it still writes
 cooldown epochs. The decision rule in the python block is also checked
 directly over thousands of generated payloads.
+
+A damaged counter or cooldown file, or an epoch later than the run clock,
+reads as missing (read_state, from the parked watchdog-hardening branch and
+extended).
 """
 from __future__ import annotations
 
@@ -31,6 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from hypothesis import HealthCheck, Phase, example, given, settings
+from hypothesis import strategies as st
 
 SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "openmessage-watchdog"
 
@@ -503,6 +509,155 @@ def test_silence_verdict_is_a_step_in_the_pinned_clock(tmp_path):
         assert verdicts == sorted(verdicts), ctx  # False... then True...
         early += any(v for n, v in zip(clocks, verdicts) if n < last + 72 * HOUR)
     assert 10 <= early <= len(stores) - 10, early  # both the baseline rules and the 72 h rule decide some inboxes
+
+
+# ---------- damaged state files ----------
+
+def shell_function(name: str) -> str:
+    match = re.search(rf"^{name}\(\) \{{.*?^\}}\n", SCRIPT.read_text(), re.M | re.S)
+    assert match, f"{name}() not found"
+    return match.group(0)
+
+
+def as_bash_reads(content: bytes) -> bytes:
+    """What `$(head -c 64 FILE)` hands bash 3.2: the first 64 bytes, NULs
+    dropped, trailing newlines stripped."""
+    return content[:64].replace(b"\0", b"").rstrip(b"\n")
+
+
+def canonical(value: bytes) -> bool:
+    return re.fullmatch(rb"0|[1-9][0-9]{0,17}", value) is not None
+
+
+@pytest.mark.parametrize("mode", ["count", "epoch"])
+def test_read_state_returns_canonical_values_and_removes_the_rest(tmp_path, mode):
+    """For every file content C, with V = what bash reads of it: read_state
+    prints V and leaves the file alone when V is a canonical decimal of at
+    most 18 digits (and, for an epoch, no later than the run clock NOW).
+    Otherwise it prints 0, logs the file's name once and removes it, so it
+    reads as missing from then on. A missing file reads as 0, silently."""
+    rng = random.Random(20261009)
+    alphabet = b"0123456789 -+.\n\t\0xZ\xff\xc3\xa9"
+    contents = [b"", b"0", b"7", str(T0).encode(), str(T0 + 1).encode(), b"9" * 18, b"9" * 19, b"08", b"00",
+                b"-5", b"+5", b"1 2", b"12\n34", b"5\n", b"5\n\n", b"5\0", b"\n5", b" 5", b"abc", b"1e3", b"0x10",
+                b"\xff\xfe", b"5" + b"\n" * 63 + b"x", b"1" * 70]
+    contents += [bytes(rng.choice(alphabet) for _ in range(rng.randint(0, 24))) for _ in range(400)]
+    contents += [str(T0 + rng.randint(-DAY, DAY)).encode() for _ in range(50)]
+    files = []
+    for i, content in enumerate(contents):
+        path = tmp_path / f"state_{i}"
+        path.write_bytes(content)
+        files.append(path)
+    missing = tmp_path / "state_missing"
+    log = tmp_path / "log"
+    driver = (shell_function("read_state") + 'log() { echo "$*" >> "$LOGF"; }\n'
+              'for f in "$@"; do printf "%s\\n" "$(read_state "$f" "$MODE")"; done\n')
+    proc = subprocess.run(["/bin/bash", "-c", "set -u\n" + driver, "bash", *map(str, files), str(missing)],
+                          env={"LOGF": str(log), "NOW": str(T0), "MODE": mode if mode == "epoch" else "",
+                               "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                          capture_output=True, timeout=60)
+    assert proc.returncode == 0 and proc.stderr == b"", proc.stderr
+    out = proc.stdout.decode().splitlines()
+    assert len(out) == len(files) + 1
+    logged = log.read_text(errors="replace").splitlines() if log.exists() else []
+    removed = future = 0
+    for path, content, printed in zip(files, contents, out):
+        assert re.fullmatch(r"0|[1-9][0-9]{0,17}", printed), (content, printed)
+        value = as_bash_reads(content)
+        ahead = canonical(value) and mode == "epoch" and int(value) > T0
+        if canonical(value) and not ahead:
+            assert printed.encode() == value and path.read_bytes() == content, content
+            assert not any(f"state file {path.name} " in line for line in logged), content
+        else:
+            removed += 1
+            future += ahead
+            why = "in the future" if ahead else "damaged"
+            assert printed == "0" and not path.exists(), content
+            assert sum(f"state file {path.name} was {why}" in line for line in logged) == 1, content
+    assert out[-1] == "0" and not missing.exists()
+    assert len(logged) == removed > 300  # the property is not vacuous
+    assert (future > 20) if mode == "epoch" else (future == 0)
+
+
+def test_a_damaged_cooldown_stamp_no_longer_drops_the_runs_alerts(box):
+    """Before read_state, '08' in alert_all_quiet made bash abandon the alert
+    loop when all_quiet came up: that alert and every later one in the loop
+    were lost, every run, and the stamp was never rewritten. Alerts read
+    before it (behind_whatsapp here) still reached the banner."""
+    (box.state).mkdir()
+    (box.state / "alert_all_quiet").write_text("08")
+    box.run(status(T0 - 25 * HOUR, whatsapp={**PAIRED, "behind": 3 * DAY}))
+    assert box.banners() == ["whatsapp received nothing for 3.0d while other platforms flow (+1 more - see log)"]
+    assert box.log_lines("ALERT: No messages on ANY platform") != []
+    assert box.log_lines("state file") == ["state file alert_all_quiet was damaged ('08') - removed, read as 0"]
+    assert box.stored("alert_all_quiet") == str(T0)
+
+
+@pytest.mark.parametrize("name", ["consecutive_fails", "last_action_epoch"])
+def test_a_damaged_relaunch_counter_no_longer_blocks_relaunches(box, name):
+    """Before read_state, 'zz' in either file ended every class-A run before
+    the relaunch, for good: the dead daemon stayed dead, and the main log
+    never named the cause."""
+    box.state.mkdir()
+    (box.state / name).write_text("zz")
+    box.run({}, at=T0)
+    box.run({}, at=T0 + 300)
+    assert box.calls("open") == [["-ga", "OpenMessage"]]
+    assert box.log_lines("state file") == [f"state file {name} was damaged ('zz') - removed, read as 0"]
+
+
+DAMAGED = st.binary(max_size=24).filter(lambda b: not canonical(as_bash_reads(b)))
+EPOCH_FILES = ("last_action_epoch", "alert_unlinked_signal", "alert_all_quiet", "alert_behind_whatsapp")
+STATE_FILES = ("consecutive_fails", "last_action_epoch", "disc_google", "disc_whatsapp", "disc_signal",
+               "repair_google", "alert_unlinked_signal", "alert_all_quiet", "alert_behind_whatsapp")
+
+
+def run_every_state_read(box: Sandbox) -> tuple:
+    """Two dead-daemon runs (a relaunch), then three healthy runs that hit the
+    disconnect, repair, lost-pairing and cooldown counters."""
+    box.state.mkdir(exist_ok=True)
+    (box.state / "paired_signal").write_text("1")
+    box.run({}, at=T0)
+    box.run({}, at=T0 + 300)
+    for i in range(3):
+        at = T0 + 600 + 300 * i
+        body = status(at - 25 * HOUR, whatsapp={"paired": True, "connected": False, "behind": 3 * DAY},
+                      signal=UNLINKED)
+        body["google"]["needs_repair"] = True
+        box.run(body, at=at)
+    stored = {p.name: p.read_text() for p in sorted(box.state.iterdir())}
+    return box.banners(), box.calls("open"), stored, [l for l in box.log_lines() if not l.startswith("state file")]
+
+
+@settings(max_examples=3, deadline=None, derandomize=True, phases=[Phase.explicit, Phase.generate],
+          suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(damage=st.dictionaries(st.sampled_from(STATE_FILES), DAMAGED, min_size=1))
+@example(damage={name: b"" for name in STATE_FILES})  # a write cut off after the truncate
+@example(damage={name: b"08" for name in STATE_FILES})
+@example(damage={name: str(T0 + DAY).encode() for name in EPOCH_FILES})  # stamps from a clock that went back
+def test_damaged_state_behaves_like_missing_state(tmp_path_factory, daemon, damage):
+    """Differential: whatever damaged bytes sit in whichever state files, the
+    run sequence makes the same banners, relaunches, final state and log as it
+    does with those files absent, plus one damage line per file."""
+    clean = Sandbox(tmp_path_factory.mktemp("clean"), daemon)
+    hurt = Sandbox(tmp_path_factory.mktemp("hurt"), daemon)
+    hurt.state.mkdir()
+    for name, content in damage.items():
+        (hurt.state / name).write_bytes(content)
+    assert run_every_state_read(hurt) == run_every_state_read(clean)
+    assert sorted(l.split()[2] for l in hurt.log_lines("state file")) == sorted(damage)
+
+
+def test_a_future_relaunch_stamp_no_longer_blocks_relaunches(box):
+    """Before, a last_action_epoch a day ahead of the clock (a clock that went
+    back) throttled every relaunch for that day: "action throttled (-1425m
+    since last; need 30m)"."""
+    box.state.mkdir()
+    (box.state / "last_action_epoch").write_text(str(T0 + DAY))
+    (box.state / "consecutive_fails").write_text("1")
+    box.run({}, at=T0)
+    assert box.calls("open") == [["-ga", "OpenMessage"]]
+    assert box.log_lines("state file") == [f"state file last_action_epoch was in the future ('{T0 + DAY}') - removed, read as 0"]
 
 
 # ---------- the pairing-in-flight guard ----------

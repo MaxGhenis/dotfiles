@@ -59,6 +59,10 @@
 # Touch that flag before intentionally quitting the app (re-pair recipe,
 # debugging); remove it when done.
 #
+# The counters and epochs in the state dir are canonical decimals, and the
+# epochs are no later than the run clock. A file that is anything else is
+# logged, removed and read as missing (read_state).
+#
 # Env overrides (testing; tests/test_openmessage_watchdog.py):
 #   OPENMESSAGE_WATCHDOG_PORT   daemon port (default 7007)
 #   OPENMESSAGE_WATCHDOG_APP    app bundle that must exist (default
@@ -93,6 +97,30 @@ mkdir -p "$STATE_DIR"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
+read_state() { # $1 = a state file, $2 = "epoch" if it holds one; prints its value, 0 if absent
+  # The script writes canonical decimals there, and epochs from the run clock.
+  # Under bash 3.2 anything else misleads it (tested on 7de27cc and b51582d):
+  # a word ("abc") ends the run under set -u; "08" or "1 2" abandons the alert
+  # loop or relaunch block it is read in, every run; a sign or 19+ digits reads
+  # as a wrong count, which can keep a relaunch from ever coming; and an epoch
+  # in the future (from a clock that went back, or wrapped digits) holds its
+  # alert or relaunch until the clock passes it. So such a file is logged,
+  # removed and read as missing.
+  local v why="damaged"
+  [ -e "$1" ] || { echo 0; return 0; }
+  v=$(head -c 64 "$1" 2>/dev/null)
+  case "$v" in
+    ''|*[!0-9]*|0?*) ;;
+    *) if [ "${#v}" -gt 18 ]; then :
+       elif [ "${2:-}" = epoch ] && [ "$v" -gt "$NOW" ]; then why="in the future"
+       else echo "$v"; return 0
+       fi ;;
+  esac
+  log "state file ${1##*/} was $why ('$(printf %s "$v" | tr -cd '[:alnum:] ._:-' | cut -c1-40)') - removed, read as 0"
+  rm -f "$1"
+  echo 0
+}
+
 notify() { # $1 = message (keep quote-free)
   log "NOTIFY: $1"
   [ "$DRYRUN" = "1" ] && return 0
@@ -111,7 +139,7 @@ STATUS_JSON=$(curl -s -m 5 "http://127.0.0.1:$PORT/api/status" 2>/dev/null)
 
 # ---------- Class A: daemon dead or hung → relaunch ----------
 if ! echo "$STATUS_JSON" | grep -q '"connected"'; then
-  fails=$(( $(cat "$FAILS_F" 2>/dev/null || echo 0) + 1 ))
+  fails=$(( $(read_state "$FAILS_F") + 1 ))
   echo "$fails" > "$FAILS_F"
 
   # App process = the Swift wrapper; its backend child is `openmessage serve --web`.
@@ -124,7 +152,7 @@ if ! echo "$STATUS_JSON" | grep -q '"connected"'; then
   log "probe failed ($fails/$threshold): $mode"
   [ "$fails" -lt "$threshold" ] && exit 0
 
-  last_action=$(cat "$LAST_ACTION_F" 2>/dev/null || echo 0)
+  last_action=$(read_state "$LAST_ACTION_F" epoch)
   if [ $(( NOW - last_action )) -lt 1800 ]; then
     log "action throttled ($(( (NOW - last_action) / 60 ))m since last; need 30m)"
     exit 0
@@ -151,9 +179,8 @@ if ! echo "$STATUS_JSON" | grep -q '"connected"'; then
 fi
 
 # ---------- Class B: daemon healthy → platform staleness sentinel ----------
-if [ -s "$FAILS_F" ] && [ "$(cat "$FAILS_F")" != "0" ]; then
-  log "healthy again (was $(cat "$FAILS_F") fails)"
-fi
+prev_fails=$(read_state "$FAILS_F")
+[ "$prev_fails" -ne 0 ] && log "healthy again (was $prev_fails fails)"
 echo 0 > "$FAILS_F"
 
 HEALTH=$(echo "$STATUS_JSON" | /usr/bin/python3 -c '
@@ -290,13 +317,13 @@ while IFS= read -r line; do
     DISC\|*)
       name=${line#DISC|}
       disc_seen="$disc_seen$name "
-      c=$(( $(cat "$STATE_DIR/disc_$name" 2>/dev/null || echo 0) + 1 ))
+      c=$(( $(read_state "$STATE_DIR/disc_$name") + 1 ))
       echo "$c" > "$STATE_DIR/disc_$name"
       log "disconnected: $name ($c/3)"
       [ "$c" -eq 3 ] && alerts+=("$name disconnected 15+ min - in-app recovery may be stuck") ;;
     REPAIR\|google)
       repair_seen=1
-      c=$(( $(cat "$STATE_DIR/repair_google" 2>/dev/null || echo 0) + 1 ))
+      c=$(( $(read_state "$STATE_DIR/repair_google") + 1 ))
       echo "$c" > "$STATE_DIR/repair_google"
       log "google needs_repair ($c/3)"
       [ "$c" -eq 3 ] && alerts+=("Google needs repair 15+ min - cookie self-heal is not recovering it") ;;
@@ -310,7 +337,7 @@ while IFS= read -r line; do
       elif [ "$was" = "1" ]; then
         # Inside the cooldown the stored state stays paired, so the next run
         # tries again: a loss is never recorded without its banner.
-        last=$(cat "$STATE_DIR/alert_unlinked_$name" 2>/dev/null || echo 0)
+        last=$(read_state "$STATE_DIR/alert_unlinked_$name" epoch)
         if [ $(( NOW - last )) -lt "$ALERT_COOLDOWN" ]; then
           log "suppressed (cooldown): unlinked_$name"
           continue
@@ -326,7 +353,7 @@ while IFS= read -r line; do
       rest=${line#ALERT|}
       key=${rest%%|*}
       msg=${rest#*|}
-      last=$(cat "$STATE_DIR/alert_$key" 2>/dev/null || echo 0)
+      last=$(read_state "$STATE_DIR/alert_$key" epoch)
       if [ $(( NOW - last )) -ge "$ALERT_COOLDOWN" ]; then
         echo "$NOW" > "$STATE_DIR/alert_$key"
         alerts+=("$msg")
@@ -340,12 +367,11 @@ done <<< "$HEALTH"
 for p in google whatsapp signal; do
   case "$disc_seen" in
     *" $p "*) ;;
-    *) [ -s "$STATE_DIR/disc_$p" ] && [ "$(cat "$STATE_DIR/disc_$p")" != "0" ] \
+    *) [ "$(read_state "$STATE_DIR/disc_$p")" -ne 0 ] \
          && { log "reconnected: $p"; echo 0 > "$STATE_DIR/disc_$p"; } ;;
   esac
 done
-if [ "$repair_seen" = "0" ] && [ -s "$STATE_DIR/repair_google" ] \
-     && [ "$(cat "$STATE_DIR/repair_google")" != "0" ]; then
+if [ "$repair_seen" = "0" ] && [ "$(read_state "$STATE_DIR/repair_google")" -ne 0 ]; then
   log "google repair cleared"
   echo 0 > "$STATE_DIR/repair_google"
 fi
