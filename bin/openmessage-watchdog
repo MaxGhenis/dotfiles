@@ -83,6 +83,15 @@
 # append_errors, five fields on one line; its arm logs a bad field and reads
 # that field as 0.
 #
+# Daemon text reaches the bash loop through the python block's output, one
+# line per finding, so the block turns every ASCII control character in it
+# (and any lone surrogate) into a space. A platform name also names state files (alert_proj_<p>,
+# alert_behind_<p>, alert_unlinked_<p>, paired_<p>), so it is encoded first:
+# lowercase ASCII letters, digits and ._- as they are, every other byte as
+# %XX ("Signal" is %53ignal), and a name longer than 64 characters once
+# encoded is cut to 40 plus ~ and a hash. Those names also appear in banners
+# and the log that way.
+#
 # Every run past the clock check rewrites <state dir>/health.txt from an EXIT
 # trap, skipped runs included: what the run did and every condition it
 # currently sees, whether or not a cooldown kept it off the banner. A clean run
@@ -309,7 +318,32 @@ H_DAEMON=up H_DAEMON_DETAIL="answered /api/status"
 # closing `')` as it is; tests find the block by it.
 exec 3>&2 2>"$STATE_DIR/python.stderr"
 HEALTH=$(echo "$STATUS_JSON" | /usr/bin/python3 -c '
-import datetime, json, os, sqlite3, sys, time, urllib.parse
+import datetime, hashlib, json, os, sqlite3, sys, time, urllib.parse
+
+# Each printed line is one finding, and the bash loop below reads them with
+# read -r and splits their fields on "|". Daemon text in a line (Signal
+# last_issue_reason, an exception message) used to go in raw: a newline in it
+# cut the alert short, and a remainder shaped like ALERT|key|text became an
+# alert of its own, with its own cooldown stamp. So every line goes through
+# line() on its way out, and a platform name, which also names stamp files,
+# through plat() first.
+def line(s):
+    # C0 controls, DEL and lone surrogates (\ud800-style escapes in the JSON)
+    # become spaces. Under launchd (C locale) a surrogate outside U+DC80 to
+    # U+DCFF made print raise, so the run did no staleness checks, and one
+    # inside it went out as a stray byte, invalid UTF-8 in the log.
+    return "".join(" " if c < " " or c == "\x7f" or "\ud800" <= c <= "\udfff" else c for c in s)
+
+def plat(name):
+    # Lowercase ASCII letters, digits and ._- stay. Every other UTF-8 byte,
+    # capitals included, becomes %XX, so the name holds no | or / and distinct
+    # names stay distinct, even on a case-insensitive volume. Past 64 encoded
+    # characters it is cut to its first 40 plus ~ (otherwise encoded) and 64
+    # bits of a sha256 of the name, so two long names collide only if those
+    # bits do.
+    raw = str(name).encode("utf-8", "surrogatepass")
+    k = "".join(chr(b) if chr(b) in "abcdefghijklmnopqrstuvwxyz0123456789._-" else "%%%02X" % b for b in raw)
+    return k if len(k) <= 64 else "%s~%s" % (k[:40], hashlib.sha256(raw).hexdigest()[:16])
 
 # Mirror of internal/freshness.EvaluateSilence with DefaultSilenceConfig in
 # ~/openmessage (keep the constants and rules in step). Only used when the
@@ -360,7 +394,7 @@ def silent_msg(name, hours, expected, note=""):
 try:
     d = json.load(sys.stdin)
 except Exception as e:
-    print("PARSEERR|%s" % str(e)[:60]); sys.exit(0)
+    print(line("PARSEERR|%s" % str(e)[:60])); sys.exit(0)
 import os
 now_ms = float(os.environ.get("OPENMESSAGE_WATCHDOG_NOW") or time.time()) * 1000
 plats = {n: (d.get(n) or {}) for n in ("google", "whatsapp", "signal")}
@@ -397,15 +431,16 @@ if d.get("projection_stalled"):
 # skipped; only an explicit boolean false counts.
 pairing = {n: d[n]["paired"] for n in set(plats) | set(fresh)
            if isinstance(d.get(n), dict) and isinstance(d[n].get("paired"), bool)}
-out.extend("%s|%s" % ("PAIRED" if pairing[n] else "UNPAIRED", n) for n in sorted(pairing))
+out.extend("%s|%s" % ("PAIRED" if pairing[n] else "UNPAIRED", plat(n)) for n in sorted(pairing))
 for name, f in fresh.items():
     if not isinstance(f, dict) or pairing.get(name) is False:
         continue
+    k = plat(name)
     if f.get("projection_stalled"):
-        out.append("ALERT|proj_%s|%s projection stalled" % (name, name))
+        out.append("ALERT|proj_%s|%s projection stalled" % (k, k))
     lat = f.get("latest_received_ms") or f.get("latest_ms") or 0
     if lat and newest and newest - lat > 48 * 3600 * 1000:
-        out.append("ALERT|behind_%s|%s received nothing for %.1fd while other platforms flow" % (name, name, (newest - lat) / 86400000.0))
+        out.append("ALERT|behind_%s|%s received nothing for %.1fd while other platforms flow" % (k, k, (newest - lat) / 86400000.0))
 if newest and now_ms - newest > 24 * 3600 * 1000:
     out.append("ALERT|all_quiet|No messages on ANY platform for %dh - likely silent global failure" % int((now_ms - newest) / 3600000))
 v2i = d.get("v2_ingest")
@@ -450,6 +485,7 @@ if not reported and g.get("paired") and g.get("connected") and isinstance(v2i, d
         out.append("ALERT|silence_check|watchdog could not read the v2 inbox: %s" % str(e)[:60].replace("\"", ""))
     if v and v[0]:
         silent_alerts.append("ALERT|silent_google|%s" % silent_msg("google", v[1], v[2], " (watchdog estimate)"))
+silent_alerts, out = [line(l) for l in silent_alerts], [line(l) for l in out]
 print("\n".join(silent_alerts + out))
 ')
 py_rc=$?

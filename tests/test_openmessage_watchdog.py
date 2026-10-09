@@ -22,10 +22,16 @@ extended), and banner text from the daemon stays inside its AppleScript
 string literal.
 Every run, skipped ones included, rewrites health.txt in the state dir with
 what it did and every condition it currently sees.
+
+Daemon text cannot add, cut or rename a line of the python block's output
+(the line protocol section at the end): before, a newline in Signal's
+last_issue_reason cut its alert short there, and the rest became a line of
+its own, an alert with its own cooldown stamp when shaped like one.
 """
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import random
@@ -36,6 +42,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -1202,3 +1209,400 @@ def test_a_write_that_does_not_finish_keeps_the_previous_health(box):
     box.run(status(T0 + 300), at=T0 + 300)
     assert (box.state / "health.txt").read_bytes() == before
     assert health(box)["updated_epoch"] == str(T0)
+
+
+# ---------- the line protocol between the python block and bash ----------
+#
+# The block prints one line per finding; bash reads them with read -r and
+# splits their fields on "|". Invariant, for every /api/status payload P
+# whose fields have the types the daemon sends, with any string wherever a
+# string goes (a block that is not an object still crashes it, as before):
+#   1. the block exits cleanly, and its output, split on \n alone (as bash
+#      splits it), is UTF-8 lines that each match GRAMMAR;
+#   2. the lines are exactly those of P's plain twin (every daemon string the
+#      block prints swapped for a sentinel), with each sentinel read back:
+#      a platform name as ref_plat(name), Signal's reason as ref_line(reason).
+#      Only the PAIRED/UNPAIRED lines may change places (they come sorted
+#      by the raw name). So no daemon string adds, drops, cuts or splits a
+#      line, and the only stamp files a name keys are alert_proj_, alert_behind_,
+#      alert_unlinked_ and paired_ plus its encoded name;
+#   3. distinct names never share an encoded name, even ignoring case (the
+#      macOS volume ignores it), unless both are cut and their 64-bit hashes
+#      collide.
+# "Types the daemon sends" includes finite numbers: Python's json accepts
+# NaN and Infinity, and those still crash the block where it formats a count.
+
+FORGED = "x\nALERT|forged|forged alert text"  # the 2026-10-09 repro
+FIXED = ("google", "whatsapp", "signal")
+ALERT_KEYS = {"repairs_paced", "pull_empty", "projection_stalled", "all_quiet", "quarantine",
+              "signal_recovery", "silence_check", "silent_google"}
+TEXT = r"[^\x00-\x1f\x7f\ud800-\udfff]*"
+GRAMMAR = re.compile(rf"PARSEERR\|{TEXT}|NOTE\|{TEXT}|DISC\|(?:google|whatsapp|signal)|REPAIR\|google"
+                     rf"|(?:UN)?PAIRED\|(?P<plat>[^|]*)|ALERT\|(?P<key>[^|]*)\|{TEXT}"
+                     rf"|APPEND\|(?:0|[1-9][0-9]*)\|(?:0|[1-9][0-9]*)\|{TEXT}")
+# Keys of /api/status (or of its freshness block) that are not platforms.
+NOT_PLATFORMS = {"connected", "freshness", "v2_ingest", "auth", "projection_stalled", "newest_ms", *FIXED}
+
+
+def ref_plat(name: str) -> str:
+    """plat() as its comment specifies it: lowercase ASCII letters, digits and
+    ._- as they are, every other UTF-8 byte as %XX; past 64 characters, the
+    first 40 of that, ~ and 16 hex digits of the name's sha256."""
+    raw = name.encode("utf-8", "surrogatepass")
+    k = "".join(chr(b) if re.fullmatch(r"[a-z0-9._-]", chr(b)) else f"%{b:02X}" for b in raw)
+    return k if len(k) <= 64 else f"{k[:40]}~{hashlib.sha256(raw).hexdigest()[:16]}"
+
+
+RAW_DRIVER = r"""
+import io, json, os, sys, types
+job = json.load(sys.stdin)
+if job["sqlite_error"]:
+    def connect(*args, **kwargs):
+        raise RuntimeError(job["sqlite_error"])
+    sys.modules["sqlite3"] = types.SimpleNamespace(connect=connect)
+code = compile(job["code"], "openmessage-watchdog:python", "exec")
+real_stdout, results = sys.stdout, []
+for case in job["cases"]:
+    os.environ["OPENMESSAGE_WATCHDOG_NOW"] = str(case["now"])
+    sys.stdin = io.StringIO(json.dumps(case["status"]))
+    buf = io.BytesIO()
+    # The stdout launchd gives the block: the C locale, so UTF-8 with surrogateescape.
+    sys.stdout = io.TextIOWrapper(buf, encoding="utf-8", errors="surrogateescape", newline="\n", write_through=True)
+    crash = None
+    try:
+        exec(code, {"__name__": "__main__"})
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            crash = "SystemExit(%r)" % (e.code,)
+    except Exception as e:
+        crash = repr(e)
+    sys.stdout.flush()
+    sys.stdout.detach()
+    results.append({"out": buf.getvalue().decode("latin-1"), "crash": crash})
+sys.stdout = real_stdout
+print(json.dumps(results))
+"""
+
+
+def evaluate_raw(cases: list[dict], home: Path, sqlite_error: str = "") -> list[tuple[bytes, str | None]]:
+    """Like evaluate(), but each case's output is the bytes the block wrote to
+    a stdout like launchd's, with the exception it raised, if any.
+    sqlite_error makes every sqlite3.connect raise it."""
+    proc = subprocess.run(
+        ["/usr/bin/python3", "-I", "-c", RAW_DRIVER],
+        input=json.dumps({"code": python_block(), "cases": cases, "sqlite_error": sqlite_error}),
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        cwd=home, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return [(r["out"].encode("latin-1"), r["crash"]) for r in json.loads(proc.stdout)]
+
+
+def protocol_lines(out: bytes) -> list[str]:
+    """The lines bash reads from the block's output, each checked against
+    GRAMMAR. bash skips an empty one (a run with no findings prints one)."""
+    assert out.endswith(b"\n"), out
+    lines = [raw.decode("utf-8") for raw in out.split(b"\n")[:-1] if raw]  # strict: no surrogates
+    for line in lines:
+        assert GRAMMAR.fullmatch(line), line
+    return lines
+
+
+def ref_line(text: str) -> str:
+    """line() as its comment specifies it: C0 controls, DEL and lone
+    surrogates become spaces."""
+    return re.sub(r"[\x00-\x1f\x7f\ud800-\udfff]", " ", text)
+
+
+SENTINEL = re.compile(r"zqp(\d+)zq|zqreasonzq")  # what plain_twin() puts in; plat() leaves both as they are
+
+
+def read_back(twin_lines: list[str], body: dict, extra: list[str]) -> list[str]:
+    """The lines body should make: its plain twin's, with each sentinel
+    replaced in one pass by what the block prints for the string it stands
+    for."""
+    reason = body["signal"]["receive_recovery"]["last_issue_reason"]
+    return [SENTINEL.sub(lambda m: ref_plat(extra[int(m[1])]) if m[1] else ref_line(reason), line)
+            for line in twin_lines]
+
+
+def in_place(lines: list[str]) -> tuple[list[str], list[str]]:
+    """The lines in order, and apart the PAIRED/UNPAIRED ones, sorted: the
+    block sorts those by the raw name, so a renaming reorders them."""
+    pairing = ("PAIRED|", "UNPAIRED|")
+    return [l for l in lines if not l.startswith(pairing)], sorted(l for l in lines if l.startswith(pairing))
+
+
+def plat_labels(extra: list[str], twin: bool = False) -> dict[str, str]:
+    """Encoded platform name -> label, for a payload's extra platforms (or its
+    plain twin's sentinels) and the fixed three. The encoded names are
+    distinct even ignoring case, and each decodes to its name unless cut."""
+    labels = {(f"zqp{i}zq" if twin else ref_plat(n)): f"#{i}" for i, n in enumerate(extra)}
+    labels.update({n: n for n in FIXED})
+    assert len({k.lower() for k in labels}) == len(labels) == len(extra) + len(FIXED)
+    for n in extra:
+        k = ref_plat(n)
+        assert "~" in k or urllib.parse.unquote_to_bytes(k) == n.encode("utf-8", "surrogatepass")
+    return labels
+
+
+# Daemon strings, weighted toward what splits or confuses a line: line
+# breaks bash honours (\n) and ones it does not, C0 controls, the field
+# separator, lone surrogates, path parts, capitals, and names long enough to
+# be cut once encoded.
+PIECES = ["\n", "\r", "\r\n", "|", "\x00", "\t", "\x0b", "\x0c", "\x1b", "\x1c", "\x1e", "\x7f", "\x85",
+          "\N{LINE SEPARATOR}", "\N{PARAGRAPH SEPARATOR}", "\ud800", "\udc80", "\udfff", "%", "~", "/", "..",
+          " ", "A", "\N{LATIN SMALL LETTER E WITH ACUTE}", "e\N{COMBINING ACUTE ACCENT}",
+          "ALERT|forged|forged alert text", "NOTE|", "PAIRED|", "PARSEERR|", "google"]
+daemon_text = st.one_of(
+    st.text(max_size=12),
+    st.lists(st.sampled_from(PIECES), max_size=6).map("".join),
+    st.text(st.characters(max_codepoint=127), min_size=40, max_size=80),
+    st.just(FORGED),
+)
+
+
+@st.composite
+def protocol_payloads(draw) -> tuple[dict, list[str]]:
+    """(status, its extra platform names): every daemon string drawn from
+    daemon_text (extra platform names, Signal's last_issue_reason, the
+    pull_health fields, v2 ingest account names), every other field
+    well-typed."""
+    newest = T0 * 1000
+    # Distinct once JSON joins a surrogate pair (see as_sent).
+    extra = draw(st.lists(daemon_text.filter(lambda s: s not in NOT_PLATFORMS), unique_by=as_sent, max_size=3))
+    names = draw(st.permutations(extra + draw(st.lists(st.sampled_from(FIXED), unique=True, max_size=3))))
+    body: dict = {"connected": True}
+    for n in (*FIXED, *extra):
+        if n in FIXED or draw(st.booleans()):
+            body[n] = {"paired": draw(st.sampled_from([True, False, None])), "connected": draw(st.booleans())}
+    fresh: dict = {"newest_ms": newest}
+    for n in names:
+        fresh[n] = {"latest_received_ms": newest - draw(st.sampled_from([0, 3 * DAY])) * 1000,
+                    "projection_stalled": draw(st.booleans())}
+        if n in FIXED and draw(st.booleans()):
+            fresh[n].update(stale_reason="silent", silence={
+                "stalled": True, "silent_ms": 20 * HOUR * 1000, "expected_active_hours": 9})
+    body["freshness"] = fresh
+    body["google"].update(needs_repair=draw(st.booleans()), repairs_paced=draw(st.sampled_from([0, 3])))
+    body["google"]["pull_health"] = draw(st.fixed_dictionaries({
+        "empty_with_local_history": st.one_of(st.just(True), daemon_text),
+        "account_switch": st.one_of(st.booleans(), daemon_text),
+        "local_conversations": st.one_of(st.integers(0, 2000), daemon_text),
+        "last_attempt_ms": st.one_of(st.integers(newest - DAY * 1000, newest), daemon_text),
+        **{k: daemon_text for k in ("last_error", "last_trigger", "last_folder", "last_outcome")},
+    }))
+    body["signal"]["receive_recovery"] = {"pending_count": draw(st.sampled_from([0, 6])),
+                                          "last_issue_reason": draw(daemon_text)}
+    if draw(st.booleans()):
+        accounts = draw(st.lists(daemon_text.filter(lambda s: "zq" not in s), unique=True, max_size=2))
+        body["v2_ingest"] = {"enabled": draw(st.booleans()), "per_account": {
+            a: {"append_errors": draw(st.integers(0, 3)), "appended": 5, "quarantined": draw(st.integers(0, 1))}
+            for a in accounts}}
+    return body, extra
+
+
+def as_sent(value):
+    """value as the block receives it: JSON joins two lone surrogates that
+    form a pair into one character."""
+    return json.loads(json.dumps(value))
+
+
+def sent_case(body: dict, extra: list[str]) -> tuple[dict, list[str]]:
+    """A case as the block receives it. Names that JSON makes equal
+    ("\\ud800\\udc80" and "\\U00010080") are one platform there, as are
+    their keys in the body."""
+    return as_sent(body), list(dict.fromkeys(as_sent(extra)))
+
+
+def plain_twin(body: dict, extra: list[str]) -> dict:
+    """body with every daemon string the block prints swapped for a
+    sentinel: extra platform i becomes zqp<i>zq, Signal's last_issue_reason
+    zqreasonzq. The pull_health strings, which it never prints, become "t".
+    Account names stay: APPEND lists them in their own sort order, and
+    test_account_ids_cannot_break_the_notification_or_the_line_format covers
+    their filter."""
+    twin = copy.deepcopy(body)
+    rename = {n: f"zqp{i}zq" for i, n in enumerate(extra)}
+    twin["freshness"] = {rename.get(k, k): v for k, v in twin["freshness"].items()}
+    blocks = {n: twin.pop(n) for n in rename if n in twin}
+    twin.update({rename[n]: block for n, block in blocks.items()})
+    pull_health = twin["google"]["pull_health"]
+    pull_health.update({k: "t" for k, v in pull_health.items() if isinstance(v, str)})
+    twin["signal"]["receive_recovery"]["last_issue_reason"] = "zqreasonzq"
+    return twin
+
+
+NASTY_NAMES = ("zz\nALERT|forged|forged alert text", "../../escape", "a|b", "Signal", "\ud800", "\r", "",
+               "x" * 300, "é")
+
+
+def nasty_status(reason: str = FORGED, names: tuple[str, ...] = NASTY_NAMES) -> tuple[dict, list[str]]:
+    """Every platform paired and connected, each named one 3 days behind with
+    its projection stalled, Signal's backlog and Google's pull_health
+    carrying reason."""
+    body = status(signal=PAIRED, whatsapp=PAIRED, **{n: {**PAIRED, "behind": 3 * DAY, "proj": True} for n in names})
+    body["signal"]["receive_recovery"] = {"pending_count": 6, "last_issue_reason": reason}
+    body["google"]["pull_health"] = {"empty_with_local_history": True, "local_conversations": 40,
+                                     "last_error": reason, "account_switch": reason}
+    return body, list(names)
+
+
+@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
+@given(batch=st.lists(protocol_payloads(), min_size=1, max_size=25))
+@example(batch=[nasty_status(), nasty_status("\r\n|\ud800\x00\N{LINE SEPARATOR}", ("A", "a"))])
+@example(batch=[nasty_status(names=("\ud800\udc80", "\U00010080"))])  # one name once sent
+def test_no_daemon_string_adds_cuts_or_renames_a_line(tmp_path_factory, batch):
+    """Invariants 1-3 above, for each payload in the batch against its plain
+    twin (one /usr/bin/python3 for the whole batch)."""
+    home = tmp_path_factory.mktemp("protocol")
+    batch = [sent_case(body, extra) for body, extra in batch]
+    cases = [{"status": body, "now": T0} for body, _ in batch]
+    twins = [{"status": plain_twin(body, extra), "now": T0} for body, extra in batch]
+    results = evaluate_raw(cases + twins, home)
+    for (body, extra), (out, crash), (twin_out, twin_crash) in zip(batch, results, results[len(batch):]):
+        assert crash is None and twin_crash is None, (crash, twin_crash, body)
+        plat_labels(extra)  # invariant 3
+        expected = read_back(protocol_lines(twin_out), body, extra)
+        assert in_place(protocol_lines(out)) == in_place(expected), body
+
+
+def test_a_newline_in_a_signal_reason_cannot_forge_an_alert(box):
+    """The repro on ffda554: the alert was cut at the newline, and the rest
+    became an alert of its own, with its own alert_forged stamp and a
+    "(+1 more - see log)" on the banner."""
+    body = status(signal=PAIRED)
+    body["signal"]["receive_recovery"] = {"pending_count": 6, "last_issue_reason": FORGED}
+    box.run(body)
+    shown = "Signal receive-recovery backlog: 6 pending (x ALERT|forged|forged alert text)"
+    assert box.banners() == [shown]
+    assert health(box)["alert"] == [shown]
+    assert box.log_lines("ALERT: ") == [f"ALERT: {shown}"]
+    assert sorted(p.name for p in box.state.glob("alert_*")) == ["alert_signal_recovery"]
+
+
+def test_platform_names_are_encoded_into_one_line_and_one_stamp_file(box):
+    """Freshness keys name platforms, and a platform names stamp files. A
+    newline, |, / or capital in one is encoded, so the name stays on its line,
+    keys a file inside the state dir and still says which platform it is."""
+    names = {"zz\nALERT|forged|forged alert text": "zz%0A%41%4C%45%52%54%7Cforged%7Cforged%20alert%20text",
+             "../../escape": "..%2F..%2Fescape", "a|b": "a%7Cb"}
+    box.run(status(**{n: {**PAIRED, "behind": 3 * DAY} for n in names}))
+    first = next(iter(names.values()))
+    assert box.banners() == [f"{first} received nothing for 3.0d while other platforms flow (+2 more - see log)"]
+    assert sorted(p.name for p in box.state.glob("alert_*")) == sorted(f"alert_behind_{k}" for k in names.values())
+    assert sorted(p.name for p in box.state.glob("paired_*")) == sorted(
+        ["paired_google"] + [f"paired_{k}" for k in names.values()])
+    assert sorted(p.name for p in box.home.parent.iterdir()) == [
+        "Applications", "calls", "home", "state", "stubs", "tmp", "watchdog.log"]
+
+
+def test_case_variants_of_a_name_keep_their_own_pairing_state(box):
+    """On a case-insensitive volume (the macOS default) paired_Signal and
+    paired_signal were one file. A status naming both flipped it on every run
+    outside the cooldown and announced "No longer paired: Signal" every 6 h."""
+    body = status(signal=PAIRED, Signal=UNLINKED)
+    for at in (T0, T0 + 300, T0 + COOLDOWN + 600):
+        box.run(body, at=at)
+    assert box.banners() == [] and box.log_lines("paired again") == []
+    assert (box.stored("paired_signal"), box.stored("paired_%53ignal")) == ("1", "0")
+
+
+def test_a_long_platform_name_keys_a_stamp_file_that_fits(box):
+    """A name past the 255-byte file-name limit failed every stamp write
+    ("File name too long"), so its alert notified on every run."""
+    name = "x" * 300
+    body = status(**{name: {**PAIRED, "behind": 3 * DAY}})
+    box.run(body)
+    box.run(body, at=T0 + 300)
+    k = "x" * 40 + "~" + hashlib.sha256(name.encode()).hexdigest()[:16]
+    assert box.banners() == [f"{k} received nothing for 3.0d while other platforms flow"]
+    assert (box.stored(f"alert_behind_{k}"), box.stored(f"paired_{k}")) == (str(T0), "1")
+
+
+def test_a_lone_surrogate_no_longer_stops_the_checks(box):
+    """A \\ud800 escape in daemon text made the block's print raise under
+    launchd's C locale (UTF-8, surrogateescape): python3 exited 1, and that
+    run's staleness checks did not run."""
+    body = status(whatsapp={**PAIRED, "behind": 3 * DAY}, signal=PAIRED)
+    body["signal"]["receive_recovery"] = {"pending_count": 6, "last_issue_reason": "a\ud800b"}
+    box.run(body)
+    behind = "whatsapp received nothing for 3.0d while other platforms flow"
+    assert box.banners() == [f"{behind} (+1 more - see log)"]
+    assert health(box)["alert"] == [behind, "Signal receive-recovery backlog: 6 pending (a b)"]
+
+
+def test_an_inbox_read_error_stays_on_one_line(tmp_path):
+    """silence_check quotes the exception from reading the v2 inbox."""
+    body = status()
+    body["v2_ingest"] = {"enabled": True}
+    [(out, crash)] = evaluate_raw([{"status": body, "now": T0}], tmp_path, sqlite_error="disk I/O error\r\n" + FORGED)
+    assert crash is None
+    assert protocol_lines(out) == [
+        "PAIRED|google", "ALERT|silence_check|watchdog could not read the v2 inbox: disk I/O error  x ALERT|forged|forged alert text"]
+
+
+STATE_FILE = re.compile(
+    r"consecutive_fails|last_action_epoch|down_since|health\.txt|python\.stderr|append_errors"
+    r"|repair_google|repair_since_google|disc_(?:since_)?(?:google|whatsapp|signal)"
+    rf"|alert_(?:{'|'.join(sorted(ALERT_KEYS | {'append_errors'}))})"
+    r"|(?P<slot>alert_proj_|alert_behind_|alert_unlinked_|paired_)(?P<plat>.*)", re.S)
+
+
+def log_entries(box: Sandbox) -> list[str]:
+    """The log's entries without their wall-clock stamp. Split on \\n alone,
+    and matched by prefix, not substring: daemon text in an entry may hold
+    U+2028 (which str.splitlines splits on) or "ALERT: " itself."""
+    return [l[20:] for l in box.log.read_bytes().decode().split("\n") if l] if box.log.exists() else []
+
+
+def run_unlinking(box: Sandbox, body: dict, labels: dict[str, str]) -> tuple:
+    """A run on body, then one with every paired platform unpaired. Returns
+    what they did, platform names left out. For each run: its banners (does
+    it announce a lost pairing, and for how many platforms) and its ALERT and
+    suppressed log entries (bash logs each of the run's alerts, so the
+    banner's "+N more" is the ALERT count less one). Then health.txt's keys
+    and alert and note counts, the state files (each a known name, or a slot
+    and a platform label) and the sandbox's top level."""
+    lost = copy.deepcopy(body)
+    for block in lost.values():
+        if isinstance(block, dict) and block.get("paired") is True:
+            block["paired"] = False
+    runs = []
+    for at, payload in ((T0, body), (T0 + 300, lost)):
+        seen_banners, seen_log = len(box.banners()), len(log_entries(box))
+        box.run(payload, at=at)
+        lost_banner = "No longer paired: "  # bash's own text; encoded names hold no ", " or " - "
+        banners = [(b.startswith(lost_banner), b.split(" - ")[0].count(", ") if b.startswith(lost_banner) else 0)
+                   for b in box.banners()[seen_banners:]]
+        entries = log_entries(box)[seen_log:]
+        runs.append((banners, sum(e.startswith("ALERT: ") for e in entries),
+                     sum(e.startswith("suppressed (cooldown): ") for e in entries)))
+    h = health(box)
+    files = []
+    for path in box.state.iterdir():
+        m = STATE_FILE.fullmatch(path.name)
+        assert m, path.name
+        files.append((m["slot"], labels[m["plat"]]) if m["slot"] else (path.name, ""))
+    return (runs, sorted(h), len(h["alert"]), len(h["note"]), sorted(files),
+            sorted(p.name for p in box.home.parent.iterdir()))
+
+
+@settings(max_examples=4, deadline=None, phases=[Phase.explicit, Phase.generate],
+          suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
+@given(case=protocol_payloads())
+@example(case=nasty_status())
+@example(case=nasty_status("ALERT: suppressed (cooldown): x\N{LINE SEPARATOR}ALERT: (+1 more - see log)", ("p",)))
+def test_daemon_strings_change_none_of_a_runs_decisions(tmp_path_factory, daemon, case):
+    """End to end, differential: the real script, run on a payload and then
+    with its platforms unpaired, makes as many banners, ALERT and suppressed
+    log entries per run, the same lost-pairing announcements, the same
+    health.txt keys and alert and note counts, and the same state files (up
+    to platform names) as on the payload's plain twin. The texts are the
+    block-level property's job; each run here takes about 2 s, hence few
+    examples."""
+    body, extra = sent_case(*case)
+    nasty = Sandbox(tmp_path_factory.mktemp("nasty"), daemon)
+    plain = Sandbox(tmp_path_factory.mktemp("plain"), daemon)
+    assert run_unlinking(nasty, body, plat_labels(extra)) == run_unlinking(
+        plain, plain_twin(body, extra), plat_labels(extra, twin=True))
