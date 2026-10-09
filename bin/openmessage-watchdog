@@ -121,10 +121,17 @@ read_state() { # $1 = a state file, $2 = "epoch" if it holds one; prints its val
   echo 0
 }
 
-notify() { # $1 = message (keep quote-free)
+notify() { # $1 = message
+  local msg
   log "NOTIFY: $1"
   [ "$DRYRUN" = "1" ] && return 0
-  osascript -e "display notification \"$1\" with title \"OpenMessage watchdog\"" >/dev/null 2>&1
+  # The message goes inside an AppleScript string literal, and parts of it come
+  # from the daemon (signal last_issue_reason, exception text). A quote there
+  # failed to compile, losing the banner, or ended the literal early and ran
+  # the rest as AppleScript. Those are the literal's only special characters.
+  msg=${1//\"/}
+  msg=${msg//\\/}
+  osascript -e "display notification \"$msg\" with title \"OpenMessage watchdog\"" >/dev/null 2>&1
 }
 
 [ -e "$FLAG" ] && { log "skip: disable flag present"; exit 0; }

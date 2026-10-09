@@ -18,7 +18,8 @@ directly over thousands of generated payloads.
 
 A damaged counter or cooldown file, or an epoch later than the run clock,
 reads as missing (read_state, from the parked watchdog-hardening branch and
-extended).
+extended), and banner text from the daemon stays inside its AppleScript
+string literal.
 """
 from __future__ import annotations
 
@@ -658,6 +659,61 @@ def test_a_future_relaunch_stamp_no_longer_blocks_relaunches(box):
     box.run({}, at=T0)
     assert box.calls("open") == [["-ga", "OpenMessage"]]
     assert box.log_lines("state file") == [f"state file last_action_epoch was in the future ('{T0 + DAY}') - removed, read as 0"]
+
+
+# ---------- banner text from the daemon ----------
+
+STRICT_BANNER = re.compile(r'display notification "([^"\\]*)" with title "OpenMessage watchdog"')
+INJECTION = 'x" & (do shell script "echo ran") & "'
+
+
+def test_notify_puts_any_message_inside_one_literal(tmp_path):
+    """For every message M, notify() hands osascript one `display
+    notification` statement whose only string literals are M without its
+    double quotes and backslashes, and the title. It logs M unchanged."""
+    rng = random.Random(20261010)
+    pieces = ['"', "\\", "\\\\", '\\"', INJECTION, "é", "—", "\t", "\r", " ", "(", ")", "&", "'", "a", "7", "¬", "\u2028"]
+    messages = ["", '"', "\\", INJECTION, 'decrypt "failed"', "C:\\path\\"]
+    messages += ["".join(rng.choice(pieces) for _ in range(rng.randint(0, 12))) for _ in range(300)]
+    calls, log = tmp_path / "calls", tmp_path / "log"
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    (stubs / "osascript").write_text('#!/bin/bash\nprintf "%s\\0" "$2" >> "$CALLS"\n')
+    (stubs / "osascript").chmod(0o755)
+    driver = shell_function("notify") + 'log() { printf "%s\\0" "$*" >> "$LOGF"; }\nDRYRUN=0\nfor m in "$@"; do notify "$m"; done\n'
+    proc = subprocess.run(["/bin/bash", "-c", "set -u\n" + driver, "bash", *messages],
+                          env={"CALLS": str(calls), "LOGF": str(log), "PATH": f"{stubs}:/usr/bin:/bin",
+                               "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"},
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0 and proc.stderr == "", proc.stderr
+    scripts = calls.read_bytes().decode().split("\0")[:-1]  # bytes: text mode would turn \r into \n
+    logged = log.read_bytes().decode().split("\0")[:-1]
+    assert len(scripts) == len(logged) == len(messages)
+    for message, script, line in zip(messages, scripts, logged):
+        match = STRICT_BANNER.fullmatch(script)
+        assert match, (message, script)
+        assert match.group(1) == message.replace('"', "").replace("\\", ""), message
+        assert line == f"NOTIFY: {message}"
+
+
+def test_a_quoted_signal_reason_still_reaches_the_banner(box, tmp_path):
+    """signal last_issue_reason comes from the daemon verbatim. With a quote
+    in it, the banner used to fail to compile (lost); with a crafted one, the
+    rest ran as AppleScript. Checked with osacompile, which compiles and never
+    runs, where macOS provides it."""
+    reason = f'decrypt "failed" \\ {INJECTION}'
+    body = status(signal=PAIRED)
+    body["signal"]["receive_recovery"] = {"pending_count": 6, "last_issue_reason": reason}
+    box.run(body)
+    shown = f"Signal receive-recovery backlog: 6 pending ({reason})".replace('"', "").replace("\\", "")
+    assert box.banners() == [shown]
+    script = box.calls("osascript")[0][-1]
+    assert STRICT_BANNER.fullmatch(script)
+    assert box.log_lines("NOTIFY") == [f"NOTIFY: Signal receive-recovery backlog: 6 pending ({reason})"]
+    if shutil.which("osacompile"):
+        compiled = subprocess.run(["osacompile", "-o", str(tmp_path / "banner.scpt"), "-e", script],
+                                  capture_output=True, text=True, timeout=60)
+        assert compiled.returncode == 0, compiled.stderr
 
 
 # ---------- the pairing-in-flight guard ----------
