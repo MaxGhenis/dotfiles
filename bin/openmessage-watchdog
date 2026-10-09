@@ -266,7 +266,7 @@ g = plats["google"]
 if not reported and g.get("paired") and g.get("connected") and d.get("v2_ingest", {}).get("enabled"):
     data_dir = (d.get("auth") or {}).get("data_dir") or os.path.expanduser("~/Library/Application Support/OpenMessage")
     try:
-        v = inbox_silence(os.path.join(data_dir, "v2", "store.sqlite3"), "google.protobuf", time.time())
+        v = inbox_silence(os.path.join(data_dir, "v2", "store.sqlite3"), "google.protobuf", now_ms / 1000.0)
     except Exception as e:
         v = None
         out.append("ALERT|silence_check|watchdog could not read the v2 inbox: %s" % str(e)[:60].replace("\"", ""))

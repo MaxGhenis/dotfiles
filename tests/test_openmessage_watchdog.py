@@ -24,6 +24,7 @@ import random
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -398,6 +399,110 @@ def test_dryrun_posts_nothing_but_still_writes_cooldowns(box):
     assert box.calls("osascript") == []
     assert box.log_lines("NOTIFY") == ["NOTIFY: whatsapp received nothing for 3.0d while other platforms flow"]
     assert box.stored("alert_behind_whatsapp") == str(T0)  # why tests never point it at the live state
+
+
+# ---------- the watchdog's own silence estimate ----------
+
+SILENT_GOOGLE = ("google silent {}h while connected (normally active in {} of those hours)"
+                 " - check or restart the phone (watchdog estimate)")
+
+
+def v2_store(data_dir: Path, received: list[int]) -> None:
+    """data_dir/v2/store.sqlite3 with one google.protobuf inbox frame per
+    epoch second in `received`. The table keeps the inbox columns from
+    openmessage's 0004_messages_inbox.sql that a frame needs here; the
+    watchdog reads only codec and received_at_ms."""
+    (data_dir / "v2").mkdir(parents=True)
+    con = sqlite3.connect(data_dir / "v2" / "store.sqlite3")
+    with con:
+        con.execute("create table inbox (inbox_id text primary key, account_id text not null,"
+                    " codec text not null, received_at_ms integer not null)")
+        con.executemany("insert into inbox values (?, 'google', 'google.protobuf', ?)",
+                        [(f"frame-{i}", at * 1000) for i, at in enumerate(received)])
+    con.close()
+
+
+@pytest.mark.parametrize("baseline_days, alert_h", [
+    (14, 6),   # 14 active days: alerts once 6 normally-active hours pass silent
+    (5, 16),   # busy, but under 7 active days: alerts after 16 h
+    (0, 72),   # no baseline: alerts after 72 h
+], ids=["evaluated-baseline", "busy-baseline", "no-baseline"])
+def test_silence_estimate_runs_on_the_pinned_clock(box, tmp_path, baseline_days, alert_h):
+    """On a daemon that does not report silence itself, the watchdog computes
+    Google's verdict from the v2 inbox, and that verdict follows
+    OPENMESSAGE_WATCHDOG_NOW like every other check. Two runs seconds apart on
+    one store, pinned a minute either side of the rule's threshold, get
+    opposite verdicts, which a wall-clock reading could not produce.
+
+    Google's last frame is at T0. A baseline has a frame in every hour of the
+    baseline_days whole days before T0's day, so every hour counts as
+    normally active and the expected-active hours equal the silent hours;
+    with none they stay 0 and only the 72 h rule applies. TZ=UTC fixes the
+    day and hour buckets."""
+    data_dir = tmp_path / "openmessage-data"
+    day0 = T0 - T0 % DAY
+    v2_store(data_dir, [day0 - k * HOUR for k in range(baseline_days * 24, 0, -1)] + [T0])
+    body = status(T0)  # Google paired, connected, newest at T0, no silence block
+    body["v2_ingest"] = {"enabled": True}
+    body["auth"] = {"data_dir": str(data_dir)}
+
+    quiet, loud = T0 + alert_h * HOUR - 60, T0 + alert_h * HOUR + 60
+    box.run(body, at=quiet, TZ="UTC")
+    assert box.log_lines("google silent") == []
+    assert box.stored("alert_silent_google") is None
+    box.run(body, at=loud, TZ="UTC")
+    msg = SILENT_GOOGLE.format(alert_h, alert_h if baseline_days else 0)
+    assert box.log_lines("google silent") == [f"ALERT: {msg}", f"NOTIFY: {msg}"]
+    assert box.banners()[-1] == msg  # at 72 h, all_quiet fired on the quiet run and is cooling down
+    assert box.stored("alert_silent_google") == str(loud)
+    assert box.log_lines("could not read the v2 inbox") == []
+
+
+def test_silence_verdict_is_a_step_in_the_pinned_clock(tmp_path):
+    """For any v2 inbox whose last Google frame is at L, and pinned clocks N:
+      1. at N = L (no silence yet) there is no silent_google alert;
+      2. from N = L + 72 h on there always is one;
+      3. as N grows the verdict never returns to quiet;
+      4. the alert reports floor((N - L) / 3600) silent hours and leads the
+         block's output.
+    Checked on the script's python block over random inboxes and clocks. An
+    estimate read off the wall clock gives every N of an inbox the same
+    verdict, so each inbox breaks 1 or 2."""
+    rng = random.Random(20261009)
+    cases, stores = [], []
+    for i in range(60):
+        last = T0 + rng.randint(0, DAY)  # vary the hour of day
+        density = rng.choice([0.0, 0.1, 0.5, 0.9, 1.0])
+        earlier = [last - k * HOUR - rng.randint(0, HOUR - 1)
+                   for k in range(1, rng.randint(0, 16) * 24 + 1) if rng.random() < density]
+        data_dir = tmp_path / f"store{i}"
+        v2_store(data_dir, earlier + [last])
+        body = {"connected": True, "google": {"paired": True, "connected": True},
+                "freshness": {"newest_ms": last * 1000, "google": {"latest_received_ms": last * 1000}},
+                "v2_ingest": {"enabled": True}, "auth": {"data_dir": str(data_dir)}}
+        clocks = sorted({last, last + 72 * HOUR, last + 72 * HOUR + rng.randint(1, 3 * DAY)}
+                        | {last + h * HOUR + d for h in (6, 16, 72) for d in (-60, 60)}
+                        | {last + rng.randint(1, 72 * HOUR - 1) for _ in range(12)})
+        cases += [{"status": body, "now": n} for n in clocks]
+        stores.append((last, density, clocks))
+    results = iter(evaluate(cases, tmp_path))
+    early = 0
+    for last, density, clocks in stores:
+        verdicts = []
+        for n in clocks:
+            out = next(results)
+            assert not any(line.startswith("ALERT|silence_check|") for line in out), out
+            silent = [line for line in out if line.startswith("ALERT|silent_google|")]
+            if silent:
+                assert out[0] == silent[0], out
+                assert silent[0].startswith(f"ALERT|silent_google|google silent {(n - last) // HOUR}h "), (n - last, out)
+            verdicts.append(bool(silent))
+        ctx = (last, density, clocks, verdicts)
+        assert verdicts[0] is False, ctx
+        assert all(v for n, v in zip(clocks, verdicts) if n >= last + 72 * HOUR), ctx
+        assert verdicts == sorted(verdicts), ctx  # False... then True...
+        early += any(v for n, v in zip(clocks, verdicts) if n < last + 72 * HOUR)
+    assert 10 <= early <= len(stores) - 10, early  # both the baseline rules and the 72 h rule decide some inboxes
 
 
 # ---------- the pairing-in-flight guard ----------
