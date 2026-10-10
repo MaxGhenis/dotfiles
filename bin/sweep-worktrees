@@ -21,6 +21,11 @@
 #   - Falls back to GitHub lookups by branch name, then HEAD SHA for detached worktrees.
 #   - Auto-removes only clean merged worktrees by default.
 #   - Closed-but-unmerged PR worktrees are reported, not removed, unless --remove-closed is set.
+#
+# Locks:
+#   - A worktree pinned with `git worktree lock [--reason ...]` is never touched in any
+#     mode (removal, --prune-ignored, --prune-venvs). It is reported as LOCKED with its
+#     reason, and the lock is re-checked right before anything is deleted.
 
 set -u
 
@@ -71,6 +76,9 @@ Options:
   --recent-hours N Keep recently touched worktrees. Default: 24.
   -h, --help       Show this help.
 
+Locked worktrees (`git worktree lock --reason ...`) are never touched in any mode;
+they are reported as LOCKED with the lock reason.
+
 Examples:
   sweep-worktrees --dry-run
   sweep-worktrees ~/PolicyEngine/policyengine-us-data
@@ -120,6 +128,40 @@ is_git_repo() {
 
 is_linked_worktree_dir() {
   [ -d "$1" ] && [ -f "$1/.git" ] && is_git_repo "$1"
+}
+
+# Collapse tabs and newlines so a value cannot break the tab-separated report.
+one_line() {
+  printf '%s' "$1" | LC_ALL=C tr '\t\r\n' '   ' | LC_ALL=C sed 's/^ *//; s/ *$//'
+}
+
+# Succeed and print the lock reason (possibly empty) when WT is pinned with
+# `git worktree lock`. Git keeps the lock at <worktree git dir>/locked, i.e.
+# $GIT_COMMON_DIR/worktrees/<id>/locked. Fails closed: if the git dir cannot be
+# resolved, the worktree is treated as locked.
+worktree_lock_reason() {
+  local git_dir
+  if ! git_dir=$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null) || [ -z "$git_dir" ]; then
+    printf '(lock state unreadable)\n'
+    return 0
+  fi
+  [ -e "$git_dir/locked" ] || return 1
+  one_line "$(cat "$git_dir/locked" 2>/dev/null)"
+}
+
+report_locked() {
+  local wt=$1 repo_label=$2 branch=$3 reason=$4
+  local line
+  line=$(printf '%s\t[%s]\tlocked' "$(printf '%s\n' "$wt" | safe_label)" "$repo_label")
+  [ -n "$branch" ] && line="$line branch=$branch"
+  printf 'LOCKED\t%s\treason=%s\n' "$line" "${reason:-(none)}"
+}
+
+# Re-check just before deleting, so a lock taken mid-sweep still wins.
+locked_now() {
+  local wt=$1 line=$2 reason
+  reason=$(worktree_lock_reason "$wt") || return 1
+  printf 'LOCKED\t%s\treason=%s\n' "$line" "${reason:-(none)}"
 }
 
 mark_once() {
@@ -302,6 +344,7 @@ prune_worktree_venvs() {
     elif [ "$DRY_RUN" = "1" ]; then
       printf 'WOULD-PRUNE-VENV\t%s\tenv=%s\tsize=%s\n' "$line" "$env_name" "$size_label"
     else
+      locked_now "$wt" "$line" && return 0
       printf 'PRUNE-VENV\t%s\tenv=%s\tsize=%s\n' "$line" "$env_name" "$size_label"
       rm -rf -- "$env_dir"
     fi
@@ -337,10 +380,12 @@ should_keep_ignored_path() {
   return 1
 }
 
+# Also keeps any directory holding a nested repo or worktree (.git), so a locked
+# worktree inside another checkout's ignored dir is never swept with it.
 ignored_target_has_kept_file() {
   local target=$1
   [ -d "$target" ] || return 1
-  find "$target" \( -name '.env' -o -name '.env.*' -o -name '.netrc' -o -name '*.pem' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' -o -name '.venv' -o -name 'venv' \) -print -quit 2>/dev/null | grep -q .
+  find "$target" \( -name '.env' -o -name '.env.*' -o -name '.netrc' -o -name '*.pem' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' -o -name '.venv' -o -name 'venv' -o -name '.git' \) -print -quit 2>/dev/null | grep -q .
 }
 
 prune_worktree_ignored() {
@@ -387,12 +432,14 @@ prune_worktree_ignored() {
     printf 'IGNORED-BLOCKED\t%s\tignored=%s\tsize=%s\thold=%s\tlargest=%s\n' "$line" "$count" "$size_label" "$activity_holds" "$top_summary"
   elif [ "$DRY_RUN" = "1" ]; then
     printf 'WOULD-PRUNE-IGNORED\t%s\tignored=%s\tsize=%s\tlargest=%s\n' "$line" "$count" "$size_label" "$top_summary"
+  elif locked_now "$wt" "$line"; then
+    :
   else
     printf 'PRUNE-IGNORED\t%s\tignored=%s\tsize=%s\tlargest=%s\n' "$line" "$count" "$size_label" "$top_summary"
     while IFS= read -r path; do
       [ -n "$path" ] || continue
       clean_path=${path%/}
-      rm -rf "$wt/$clean_path"
+      rm -rf -- "${wt:?}/${clean_path:?}"
     done < "$paths_file"
   fi
 
@@ -580,7 +627,7 @@ inspect_worktree() {
   local merged_state repo_top origin_url repo_slug status_line upstream_gone
   local pr_row pr_source pr_number pr_state pr_merged_at pr_closed_at pr_url pr_head_ref pr_head_oid
   local safe_to_remove=0 removal_candidate=0 allow_force=0 tag removal_reason repo_label line pr_exact_head
-  local proc_usage tmux_usage recent_age hold_reasons ahead_count
+  local proc_usage tmux_usage recent_age hold_reasons ahead_count lock_reason remove_force remove_output
 
   wt_name=$(basename "$wt")
   repo_top=$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null || true)
@@ -618,6 +665,13 @@ inspect_worktree() {
     repo_label=$repo_slug
   else
     repo_label=$(basename "$repo_top")
+  fi
+
+  # Locked worktrees are reported and left alone before any status, fetch,
+  # prune or removal step runs against them.
+  if lock_reason=$(worktree_lock_reason "$wt"); then
+    report_locked "$wt" "$repo_label" "$branch" "$lock_reason"
+    return 0
   fi
 
   if [ "$PRUNE_VENVS" = "1" ] || [ "$PRUNE_IGNORED" = "1" ]; then
@@ -780,15 +834,20 @@ EOF
   if [ "$safe_to_remove" = "1" ]; then
     if [ "$DRY_RUN" = "1" ]; then
       printf 'WOULD-REMOVE\t%s\treason=%s\tmode=%s\n' "$line" "$removal_reason" "$tag"
+    elif locked_now "$wt" "$line"; then
+      :
     else
       printf 'REMOVE\t%s\treason=%s\tmode=%s\n' "$line" "$removal_reason" "$tag"
-      if [ "$dirty" != "0" ]; then
-        git --git-dir="$common_dir" worktree remove --force "$wt" 2>&1 | sed 's|^|  |'
+      # A single --force still refuses a locked worktree; never pass it twice.
+      remove_force=""
+      [ "$dirty" != "0" ] && remove_force="--force"
+      if remove_output=$(git --git-dir="$common_dir" worktree remove $remove_force "$wt" 2>&1); then
+        [ -n "$remove_output" ] && printf '%s\n' "$remove_output" | sed 's|^|  |'
+        if [ -n "$branch" ]; then
+          git --git-dir="$common_dir" branch -D "$branch" 2>&1 | sed 's|^|  |'
+        fi
       else
-        git --git-dir="$common_dir" worktree remove "$wt" 2>&1 | sed 's|^|  |'
-      fi
-      if [ -n "$branch" ]; then
-        git --git-dir="$common_dir" branch -D "$branch" 2>&1 | sed 's|^|  |'
+        printf '%s\n' "$remove_output" | sed 's|^|  |'
       fi
     fi
   elif [ "$removal_candidate" = "1" ] && [ -n "$hold_reasons" ]; then
@@ -808,19 +867,47 @@ EOF
   maybe_prune_repo "$common_dir"
 }
 
+# Print each worktree as path<TAB>branchref<TAB>locked|unlocked<TAB>reason.
+# -z keeps paths with spaces and multi-line lock reasons intact.
+list_worktrees() {
+  local field wt="" branchref="-" lock="unlocked" reason=""
+  while IFS= read -r -d '' field; do
+    case "$field" in
+      "worktree "*) wt=${field#worktree }; branchref="-"; lock="unlocked"; reason="" ;;
+      "branch "*) branchref=${field#branch } ;;
+      detached) branchref="DETACHED" ;;
+      locked) lock="locked" ;;
+      "locked "*) lock="locked"; reason=$(one_line "${field#locked }") ;;
+      "")
+        [ -n "$wt" ] && printf '%s\t%s\t%s\t%s\n' "$wt" "$branchref" "$lock" "$reason"
+        wt=""
+        ;;
+    esac
+  done < <(git -C "$1" worktree list --porcelain -z 2>/dev/null)
+  [ -n "$wt" ] && printf '%s\t%s\t%s\t%s\n' "$wt" "$branchref" "$lock" "$reason"
+  return 0
+}
+
 sweep_repo() {
   local repo_dir=$1
-  local repo_top
-  local wt branchref
+  local repo_top repo_label origin_url
+  local wt branchref lock lock_reason branch
 
   repo_top=$(git -C "$repo_dir" rev-parse --show-toplevel 2>/dev/null || printf '%s\n' "$repo_dir")
+  origin_url=$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)
+  repo_label=$(github_repo_from_origin "$origin_url" 2>/dev/null || basename "$repo_top")
 
-  git -C "$repo_dir" worktree list --porcelain | awk '
-    /^worktree / {wt=$2}
-    /^branch / {br=$2; print wt "\t" br}
-    /^detached/ {print wt "\tDETACHED"}
-  ' | while IFS=$'\t' read -r wt branchref; do
+  list_worktrees "$repo_dir" | while IFS=$'\t' read -r wt branchref lock lock_reason; do
     [ "$wt" = "$repo_top" ] && continue
+    [ "$branchref" = "-" ] && branchref=""
+    if [ "$lock" = "locked" ]; then
+      # Reported from the porcelain listing so a lock also covers a worktree
+      # whose directory is offline.
+      branch=""
+      [ "$branchref" != "DETACHED" ] && branch=${branchref#refs/heads/}
+      report_locked "$wt" "$repo_label" "$branch" "$lock_reason"
+      continue
+    fi
     inspect_worktree "$wt" "$branchref"
   done
 }

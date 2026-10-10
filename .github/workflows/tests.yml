@@ -1,0 +1,16 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  pytest:
+    # The scripts target macOS (BSD userland, /bin/bash 3.2).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: git --version && bash --version | head -1
+      - run: uvx pytest -q tests
