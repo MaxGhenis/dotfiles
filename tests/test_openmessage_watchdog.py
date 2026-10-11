@@ -27,6 +27,11 @@ Daemon text cannot add, cut or rename a line of the python block's output
 (the line protocol section at the end): before, a newline in Signal's
 last_issue_reason cut its alert short there, and the rest became a line of
 its own, an alert with its own cooldown stamp when shaped like one.
+
+A WhatsApp logout (whatsapp.needs_relink, openmessage PR #232) is listed in
+health.txt on every run that reads the status and announced once per
+episode, in place of the lost-pairing banner. From 2026-08-20 such a logout
+stood for eight days behind one disconnect banner.
 """
 from __future__ import annotations
 
@@ -182,17 +187,20 @@ def box(tmp_path, daemon) -> Sandbox:
     return Sandbox(tmp_path, daemon)
 
 
+BLOCK_KEYS = ("paired", "connected", "needs_relink", "relink_reason", "relink_since_ms")
+
+
 def status(at: int = T0, **platforms: dict) -> dict:
     """An /api/status body whose newest message arrived at `at`. Google is
     paired, connected and current unless overridden. Each platform spec takes
-    paired/connected (omitted keys stay absent), behind (seconds its last
-    message trails the newest), proj (projection stalled) and block=False to
-    drop its status block altogether."""
+    the status block's keys in BLOCK_KEYS (omitted keys stay absent), behind
+    (seconds its last message trails the newest), proj (projection stalled)
+    and block=False to drop its status block altogether."""
     newest = at * 1000
     body: dict = {"connected": True, "freshness": {"newest_ms": newest}}
     for name, spec in {"google": {"paired": True, "connected": True}, **platforms}.items():
         if spec.get("block", True):
-            body[name] = {k: spec[k] for k in ("paired", "connected") if k in spec}
+            body[name] = {k: spec[k] for k in BLOCK_KEYS if k in spec}
         latest = newest - spec.get("behind", 0) * 1000
         body["freshness"][name] = {
             "latest_received_ms": latest,
@@ -329,6 +337,291 @@ def test_paired_disconnect_still_escalates_on_the_third_check(box):
         box.run(status(T0 + 300 * i, whatsapp={"paired": True, "connected": False}), at=T0 + 300 * i)
         assert len(box.banners()) == (1 if i >= 2 else 0)
     assert box.banners() == ["whatsapp disconnected 15+ min - in-app recovery may be stuck"]
+
+
+# ---------- WhatsApp logout (needs_relink, openmessage PR #232) ----------
+#
+# A #232 daemon reports a WhatsApp logout (whatsmeow LoggedOut: 401, 403, 406)
+# as paired=false with needs_relink=true, relink_reason and relink_since_ms,
+# the episode's start. needs_relink is always present there, and absent on
+# older daemons. Invariants, over any run sequence:
+#   L1. health.txt lists "whatsapp logged out ..." on exactly the runs that
+#       read a whatsapp block whose needs_relink is the JSON true;
+#   L2. a logout episode gets at most one banner: on the first run that sees
+#       it at least 6 h after WhatsApp's last lost-pairing or logout banner.
+#       A standing logout never banners again (no 6-hourly repeat);
+#   L3. while needs_relink is true, WhatsApp gets no generic "No longer
+#       paired" banner, and its loss is recorded at once;
+#   L4. without needs_relink, or with anything but true there, a run decides
+#       as it did before #232.
+# test_logout_banners_match_a_reference_model checks L1-L3 over generated
+# schedules, and test_the_relink_line_reads_only_needs_relink_true (in the
+# line protocol section) checks the block's side over generated blocks.
+
+REASON = "401: logged out from another device"
+SINCE = T0 - 2 * HOUR  # when the daemon first saw the logout (epoch seconds)
+
+
+def logged_out(since: int | None = SINCE, reason: str | None = REASON, **spec) -> dict:
+    """A whatsapp spec for status() in #232's shape for a logout. since and
+    reason None leave relink_since_ms and relink_reason out."""
+    out = {**UNLINKED, "needs_relink": True, **spec}
+    if since is not None:
+        out["relink_since_ms"] = since * 1000
+    if reason is not None:
+        out["relink_reason"] = reason
+    return out
+
+
+PAIRED_232 = {**PAIRED, "needs_relink": False}
+DELIBERATE = {**UNLINKED, "needs_relink": False}  # a #232 daemon after an unpair
+LOGGED_OUT_LOG = "unpaired: whatsapp - logged out by WhatsApp; staleness alerts paused until it is relinked"
+LOST_HEALTH = "whatsapp no longer paired - check the app; relink unless that was intended"
+
+
+def logout_text(since: int | None = SINCE, reason: str | None = REASON) -> str:
+    """The alert as health.txt lists it and the banner shows it, at TZ=UTC."""
+    when = f" since {utc(since)}" if since else ""
+    why = f" ({reason})" if reason else ""
+    return f"whatsapp logged out{when}{why} - relink: Platforms -> Connect WhatsApp"
+
+
+def test_a_logout_is_a_health_alert_on_every_run_that_reads_the_status(box):
+    for at in (T0, T0 + 300, T0 + DAY):
+        box.run(status(at, whatsapp=logged_out()), at=at, TZ="UTC")
+        h = health(box)
+        assert h["alert"] == [logout_text()]
+        assert h["relink_since_whatsapp"] == str(SINCE)
+        assert h["note"] == ["whatsapp unpaired - its staleness checks are paused"]
+    # A run without status data or with the daemon down read no logout, so
+    # it lists none; the next answered run lists it again.
+    box.run(b'{"connected": true, "freshness": ', at=T0 + DAY + 300, TZ="UTC")
+    assert [a.split(":")[0] for a in health(box)["alert"]] == ["status parse error"]
+    assert "relink_since_whatsapp" not in health(box)
+    box.run({}, at=T0 + DAY + 600, TZ="UTC")
+    assert [a.split(" since ")[0] for a in health(box)["alert"]] == ["daemon not answering"]
+    box.run(status(T0 + DAY + 900, whatsapp=logged_out()), at=T0 + DAY + 900, TZ="UTC")
+    assert health(box)["alert"] == [logout_text()]
+    box.run(status(T0 + 2 * DAY, whatsapp=PAIRED_232), at=T0 + 2 * DAY, TZ="UTC")  # relinked
+    h = health(box)
+    assert (h["alert"], h["note"], "relink_since_whatsapp" in h) == ([], [], False)
+    assert box.banners() == [logout_text()]
+
+
+def test_the_lost_pairing_banner_names_the_logout_and_its_reason(box):
+    box.run(status(whatsapp=PAIRED_232))
+    box.run(status(T0 + 300, whatsapp=logged_out(T0 + 240)), at=T0 + 300, TZ="UTC")
+    shown = logout_text(T0 + 240)
+    assert box.banners() == [shown]
+    assert box.log_lines() == [LOGGED_OUT_LOG, f"ALERT: {shown}", f"NOTIFY: {shown}"]
+    assert health(box)["watchdog_detail"] == f"banner: {shown}"
+    assert [box.stored(n) for n in ("paired_whatsapp", "alert_unlinked_whatsapp", "relink_episode_whatsapp")] == [
+        "0", str(T0 + 300), str(T0 + 240)]
+
+
+def test_a_standing_logout_is_announced_once(box):
+    """No 6-hourly repeat (decided 2026-10-11; the runbook's "How alerts
+    repeat" gives the reasons). health.txt keeps listing it, and WhatsApp's
+    staleness checks stay paused however far behind it falls."""
+    box.run(status(whatsapp=PAIRED_232))
+    for at in (T0 + 300, T0 + 7 * HOUR, T0 + DAY, T0 + 8 * DAY):
+        box.run(status(at, whatsapp=logged_out(T0 + 240, behind=at - T0)), at=at, TZ="UTC")
+        assert health(box)["alert"] == [logout_text(T0 + 240)]
+    assert box.banners() == [logout_text(T0 + 240)]
+    assert box.log_lines("suppressed") == []
+    assert sorted(p.name for p in box.state.glob("alert_*")) == ["alert_unlinked_whatsapp"]
+
+
+def test_a_logout_first_seen_unpaired_is_announced(box):
+    """A plain paired=false first seen is only logged, since it may be
+    deliberate. A logout is not, so it is announced without paired history
+    too: a watchdog parked across the logout, or deployed in the middle of
+    one."""
+    box.run(status(whatsapp=logged_out()), TZ="UTC")
+    assert box.banners() == [logout_text()]
+    assert box.log_lines("unpaired:") == [LOGGED_OUT_LOG]
+
+
+@pytest.mark.parametrize("spec", [
+    UNLINKED,                               # a daemon before #232
+    DELIBERATE,                             # a #232 daemon, unpaired on purpose
+    {**UNLINKED, "needs_relink": None},
+    {**UNLINKED, "needs_relink": 1},
+    {**UNLINKED, "needs_relink": "true"},
+], ids=["no-field", "false", "null", "one", "string"])
+def test_without_a_logout_a_lost_pairing_keeps_its_banner(box, spec):
+    box.run(status(whatsapp=PAIRED))
+    box.run(status(T0 + 300, whatsapp={**spec, "relink_reason": REASON, "relink_since_ms": SINCE * 1000}),
+            at=T0 + 300)
+    assert box.banners() == [UNLINK_BANNER]
+    assert box.log_lines("unpaired:") == [f"unpaired: whatsapp - was paired; {PAUSED}"]
+    assert health(box)["alert"] == [LOST_HEALTH]
+    assert "relink_since_whatsapp" not in health(box)
+    assert box.stored("relink_episode_whatsapp") is None
+
+
+def test_a_new_episode_after_a_relink_waits_out_the_cooldown(box):
+    """A relink ends the episode. A logout within 6 h of the last banner is
+    listed and recorded at once and announced on the first run 6 h after
+    that banner, like a lost pairing."""
+    first = T0 + 300
+    box.run(status(whatsapp=PAIRED_232))
+    box.run(status(first, whatsapp=logged_out(T0 + 240)), at=first, TZ="UTC")
+    box.run(status(T0 + 600, whatsapp=PAIRED_232), at=T0 + 600)
+    assert box.stored("relink_episode_whatsapp") is None
+    box.run(status(T0 + 900, whatsapp=logged_out(T0 + 840)), at=T0 + 900, TZ="UTC")
+    assert box.log_lines("suppressed") == ["suppressed (cooldown): unlinked_whatsapp"]
+    assert (box.stored("paired_whatsapp"), health(box)["alert"]) == ("0", [logout_text(T0 + 840)])
+    box.run(status(first + COOLDOWN - 1, whatsapp=logged_out(T0 + 840)), at=first + COOLDOWN - 1)
+    assert len(box.banners()) == 1
+    box.run(status(first + COOLDOWN, whatsapp=logged_out(T0 + 840)), at=first + COOLDOWN, TZ="UTC")
+    assert box.banners() == [logout_text(T0 + 240), logout_text(T0 + 840)]
+    assert box.log_lines("paired again") == ["paired again: whatsapp - staleness alerts resume"]
+    assert box.log_lines("unpaired:") == [LOGGED_OUT_LOG] * 2
+
+
+def test_a_logout_and_another_lost_pairing_share_one_lead(box):
+    box.run(status(whatsapp=PAIRED_232, signal=PAIRED))
+    body = status(T0 + 300, whatsapp=logged_out(T0 + 240), signal=UNLINKED)
+    body["projection_stalled"] = True
+    box.run(body, at=T0 + 300, TZ="UTC")
+    assert box.banners() == [f"{logout_text(T0 + 240)}; also no longer paired: signal - check the app;"
+                             " relink unless that was intended (+1 more - see log)"]
+    assert health(box)["alert"] == [logout_text(T0 + 240),
+                                    "v2 read projection stalled - reads are stale while ingest continues",
+                                    "signal no longer paired - check the app; relink unless that was intended"]
+
+
+def test_a_logout_leading_the_banner_defers_append_errors(box):
+    """append_errors does not repeat for a flat count, so it waits for a run
+    it leads; a logout announced in the same run leads instead."""
+    def body(at):
+        b = status(at, whatsapp=logged_out(T0 + 240))
+        b["v2_ingest"] = {"per_account": {"whatsapp-primary": {"append_errors": 2, "appended": 9}}}
+        return b
+
+    box.run(status(whatsapp=PAIRED_232))
+    box.run(body(T0 + 300), at=T0 + 300, TZ="UTC")
+    assert box.banners() == [logout_text(T0 + 240)]
+    assert box.log_lines("deferred") == ["deferred: append_errors - another alert leads this run's notification"]
+    box.run(body(T0 + 600), at=T0 + 600)
+    assert box.banners()[1:] == ["2 failed attempt(s) to append to v2 ingest (whatsapp-primary 2)"]
+
+
+def test_an_unknown_start_or_reason_is_left_out(box):
+    box.run(status(whatsapp=logged_out(since=None, reason=None)))
+    shown = "whatsapp logged out - relink: Platforms -> Connect WhatsApp"
+    h = health(box)
+    assert (box.banners(), h["alert"], "relink_since_whatsapp" in h) == ([shown], [shown], False)
+    box.run(status(T0 + 300, whatsapp=logged_out(since=None, reason=None)), at=T0 + 300)
+    assert len(box.banners()) == 1  # an unknown start is still one episode
+    assert box.stored("relink_episode_whatsapp") == "0"
+
+
+def test_a_damaged_episode_file_reads_as_another_episode(box):
+    """relink_episode_whatsapp is compared as a string, like paired_<p>, so
+    other content is another episode: announced once more, if the 6 h stamp
+    allows, and rewritten."""
+    box.state.mkdir()
+    (box.state / "relink_episode_whatsapp").write_text("08\n")
+    (box.state / "paired_whatsapp").write_text("0")
+    box.run(status(whatsapp=logged_out()), TZ="UTC")
+    assert box.banners() == [logout_text()]
+    assert box.stored("relink_episode_whatsapp") == str(SINCE)
+
+
+def test_an_empty_platform_name_is_not_taken_for_a_logout(box):
+    """In a run without a logout the logged-out name is empty, and so is the
+    encoded name of a platform the status calls "". Matching on the name
+    alone recorded that platform's loss without its banner (caught by
+    test_daemon_strings_change_none_of_a_runs_decisions)."""
+    box.run(status(**{"": PAIRED}))
+    box.run(status(T0 + 300, **{"": UNLINKED}), at=T0 + 300)
+    assert box.banners() == ["No longer paired:  - check the app; relink unless that was intended"]
+    assert box.log_lines("unpaired:") == [f"unpaired:  - was paired; {PAUSED}"]
+
+
+def test_paired_beside_needs_relink_still_counts_as_a_logout(box):
+    """#232 never reports both (its R2). If a daemon did, the logout is
+    listed and announced once, and paired=true beside it does not end the
+    episode."""
+    for at in (T0, T0 + 300, T0 + 7 * HOUR):
+        box.run(status(at, whatsapp=logged_out(paired=True, connected=True)), at=at, TZ="UTC")
+        assert health(box)["alert"] == [logout_text()]
+    assert box.banners() == [logout_text()]
+    assert box.stored("relink_episode_whatsapp") == str(SINCE)
+
+
+WA_STATES = {
+    "paired": PAIRED_232,
+    "paired-old": PAIRED,                       # a daemon before #232
+    "unlinked-old": UNLINKED,
+    "deliberate": DELIBERATE,
+    "out-a": logged_out(T0 - HOUR),
+    "out-b": logged_out(T0 + 9 * HOUR, "403"),
+    "out-unknown": logged_out(None, None),
+    "both": logged_out(T0 - HOUR, paired=True, connected=True),  # out-a's episode, paired=true beside it
+}
+
+
+def reference(schedule: list[tuple[int, str]]) -> tuple[list[str], list[list[str]]]:
+    """The banners and per-run health alerts a schedule of WhatsApp states
+    should make, by the rule as the runbook states it: a logout episode is
+    announced once, on the first run at least 6 h after WhatsApp's last
+    lost-pairing or logout banner; a plain loss of a recorded pairing is
+    announced on the same 6 h terms and is not recorded until then; a
+    pairing without a logout ends the episode."""
+    stored = stamp = episode = None
+    banners, healths = [], []
+    for at, kind in schedule:
+        spec = WA_STATES[kind]
+        out = spec.get("needs_relink") is True
+        due = stamp is None or at - stamp >= COOLDOWN
+        alerts = []
+        if out:
+            ms = spec.get("relink_since_ms")
+            text = logout_text(ms // 1000 if ms else None, spec.get("relink_reason"))
+            alerts.append(text)
+            if episode != str(ms // 1000 if ms else 0) and due:
+                stamp, episode = at, str(ms // 1000 if ms else 0)
+                banners.append(text)
+        p = "1" if spec["paired"] else "0"
+        if p == "1" and not out:
+            episode = None
+        if stored != p:
+            if p == "1" or out or stored is None:
+                stored = p
+            else:  # a plain loss of a recorded pairing
+                alerts.append(LOST_HEALTH)
+                if due:
+                    stamp, stored = at, p
+                    banners.append(UNLINK_BANNER)
+        healths.append(alerts)
+    return banners, healths
+
+
+GAPS = st.sampled_from([300, HOUR, COOLDOWN - 1, COOLDOWN, DAY])
+
+
+@settings(max_examples=4, deadline=None, derandomize=True, phases=[Phase.explicit, Phase.generate],
+          suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
+@given(steps=st.lists(st.tuples(GAPS, st.sampled_from(sorted(WA_STATES))), min_size=4, max_size=9))
+# A plain loss, a relink, then a logout inside its cooldown: recorded at
+# once, announced at exactly 6 h, and never again.
+@example(steps=[(0, "paired"), (300, "unlinked-old"), (300, "paired"), (300, "out-a"),
+                (COOLDOWN - 601, "out-a"), (1, "out-a"), (DAY, "out-a"), (300, "both")])
+# Episodes without a known start, a deliberate unpair, an older daemon.
+@example(steps=[(0, "out-unknown"), (300, "paired"), (300, "out-unknown"), (COOLDOWN, "out-unknown"),
+                (300, "deliberate"), (300, "paired-old"), (COOLDOWN, "out-b"), (300, "unlinked-old")])
+def test_logout_banners_match_a_reference_model(tmp_path_factory, daemon, steps):
+    box = Sandbox(tmp_path_factory.mktemp("model"), daemon)
+    at, schedule, healths = T0, [], []
+    for gap, kind in steps:
+        at += gap
+        box.run(status(at, whatsapp=WA_STATES[kind]), at=at, TZ="UTC")
+        schedule.append((at, kind))
+        healths.append(health(box)["alert"])
+    assert (box.banners(), healths) == reference(schedule), schedule
 
 
 # ---------- cooldown ----------
@@ -837,6 +1130,10 @@ def random_status(rng: random.Random, now: int) -> dict:
         body["projection_stalled"] = True
     if rng.random() < 0.2:
         body["v2_ingest"] = {"per_account": {"a": {"quarantined": rng.randint(0, 2)}}}
+    if isinstance(body.get("whatsapp"), dict) and rng.random() < 0.3:  # a #232 daemon
+        body["whatsapp"].update(needs_relink=rng.choice([True, True, False, None, 1]),
+                                relink_reason=rng.choice(["401: logged out from another device", "", 7]),
+                                relink_since_ms=rng.choice([(now - rng.randint(0, 9 * DAY)) * 1000, 0, None]))
     return body
 
 
@@ -1221,7 +1518,8 @@ def test_a_write_that_does_not_finish_keeps_the_previous_health(box):
 #      splits it), is UTF-8 lines that each match GRAMMAR;
 #   2. the lines are exactly those of P's plain twin (every daemon string the
 #      block prints swapped for a sentinel), with each sentinel read back:
-#      a platform name as ref_plat(name), Signal's reason as ref_line(reason).
+#      a platform name as ref_plat(name), Signal's reason and WhatsApp's
+#      relink_reason as ref_line(reason).
 #      Only the PAIRED/UNPAIRED lines may change places (they come sorted
 #      by the raw name). So no daemon string adds, drops, cuts or splits a
 #      line, and the only stamp files a name keys are alert_proj_, alert_behind_,
@@ -1239,7 +1537,8 @@ ALERT_KEYS = {"repairs_paced", "pull_empty", "projection_stalled", "all_quiet", 
 TEXT = r"[^\x00-\x1f\x7f\ud800-\udfff]*"
 GRAMMAR = re.compile(rf"PARSEERR\|{TEXT}|NOTE\|{TEXT}|DISC\|(?:google|whatsapp|signal)|REPAIR\|google"
                      rf"|(?:UN)?PAIRED\|(?P<plat>[^|]*)|ALERT\|(?P<key>[^|]*)\|{TEXT}"
-                     rf"|APPEND\|(?:0|[1-9][0-9]*)\|(?:0|[1-9][0-9]*)\|{TEXT}")
+                     rf"|APPEND\|(?:0|[1-9][0-9]*)\|(?:0|[1-9][0-9]*)\|{TEXT}"
+                     rf"|RELINK\|whatsapp\|(?:0|[1-9][0-9]{{0,10}})\|{TEXT}")
 # Keys of /api/status (or of its freshness block) that are not platforms.
 NOT_PLATFORMS = {"connected", "freshness", "v2_ingest", "auth", "projection_stalled", "newest_ms", *FIXED}
 
@@ -1314,15 +1613,16 @@ def ref_line(text: str) -> str:
     return re.sub(r"[\x00-\x1f\x7f\ud800-\udfff]", " ", text)
 
 
-SENTINEL = re.compile(r"zqp(\d+)zq|zqreasonzq")  # what plain_twin() puts in; plat() leaves both as they are
+SENTINEL = re.compile(r"zqp(\d+)zq|zq(reason|relink)zq")  # what plain_twin() puts in; plat() leaves them as they are
 
 
 def read_back(twin_lines: list[str], body: dict, extra: list[str]) -> list[str]:
     """The lines body should make: its plain twin's, with each sentinel
     replaced in one pass by what the block prints for the string it stands
     for."""
-    reason = body["signal"]["receive_recovery"]["last_issue_reason"]
-    return [SENTINEL.sub(lambda m: ref_plat(extra[int(m[1])]) if m[1] else ref_line(reason), line)
+    said = {"reason": body["signal"]["receive_recovery"]["last_issue_reason"],
+            "relink": body["whatsapp"].get("relink_reason")}
+    return [SENTINEL.sub(lambda m: ref_plat(extra[int(m[1])]) if m[1] else ref_line(said[m[2]]), line)
             for line in twin_lines]
 
 
@@ -1366,8 +1666,8 @@ daemon_text = st.one_of(
 def protocol_payloads(draw) -> tuple[dict, list[str]]:
     """(status, its extra platform names): every daemon string drawn from
     daemon_text (extra platform names, Signal's last_issue_reason, the
-    pull_health fields, v2 ingest account names), every other field
-    well-typed."""
+    pull_health fields, v2 ingest account names, WhatsApp's relink_reason),
+    every other field well-typed."""
     newest = T0 * 1000
     # Distinct once JSON joins a surrogate pair (see as_sent).
     extra = draw(st.lists(daemon_text.filter(lambda s: s not in NOT_PLATFORMS), unique_by=as_sent, max_size=3))
@@ -1394,6 +1694,9 @@ def protocol_payloads(draw) -> tuple[dict, list[str]]:
     }))
     body["signal"]["receive_recovery"] = {"pending_count": draw(st.sampled_from([0, 6])),
                                           "last_issue_reason": draw(daemon_text)}
+    if draw(st.booleans()):  # a #232 daemon
+        body["whatsapp"].update(needs_relink=draw(st.booleans()), relink_reason=draw(daemon_text),
+                                relink_since_ms=draw(st.sampled_from([0, (T0 - DAY) * 1000])))
     if draw(st.booleans()):
         accounts = draw(st.lists(daemon_text.filter(lambda s: "zq" not in s), unique=True, max_size=2))
         body["v2_ingest"] = {"enabled": draw(st.booleans()), "per_account": {
@@ -1418,7 +1721,8 @@ def sent_case(body: dict, extra: list[str]) -> tuple[dict, list[str]]:
 def plain_twin(body: dict, extra: list[str]) -> dict:
     """body with every daemon string the block prints swapped for a
     sentinel: extra platform i becomes zqp<i>zq, Signal's last_issue_reason
-    zqreasonzq. The pull_health strings, which it never prints, become "t".
+    zqreasonzq, WhatsApp's relink_reason zqrelinkzq. The pull_health
+    strings, which it never prints, become "t".
     Account names stay: APPEND lists them in their own sort order, and
     test_account_ids_cannot_break_the_notification_or_the_line_format covers
     their filter."""
@@ -1430,6 +1734,8 @@ def plain_twin(body: dict, extra: list[str]) -> dict:
     pull_health = twin["google"]["pull_health"]
     pull_health.update({k: "t" for k, v in pull_health.items() if isinstance(v, str)})
     twin["signal"]["receive_recovery"]["last_issue_reason"] = "zqreasonzq"
+    if isinstance(twin["whatsapp"].get("relink_reason"), str):
+        twin["whatsapp"]["relink_reason"] = "zqrelinkzq"
     return twin
 
 
@@ -1448,10 +1754,18 @@ def nasty_status(reason: str = FORGED, names: tuple[str, ...] = NASTY_NAMES) -> 
     return body, list(names)
 
 
+def nasty_logout(reason: str = FORGED, names: tuple[str, ...] = NASTY_NAMES) -> tuple[dict, list[str]]:
+    """nasty_status, with WhatsApp logged out for reason as well."""
+    body, extra = nasty_status(reason, names)
+    body["whatsapp"] = logged_out(T0 - DAY, reason)
+    return body, extra
+
+
 @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
 @given(batch=st.lists(protocol_payloads(), min_size=1, max_size=25))
 @example(batch=[nasty_status(), nasty_status("\r\n|\ud800\x00\N{LINE SEPARATOR}", ("A", "a"))])
 @example(batch=[nasty_status(names=("\ud800\udc80", "\U00010080"))])  # one name once sent
+@example(batch=[nasty_logout(), nasty_logout("a|b\r\n|\ud800 - relink: x", ("A", "a"))])
 def test_no_daemon_string_adds_cuts_or_renames_a_line(tmp_path_factory, batch):
     """Invariants 1-3 above, for each payload in the batch against its plain
     twin (one /usr/bin/python3 for the whole batch)."""
@@ -1542,8 +1856,61 @@ def test_an_inbox_read_error_stays_on_one_line(tmp_path):
         "PAIRED|google", "ALERT|silence_check|watchdog could not read the v2 inbox: disk I/O error  x ALERT|forged|forged alert text"]
 
 
+WA_BLOCK = st.fixed_dictionaries({}, optional={
+    "paired": st.sampled_from([True, False, None]),
+    "connected": st.booleans(),
+    "needs_relink": st.sampled_from([True, True, False, None, 1, 0, "true", [True]]),
+    "relink_since_ms": st.one_of(st.integers(-1, 2 * 10 ** 13), st.sampled_from([999, 1000, 10 ** 13 - 1, 10 ** 13]),
+                                 st.floats(), st.booleans(), st.none(), daemon_text),
+    "relink_reason": st.one_of(daemon_text, st.integers(), st.none()),
+})
+
+
+def ref_since(ms) -> int:
+    """The episode start the block prints, as its comment specifies it: the
+    whole seconds of a number (not a bool) in (0, 10^13) ms, else 0."""
+    ok = isinstance(ms, (int, float)) and not isinstance(ms, bool) and 0 < ms < 10 ** 13
+    return int(ms // 1000) if ok else 0
+
+
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
+@given(blocks=st.lists(st.one_of(WA_BLOCK, st.none()), min_size=1, max_size=30))
+@example(blocks=[logged_out(reason=FORGED), logged_out(reason="a|b|c"),
+                 {"needs_relink": True, "relink_since_ms": float("nan")}, {"needs_relink": True, "relink_since_ms": 10 ** 13},
+                 {"needs_relink": True, "relink_since_ms": 1.5e12, "relink_reason": 7}, DELIBERATE, None])
+def test_the_relink_line_reads_only_needs_relink_true(tmp_path_factory, blocks):
+    """For every whatsapp block B (None: no block at all):
+      1. the block prints a RELINK line iff B is an object whose needs_relink
+         is the JSON true, and prints it first;
+      2. that line is RELINK|whatsapp|<ref_since(relink_since_ms)>|<reason>,
+         reason being ref_line(relink_reason) for a string and empty for
+         anything else, and it matches GRAMMAR;
+      3. its other lines are those of B without needs_relink, relink_reason
+         and relink_since_ms, so those fields move nothing else."""
+    blocks = [as_sent(b) for b in blocks]  # JSON joins a surrogate pair; NaN goes through
+    cases, twins = [], []
+    for b in blocks:
+        body = status(signal=PAIRED)
+        twin = copy.deepcopy(body)
+        if b is not None:
+            body["whatsapp"] = b
+            twin["whatsapp"] = {k: v for k, v in b.items() if k not in ("needs_relink", "relink_reason", "relink_since_ms")}
+        cases.append({"status": body, "now": T0})
+        twins.append({"status": twin, "now": T0})
+    results = evaluate_raw(cases + twins, tmp_path_factory.mktemp("relink"))
+    for b, (out, crash), (twin_out, twin_crash) in zip(blocks, results, results[len(blocks):]):
+        assert crash is None and twin_crash is None, (crash, twin_crash, b)
+        lines, rest = protocol_lines(out), protocol_lines(twin_out)
+        if isinstance(b, dict) and b.get("needs_relink") is True:
+            why = b.get("relink_reason")
+            said = ref_line(why) if isinstance(why, str) else ""
+            assert lines == [f"RELINK|whatsapp|{ref_since(b.get('relink_since_ms'))}|{said}"] + rest, b
+        else:
+            assert lines == rest, b
+
+
 STATE_FILE = re.compile(
-    r"consecutive_fails|last_action_epoch|down_since|health\.txt|python\.stderr|append_errors"
+    r"consecutive_fails|last_action_epoch|down_since|health\.txt|python\.stderr|append_errors|relink_episode_whatsapp"
     r"|repair_google|repair_since_google|disc_(?:since_)?(?:google|whatsapp|signal)"
     rf"|alert_(?:{'|'.join(sorted(ALERT_KEYS | {'append_errors'}))})"
     r"|(?P<slot>alert_proj_|alert_behind_|alert_unlinked_|paired_)(?P<plat>.*)", re.S)
@@ -1573,7 +1940,8 @@ def run_unlinking(box: Sandbox, body: dict, labels: dict[str, str]) -> tuple:
         seen_banners, seen_log = len(box.banners()), len(log_entries(box))
         box.run(payload, at=at)
         lost_banner = "No longer paired: "  # bash's own text; encoded names hold no ", " or " - "
-        banners = [(b.startswith(lost_banner), b.split(" - ")[0].count(", ") if b.startswith(lost_banner) else 0)
+        banners = [(b.startswith(lost_banner), b.startswith("whatsapp logged out"),
+                    b.split(" - ")[0].count(", ") if b.startswith(lost_banner) else 0)
                    for b in box.banners()[seen_banners:]]
         entries = log_entries(box)[seen_log:]
         runs.append((banners, sum(e.startswith("ALERT: ") for e in entries),
@@ -1593,6 +1961,7 @@ def run_unlinking(box: Sandbox, body: dict, labels: dict[str, str]) -> tuple:
 @given(case=protocol_payloads())
 @example(case=nasty_status())
 @example(case=nasty_status("ALERT: suppressed (cooldown): x\N{LINE SEPARATOR}ALERT: (+1 more - see log)", ("p",)))
+@example(case=nasty_logout("x\n; also no longer paired: a, b, c - y\N{LINE SEPARATOR}", ("p",)))
 def test_daemon_strings_change_none_of_a_runs_decisions(tmp_path_factory, daemon, case):
     """End to end, differential: the real script, run on a payload and then
     with its platforms unpaired, makes as many banners, ALERT and suppressed
