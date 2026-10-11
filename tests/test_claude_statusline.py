@@ -14,7 +14,6 @@ from __future__ import annotations
 import ast
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -301,17 +300,23 @@ def main_worktree(checkout: Path) -> Path | None:
     return Path(first.removeprefix("worktree "))
 
 
-def root_commits(checkout: Path) -> set[str] | None:
-    """The parentless commits in HEAD's history, which identify the repository.
-    None without full history: not the top of a git checkout, no commit yet, or
-    a shallow clone (whose cut-off commits look parentless too)."""
+def history_starts(checkout: Path) -> tuple[set[str], bool] | None:
+    """The parentless commits in HEAD's history, and whether the clone is
+    shallow: a full clone's are its repository's roots, a shallow clone's are
+    where its history was cut off. None unless `checkout` is the top of a git
+    checkout with a commit."""
     if not same_path(toplevel(checkout), checkout):
         return None
+    starts = git(checkout, "rev-list", "--max-parents=0", "HEAD")
     shallow = git(checkout, "rev-parse", "--is-shallow-repository")
-    roots = git(checkout, "rev-list", "--max-parents=0", "HEAD")
-    if shallow.stdout.strip() != "false" or roots.returncode:
+    if starts.returncode or shallow.returncode:
         return None
-    return set(roots.stdout.split())
+    return set(starts.stdout.split()), shallow.stdout.strip() == "true"
+
+
+def holds_any(checkout: Path, commits: set[str]) -> bool:
+    """Whether HEAD's history in `checkout` contains any of `commits`."""
+    return any(git(checkout, "merge-base", "--is-ancestor", c, "HEAD").returncode == 0 for c in commits)
 
 
 def assert_installed(link: Path, script: Path) -> None:
@@ -319,8 +324,8 @@ def assert_installed(link: Path, script: Path) -> None:
     of this repository `script` is in.
 
     A copy must be byte-for-byte `script`. A symlink must resolve to an executable
-    bin/claude-statusline, tracked at the top of the main worktree of a full clone
-    of this repository: the deployed checkout (~/dotfiles on Max's Mac). That need
+    bin/claude-statusline, tracked at the top of the main worktree of a clone of
+    this repository: the deployed checkout (~/dotfiles on Max's Mac). That need
     not be `script`'s own checkout, since the suite also runs from linked
     worktrees and other clones. A linked worktree is never the deploy: sweeps
     remove them, and the link would dangle.
@@ -348,13 +353,20 @@ def assert_installed(link: Path, script: Path) -> None:
     tracked = git(checkout, "ls-files", "--error-unmatch", "--", "bin/claude-statusline")
     assert tracked.returncode == 0, f"{target} is not tracked in {checkout}"
 
+    # Same repository: one checkout's history holds a commit the other's starts
+    # from. Two full clones that share nothing are different repositories; a
+    # shallow history can hide the shared part, so then there is no verdict.
     under_test = script.parent.parent
-    ours = root_commits(under_test)
+    ours = history_starts(under_test)
     if ours is None:
-        pytest.skip(f"{under_test} has no full git history to compare {checkout} with")
-    assert ours & (root_commits(checkout) or set()), (
-        f"{checkout} is not a full clone of this repository: no root commit in common with {under_test}"
-    )
+        pytest.skip(f"{under_test} is not a git checkout with commits, so {checkout} can't be compared with it")
+    theirs = history_starts(checkout)
+    assert theirs is not None, f"{checkout} has no commits"
+    if holds_any(checkout, ours[0]) or holds_any(under_test, theirs[0]):
+        return
+    if ours[1] or theirs[1]:
+        pytest.skip(f"shallow history: no way to tell whether {checkout} and {under_test} share a repository")
+    raise AssertionError(f"{checkout} is not a clone of this repository: no history in common with {under_test}")
 
 
 def test_installed_via_home_bin_symlink():
@@ -408,6 +420,7 @@ def checkouts(tmp_path_factory) -> Path:
         add_script(upstream / rel)
     build_git(upstream, "add", "-A")
     build_git(upstream, "commit", "-qm", "root")
+    build_git(root, "clone", "-q", str(upstream), "early")  # a full clone from before the second commit
     (upstream / "README").write_text("second commit, so a depth-1 clone is shallow\n")
     build_git(upstream, "add", "-A")
     build_git(upstream, "commit", "-qm", "second")
@@ -425,8 +438,22 @@ def checkouts(tmp_path_factory) -> Path:
     build_git(root / "other", "add", "-A")
     build_git(root / "other", "commit", "-qm", "unrelated history")
     add_script(root / "plain" / "bin" / "claude-statusline")
+    add_script(root / "other" / "vendored" / "bin" / "claude-statusline")  # untracked, inside "other"
     (root / "alias").symlink_to(root / "deploy", target_is_directory=True)
     return root
+
+
+def outcome(check, *args) -> tuple[str, str]:
+    """How `check` ended: pass, fail or skip, with its message. pytest.skip
+    raises a BaseException that pytest.raises(AssertionError) lets through, so
+    a check that wrongly skips would skip its test instead of failing it."""
+    try:
+        check(*args)
+    except AssertionError as e:
+        return "fail", str(e)
+    except pytest.skip.Exception as e:
+        return "skip", str(e)
+    return "pass", ""
 
 
 DEPLOYED = "deploy/bin/claude-statusline"
@@ -450,12 +477,15 @@ INSTALL_CASES = {
     "a-directory": ("wt", "link", "deploy/bin", "fail", "which is not a file"),
     "untracked-file": ("wt", "link", "untracked/bin/claude-statusline", "fail", "is not tracked in"),
     "not-executable": ("wt", "link", "noexec/bin/claude-statusline", "fail", "is not executable"),
-    "another-repository": ("wt", "link", "other/bin/claude-statusline", "fail", "not a full clone of this repository"),
-    "shallow-deploy": ("wt", "link", "shallow/bin/claude-statusline", "fail", "not a full clone of this repository"),
+    "another-repository": ("wt", "link", "other/bin/claude-statusline", "fail", "not a clone of this repository"),
     "stale-copy": ("wt", "stale-copy", "wt/bin/claude-statusline", "fail", "is a stale copy"),
     "non-executable-copy": ("wt", "noexec-copy", "wt/bin/claude-statusline", "fail", "is not executable"),
-    "run-from-a-shallow-clone": ("shallow", "link", DEPLOYED, "skip", "no full git history"),
-    "run-from-outside-git": ("plain", "link", DEPLOYED, "skip", "no full git history"),
+    "shallow-deploy": ("wt", "link", "shallow/bin/claude-statusline", "pass", ""),
+    "run-from-a-shallow-clone": ("shallow", "link", DEPLOYED, "pass", ""),
+    "shallow-deploy-ahead-of-the-checkout": ("early", "link", "shallow/bin/claude-statusline", "skip", "shallow history"),
+    "run-from-a-shallow-clone-ahead-of-the-deploy": ("shallow", "link", "early/bin/claude-statusline", "skip", "shallow history"),
+    "run-from-outside-git": ("plain", "link", DEPLOYED, "skip", "not a git checkout with commits"),
+    "run-from-a-copy-inside-another-repository": ("other/vendored", "link", DEPLOYED, "skip", "not a git checkout with commits"),
 }
 
 
@@ -485,9 +515,27 @@ def test_install_check_follows_the_deploy_not_the_checkout(
             link.chmod(0o644)
     script = checkouts / under_test / "bin" / "claude-statusline"
 
-    if expected == "pass":
-        assert_installed(link, script)
-    else:
-        raised = AssertionError if expected == "fail" else pytest.skip.Exception
-        with pytest.raises(raised, match=re.escape(reason)):
-            assert_installed(link, script)
+    ended, message = outcome(assert_installed, link, script)
+    assert (ended, reason in message) == (expected, True), f"{ended}: {message}"
+
+
+def test_a_dangling_home_link_fails_instead_of_skipping(tmp_path, monkeypatch):
+    """A dangling ~/bin/claude-statusline is a broken status line, not an absent one."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    link = tmp_path / "bin" / "claude-statusline"
+    link.parent.mkdir()
+    link.symlink_to(tmp_path / "gone")
+    ended, message = outcome(test_installed_via_home_bin_symlink)
+    assert (ended, "dangles" in message) == ("fail", True), f"{ended}: {message}"
+    link.unlink()
+    assert outcome(test_installed_via_home_bin_symlink) == ("skip", "not installed on this machine")
+
+
+def test_install_check_ignores_inherited_git_variables(checkouts, tmp_path, monkeypatch):
+    """Git hooks run with GIT_DIR and GIT_WORK_TREE set; they must not redirect
+    the check to another repository."""
+    monkeypatch.setenv("GIT_DIR", str(checkouts / "other" / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(checkouts / "other"))
+    link = tmp_path / "claude-statusline"
+    link.symlink_to(checkouts / DEPLOYED)
+    assert outcome(assert_installed, link, checkouts / "wt" / "bin" / "claude-statusline") == ("pass", "")
