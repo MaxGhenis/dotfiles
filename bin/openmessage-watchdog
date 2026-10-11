@@ -47,10 +47,21 @@
 #                      → notify once, ahead of the run's other alerts; a loss
 #                        within 6h of that platform's last one waits it out
 #     paired=false is not always a deliberate unlink: Google's server-side
-#     logout deletes the session file that paired reads, WhatsApp's
-#     device_removed deletes its device store, and a WhatsApp or Signal
-#     bridge that fails to start reports it too. A platform first seen
-#     unpaired is only logged.
+#     logout deletes the session file that paired reads, a WhatsApp logout
+#     reads as paired=false (with needs_relink on newer daemons, below), and
+#     a WhatsApp or Signal bridge that fails to start reports it too. A
+#     platform first seen unpaired is only logged.
+#   - whatsapp.needs_relink true: WhatsApp logged this install's device out
+#     (401/403/406; openmessage PR #232), which paired=false alone cannot
+#     tell from a deliberate unlink    → a health.txt alert on every run, and
+#                        a notification once per logout episode
+#                        (relink_since_ms) that takes the lost-pairing
+#                        banner's place and its 6h stamp
+#     It does not repeat while the logout stands. In August 2026 the
+#     6-hourly all_quiet repeats reached nobody over eight days, and in
+#     October 6-hourly repeats for standing unlinks buried a real SMS outage.
+#     Daemons before #232 send no needs_relink and keep the lost-pairing
+#     banner; so does needs_relink=false (a deliberate unpair).
 #   - newest message on ANY platform > 24h old (global silence; organically
 #     near-impossible at Max's volume — smells like zombie-everything)
 #                                                    → notify, re-notify 6h
@@ -111,6 +122,8 @@
 #   disconnected_since_<p>, repair_since_google   the episode's first check,
 #                            once it is listed as an alert. Like the counters,
 #                            these run on through skipped and data-less runs
+#   relink_since_whatsapp    when the daemon first saw a standing logout
+#                            (relink_since_ms), on runs that read the status
 #   alerts=N, then N "alert: <text>" lines, then any "note: <text>" lines
 # All since values are epoch seconds. A python3 failure (2026-09-15 to 09-20
 # every class-B check died on an unaccepted Xcode license, and the main log
@@ -426,6 +439,17 @@ if isinstance(ph, dict) and ph.get("empty_with_local_history") is True and g.get
     out.append("ALERT|pull_empty|Google pulls return no data while the store holds %s%s%s" % (held, age, why))
 if d.get("projection_stalled"):
     out.append("ALERT|projection_stalled|v2 read projection stalled - reads are stale while ingest continues")
+# WhatsApp logged this install out (openmessage PR #232): paired=false alone
+# cannot tell that from a deliberate unlink, needs_relink can. #232 daemons
+# always send it; older ones never do, and only the JSON true counts. The
+# line is printed first: bash reads the pairing lines knowing it, and its
+# banner leads.
+wa, relink = plats["whatsapp"], []
+if isinstance(wa, dict) and wa.get("needs_relink") is True:
+    ms = wa.get("relink_since_ms")
+    ok = isinstance(ms, (int, float)) and not isinstance(ms, bool) and 0 < ms < 10 ** 13
+    why = wa.get("relink_reason")
+    relink.append("RELINK|whatsapp|%d|%s" % (ms // 1000 if ok else 0, why if isinstance(why, str) else ""))
 # Pairing as the daemon reports it (bash alerts on a paired -> unpaired change).
 # An unlinked platform has frozen freshness, so its staleness checks are
 # skipped; only an explicit boolean false counts.
@@ -485,7 +509,8 @@ if not reported and g.get("paired") and g.get("connected") and isinstance(v2i, d
         out.append("ALERT|silence_check|watchdog could not read the v2 inbox: %s" % str(e)[:60].replace("\"", ""))
     if v and v[0]:
         silent_alerts.append("ALERT|silent_google|%s" % silent_msg("google", v[1], v[2], " (watchdog estimate)"))
-silent_alerts, out = [line(l) for l in silent_alerts], [line(l) for l in out]
+# The logout line goes first, then the silence alerts.
+silent_alerts, out = [line(l) for l in relink + silent_alerts], [line(l) for l in out]
 print("\n".join(silent_alerts + out))
 ')
 py_rc=$?
@@ -501,6 +526,8 @@ fi
 
 alerts=()
 unlinked=""
+relink_name=""   # the platform the daemon says was logged out (needs_relink)
+loggedout=""     # its banner text, when this run announces it
 disc_seen=" "
 repair_seen=0
 append_seen=0
@@ -540,14 +567,55 @@ while IFS= read -r line; do
         health_alerts+=("Google needs repair since $(date -r "$since" '+%Y-%m-%d %H:%M') ($c checks in a row)")
       fi
       [ "$c" -eq 3 ] && alerts+=("Google needs repair 15+ min - cookie self-heal is not recovering it") ;;
+    RELINK\|*)
+      # WhatsApp logged this install's device out (openmessage PR #232).
+      # health.txt lists it on every run that reads the status. The banner
+      # goes out once per logout episode, which relink_since_ms names, ahead
+      # of the run's other alerts like a lost pairing, and shares that 6 h
+      # stamp. It does not repeat while the logout stands (the runbook's
+      # "How alerts repeat" says why). Inside the cooldown it waits and the
+      # next run tries again, so an episode is never recorded without its
+      # banner.
+      rest=${line#RELINK|}
+      name=${rest%%|*}
+      rest=${rest#*|}
+      since=${rest%%|*}
+      reason=${rest#*|}
+      case "$since" in ''|*[!0-9]*|0?*|????????????*) since=0 ;; esac   # 0: unknown
+      relink_name=$name
+      text="$name logged out"
+      if [ "$since" -gt 0 ]; then
+        text="$text since $(date -r "$since" '+%Y-%m-%d %H:%M')"
+        health_keys+=("relink_since_$name=$since")
+      fi
+      text="$text${reason:+ ($reason)} - relink: Platforms -> Connect WhatsApp"
+      health_alerts+=("$text")
+      [ "$(head -c 32 "$STATE_DIR/relink_episode_$name" 2>/dev/null)" = "$since" ] && continue
+      last=$(read_state "$STATE_DIR/alert_unlinked_$name" epoch)
+      if [ $(( NOW - last )) -lt "$ALERT_COOLDOWN" ]; then
+        log "suppressed (cooldown): unlinked_$name"
+        continue
+      fi
+      echo "$NOW" > "$STATE_DIR/alert_unlinked_$name"
+      echo "$since" > "$STATE_DIR/relink_episode_$name"
+      loggedout=$text ;;
     PAIRED\|*|UNPAIRED\|*)
       name=${line#*|}
       paired=1; [ "${line%%|*}" = "UNPAIRED" ] && paired=0
       [ "$paired" = "0" ] && health_notes+=("$name unpaired - its staleness checks are paused")
+      # Logged out this run? An encoded name can be empty, so not by string alone.
+      is_out=0; [ -n "$relink_name" ] && [ "$name" = "$relink_name" ] && is_out=1
+      # A link the daemon accepts again ends the logout episode announced.
+      [ "$paired" = "1" ] && [ "$is_out" = 0 ] && [ -e "$STATE_DIR/relink_episode_$name" ] \
+        && rm -f "$STATE_DIR/relink_episode_$name"
       was=$(cat "$STATE_DIR/paired_$name" 2>/dev/null)
       [ "$was" = "$paired" ] && continue
       if [ "$paired" = "1" ]; then
         [ "$was" = "0" ] && log "paired again: $name - staleness alerts resume"
+      elif [ "$is_out" = 1 ]; then
+        # The logout has its own banner (RELINK above), so the loss is
+        # recorded now, whatever that banner's cooldown says.
+        log "unpaired: $name - logged out by WhatsApp; staleness alerts paused until it is relinked"
       elif [ "$was" = "1" ]; then
         # Inside the cooldown the stored state stays paired, so the next run
         # tries again: a loss is never recorded without its banner.
@@ -633,7 +701,7 @@ while IFS= read -r line; do
           x=""
           [ "$carry" -gt 0 ] && x=", $carry from before a restart"
           log "suppressed (cooldown): append_errors ($errs, last alert reported $alerted$x)"
-        elif [ "${#alerts[@]}" -gt 0 ] || [ -n "${unlinked:-}" ]; then
+        elif [ "${#alerts[@]}" -gt 0 ] || [ -n "${unlinked:-}${loggedout:-}" ]; then
           # The banner shows only the first alert, and this one does not
           # repeat for a flat count: wait for a run where it leads.
           log "deferred: append_errors - another alert leads this run's notification"
@@ -691,9 +759,14 @@ if [ "$checked" = 1 ]; then
     rm -f "$STATE_DIR/repair_since_google"
   fi
 fi
-# A lost pairing goes first: only the first alert reaches the banner, and this
-# one is not repeated.
-[ -n "$unlinked" ] && alerts=("No longer paired: ${unlinked#, } - check the app; relink unless that was intended" ${alerts[@]+"${alerts[@]}"})
+# A logout and the run's lost pairings go first, as one alert: only the first
+# alert reaches the banner, and these are not repeated.
+lead=$loggedout
+if [ -n "$unlinked" ]; then
+  lost="paired: ${unlinked#, } - check the app; relink unless that was intended"
+  if [ -n "$lead" ]; then lead="$lead; also no longer $lost"; else lead="No longer $lost"; fi
+fi
+[ -n "$lead" ] && alerts=("$lead" ${alerts[@]+"${alerts[@]}"})
 
 if [ "${#alerts[@]}" -gt 0 ]; then
   extra=""
