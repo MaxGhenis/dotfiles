@@ -1,5 +1,5 @@
-# === Secrets (macOS Keychain, service="claude-env") ===
-# Manage with: ~/.claude/manage-secret.sh {set|get|del|list}
+# === Secrets (agent-secret keychain; exports only the load-secrets.sh allowlist) ===
+# Manage with: agent-secret {list|search|get|set|delete} (or ~/.claude/manage-secret.sh)
 source ~/.claude/load-secrets.sh
 
 # === History ===
