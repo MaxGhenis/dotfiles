@@ -17,6 +17,12 @@
 #   - Probe /api/status. Dead + no app process: relaunch after 2 consecutive
 #     failed probes. Dead + app process present (hung): quit + relaunch after 3.
 #   - At most one relaunch action per 30 minutes.
+#   - The probe sends the daemon's control token (control.token in the app's
+#     data dir) as a Bearer header read from stdin, never on curl's command
+#     line, where other users' `ps` could read it. The daemon refuses /api/
+#     without it (401, since openmessage#261). A 401 means the daemon answers:
+#     no relaunch; health.txt names the token problem, a banner says it once
+#     per 6h, and the class-B checks wait for a readable status.
 # Class-B checks (each 5-min run while the daemon responds):
 #   - platform paired but disconnected 3 consecutive checks (~15 min sustained;
 #     ignores sub-minute Google heal-cycle dips)     → notify once per episode
@@ -120,6 +126,8 @@
 #
 # Env overrides (testing; tests/test_openmessage_watchdog.py):
 #   OPENMESSAGE_WATCHDOG_PORT   daemon port (default 7007)
+#   OPENMESSAGE_WATCHDOG_TOKEN_FILE  the daemon's control token (default
+#                               $HOME/Library/Application Support/OpenMessage/control.token)
 #   OPENMESSAGE_WATCHDOG_APP    app bundle that must exist (default
 #                               /Applications/OpenMessage.app); the relaunch
 #                               still opens the app by name
@@ -133,6 +141,7 @@
 
 set -u
 PORT="${OPENMESSAGE_WATCHDOG_PORT:-7007}"
+TOKEN_FILE="${OPENMESSAGE_WATCHDOG_TOKEN_FILE:-$HOME/Library/Application Support/OpenMessage/control.token}"
 DRYRUN="${OPENMESSAGE_WATCHDOG_DRYRUN:-0}"
 APP="${OPENMESSAGE_WATCHDOG_APP:-/Applications/OpenMessage.app}"
 FLAG="$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
@@ -249,7 +258,42 @@ pgrep -f '(^|/)openmessage[ ]pair( |$)' >/dev/null 2>&1 && {
   exit 0
 }
 
-STATUS_JSON=$(curl -s -m 5 "http://127.0.0.1:$PORT/api/status" 2>/dev/null)
+# The token rides in on stdin (curl -H @-): printf is a builtin, so it never
+# reaches a command line. Without a readable token the probe goes out bare;
+# a daemon from before enforcement still answers it.
+token=$(head -c 256 "$TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')
+case "$token" in *[!0-9a-fA-F]*) token="" ;; esac
+PROBE=$(printf '%s\n' ${token:+"Authorization: Bearer $token"} \
+  | curl -s -m 5 -H @- -w '\n%{http_code}' "http://127.0.0.1:$PORT/api/status" 2>/dev/null)
+HTTP_CODE=${PROBE##*$'\n'}
+STATUS_JSON=${PROBE%$'\n'*}
+[ "$PROBE" = "$HTTP_CODE" ] && STATUS_JSON=""
+
+# ---------- The daemon answers but refuses the token ----------
+if [ "$HTTP_CODE" = 401 ]; then
+  prev_fails=$(read_state "$FAILS_F")
+  [ "$prev_fails" -ne 0 ] && log "answering again (was $prev_fails fails)"
+  echo 0 > "$FAILS_F"
+  rm -f "$DOWN_SINCE_F"
+  why="no readable control token at $TOKEN_FILE"
+  [ -n "$token" ] && why="the control token at $TOKEN_FILE was refused"
+  log "probe refused (401): $why"
+  H_DAEMON=up H_DAEMON_DETAIL="answered /api/status with 401: $why"
+  msg="Watchdog can't read OpenMessage status: $why - platform checks are paused"
+  health_alerts+=("$msg")
+  last=$(read_state "$STATE_DIR/alert_status_unauthorized" epoch)
+  H_WATCHDOG=active H_WATCHDOG_DETAIL="no banner this run"
+  if [ $(( NOW - last )) -ge "$ALERT_COOLDOWN" ]; then
+    echo "$NOW" > "$STATE_DIR/alert_status_unauthorized"
+    log "ALERT: $msg"
+    notify "$msg"
+    H_WATCHDOG_DETAIL="banner: $msg"
+    [ "$DRYRUN" = "1" ] && H_WATCHDOG_DETAIL="would banner: $msg"
+  else
+    log "suppressed (cooldown): status_unauthorized"
+  fi
+  exit 0
+fi
 
 # ---------- Class A: daemon dead or hung → relaunch ----------
 if ! echo "$STATUS_JSON" | grep -q '"connected"'; then
