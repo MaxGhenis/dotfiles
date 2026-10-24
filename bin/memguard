@@ -10,9 +10,18 @@ and when the box goes critical it SIGTERMs the largest python-family process
 A dead sim beats a dead machine.
 
 Policy (deliberately narrow):
-  - Auto-kill targets: processes owned by $USER whose command contains
-    "python", RSS >= 20GB. Nothing else is ever signaled — a giant Chrome or
+  - Auto-kill targets: processes owned by this uid whose argv[0] or
+    executable name contains "python", physical footprint >= 20GB, largest
+    footprint first. Nothing else is ever signaled — a giant Chrome or
     Claude process only triggers a notification.
+  - Size is the physical footprint (resident + compressed pages, what `top`
+    shows as MEM), read in-process with proc_pid_rusage. Not RSS: RSS leaves
+    out compressed pages. On 2026-10-01 a us_bench.py held a 114GB footprint
+    (112GB compressed) at 7.4GB RSS and an impact.py 87GB at 0.6GB; all 70
+    actions logged from 2026-09-09 to 2026-10-02 were "no-candidate".
+    Enumeration no longer runs `ps -axo ...,args=`, which hit its 10s timeout
+    on 3 critical ticks and crashed them; uid and argv are now read only for
+    the few processes over the floor.
   - Critical = kernel pressure level >= 4, OR reclaimable-aware free
     (memory_pressure -Q) <= 8%, OR swap-backed thrash (free% <= 20 and
     swap > 4GB and raw free < 1.5GB) — sustained for 2 consecutive ticks.
@@ -29,25 +38,30 @@ Files:
   ~/Library/Logs/memguard-kills.log  JSON lines, one per signal sent, with argv
   ~/.local/state/memguard/           strike counter / last-action / rate limits
 
-Usage: memguard tick [--dry-run] | status | test
+Usage: memguard tick [--dry-run] | status | test [--dry-run]
+  (test --dry-run skips the one check that sends a real signal, to a child
+  the test itself spawned)
 """
 
+import ctypes
+import ctypes.util
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 HOME = os.path.expanduser("~")
-USER = os.environ.get("USER", "maxghenis")
+UID = os.getuid()
 STATE_DIR = os.path.join(HOME, ".local", "state", "memguard")
 LOG = os.path.join(HOME, "Library", "Logs", "memguard.log")
 KILL_LOG = os.path.join(HOME, "Library", "Logs", "memguard-kills.log")
 
 GB = 1024 ** 3
-MIN_TARGET_RSS = 20 * GB          # never signal anything smaller
+MIN_TARGET_FOOTPRINT = 20 * GB    # never signal anything smaller
 FREE_PCT_CRIT = 8                 # memory_pressure -Q free percentage
 FREE_PCT_WARN = 15
 THRASH_FREE_PCT = 20              # swap-thrash clause gates
@@ -154,50 +168,186 @@ def swap_used_gb():
         return -1.0
 
 
-def ps_rows():
-    out = subprocess.run(
-        ["/bin/ps", "-axo", "pid=,user=,rss=,comm=,args="],
-        capture_output=True, text=True, timeout=10)
-    return out.stdout.splitlines()
+# --- processes (libproc via ctypes: no subprocess on the kill path) ------
+
+RUSAGE_INFO_V2 = 2                # <sys/resource.h>
+PROC_PIDTBSDINFO = 3              # <sys/proc_info.h>
+CTL_KERN, KERN_ARGMAX, KERN_PROCARGS2 = 1, 8, 49   # <sys/sysctl.h>
 
 
-def parse_ps(lines):
-    """Yield dicts from `ps -axo pid=,user=,rss=,comm=,args=` lines."""
+class RusageInfoV2(ctypes.Structure):
+    """struct rusage_info_v2 from <sys/resource.h> (160 bytes)."""
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64) for name in (
+            "ri_user_time", "ri_system_time", "ri_pkg_idle_wkups",
+            "ri_interrupt_wkups", "ri_pageins", "ri_wired_size",
+            "ri_resident_size", "ri_phys_footprint", "ri_proc_start_abstime",
+            "ri_proc_exit_abstime", "ri_child_user_time",
+            "ri_child_system_time", "ri_child_pkg_idle_wkups",
+            "ri_child_interrupt_wkups", "ri_child_pageins",
+            "ri_child_elapsed_abstime", "ri_diskio_bytesread",
+            "ri_diskio_byteswritten")]
+
+
+class ProcBsdInfo(ctypes.Structure):
+    """struct proc_bsdinfo from <sys/proc_info.h> (136 bytes)."""
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "pbi_flags", "pbi_status", "pbi_xstatus", "pbi_pid", "pbi_ppid",
+        "pbi_uid", "pbi_gid", "pbi_ruid", "pbi_rgid", "pbi_svuid",
+        "pbi_svgid", "rfu_1")] + [
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32)] + [
+        (name, ctypes.c_uint32) for name in (
+            "pbi_nfiles", "pbi_pgid", "pbi_pjobc", "e_tdev", "e_tpgid")] + [
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64)]
+
+
+def _load_libc():
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib",
+                           use_errno=True)
+        libc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        libc.proc_listallpids.restype = ctypes.c_int
+        libc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_void_p]
+        libc.proc_pid_rusage.restype = ctypes.c_int
+        libc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_uint64, ctypes.c_void_p,
+                                      ctypes.c_int]
+        libc.proc_pidinfo.restype = ctypes.c_int
+        libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+                                ctypes.c_void_p,
+                                ctypes.POINTER(ctypes.c_size_t),
+                                ctypes.c_void_p, ctypes.c_size_t]
+        libc.sysctl.restype = ctypes.c_int
+        return libc
+    except (OSError, AttributeError):  # not macOS
+        return None
+
+
+LIBC = _load_libc()
+
+
+def list_pids():
+    """Every pid on the box (proc_listallpids returns a count, not bytes)."""
+    n = LIBC.proc_listallpids(None, 0)
+    if n <= 0:
+        return []
+    buf = (ctypes.c_int * (n + 512))()   # headroom for pids born meanwhile
+    got = LIBC.proc_listallpids(buf, ctypes.sizeof(buf))
+    return [p for p in buf[:max(got, 0)] if p > 0]
+
+
+def proc_usage(pid):
+    """(phys_footprint, resident_size) in bytes, or None.
+
+    None when the pid is gone or not ours: without root, proc_pid_rusage
+    fails with EPERM on other users' processes.
+    """
+    info = RusageInfoV2()
+    if LIBC.proc_pid_rusage(pid, RUSAGE_INFO_V2, ctypes.byref(info)) != 0:
+        return None
+    return info.ri_phys_footprint, info.ri_resident_size
+
+
+def proc_uid(pid):
+    info = ProcBsdInfo()
+    n = LIBC.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, ctypes.byref(info),
+                          ctypes.sizeof(info))
+    return info.pbi_uid if n == ctypes.sizeof(info) else None
+
+
+def _argmax():
+    value, size = ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+    mib = (ctypes.c_int * 2)(CTL_KERN, KERN_ARGMAX)
+    if LIBC.sysctl(mib, 2, ctypes.byref(value), ctypes.byref(size),
+                   None, 0) != 0 or value.value <= 0:
+        return 1024 * 1024
+    return value.value
+
+
+def parse_procargs2(raw):
+    """(exec_path, argv) from a KERN_PROCARGS2 buffer, or None.
+
+    Layout: int argc, the exec path, NUL padding, then argc NUL-terminated
+    argv strings (the environment follows; it is never read).
+    """
+    if len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    exe, _, rest = raw[4:].partition(b"\0")
+    argv = rest.lstrip(b"\0").split(b"\0")[:argc]
+    return (exe.decode("utf-8", "replace"),
+            [a.decode("utf-8", "replace") for a in argv])
+
+
+def proc_argv(pid):
+    size = ctypes.c_size_t(_argmax())
+    buf = ctypes.create_string_buffer(size.value)
+    mib = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, pid)
+    if LIBC.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+        return None
+    return parse_procargs2(buf.raw[:size.value])
+
+
+def big_processes(min_footprint=MIN_TARGET_FOOTPRINT, pids=None,
+                  usage=proc_usage, uid_of=proc_uid, argv_of=proc_argv,
+                  uid=UID):
+    """Rows for readable processes whose footprint is at least min_footprint.
+
+    One proc_pid_rusage per pid; the uid is read only for processes over the
+    floor, and argv only for those owned by uid. Readers are parameters so
+    tests can feed recorded profiles.
+    """
     rows = []
-    for line in lines:
-        parts = line.split(None, 3)
-        if len(parts) < 4:
+    for pid in list_pids() if pids is None else pids:
+        sizes = usage(pid)
+        if sizes is None or sizes[0] < min_footprint:
             continue
-        pid_s, user, rss_kb_s, rest = parts
-        try:
-            pid, rss = int(pid_s), int(rss_kb_s) * 1024
-        except ValueError:
+        owner = uid_of(pid)
+        if owner is None:
             continue
-        # comm may contain spaces; args echoes comm as its first token(s).
-        # Splitting rest on comm is unreliable, so keep rest as comm+args.
-        rows.append({"pid": pid, "user": user, "rss": rss, "cmd": rest})
+        exe, argv = (argv_of(pid) if owner == uid else None) or ("", [])
+        rows.append({"pid": pid, "uid": owner, "footprint": sizes[0],
+                     "rss": sizes[1], "exe": exe, "argv": argv,
+                     "cmd": " ".join(argv) or exe or "(argv unreadable)"})
     return rows
 
 
-def pick_target(rows, min_rss=MIN_TARGET_RSS, user=USER):
-    """Largest python-family process owned by user at/above the RSS floor.
+def _names(row):
+    """Lowercased basenames of argv[0] and the executable path."""
+    first = row["argv"][0] if row["argv"] else ""
+    return [os.path.basename(n).lower() for n in (first, row["exe"]) if n]
+
+
+def is_denied(row):
+    return any(n.startswith(p) for n in _names(row) for p in DENY_PREFIXES)
+
+
+def is_python(row):
+    return any("python" in n for n in _names(row))
+
+
+def pick_target(rows, min_footprint=MIN_TARGET_FOOTPRINT, uid=UID):
+    """Largest python-family process owned by uid at/above the footprint floor.
 
     Returns (target, giants): giants = non-python processes over the floor,
-    reported but never signaled.
+    largest first, reported but never signaled.
     """
     target, giants = None, []
     me = os.getpid()
     for r in rows:
-        if r["user"] != user or r["rss"] < min_rss or r["pid"] in (me, 1):
+        if (r["uid"] != uid or r["footprint"] < min_footprint
+                or r["pid"] in (me, 1) or is_denied(r)):
             continue
-        base = os.path.basename(r["cmd"].split()[0]).lower()
-        if any(base.startswith(p) for p in DENY_PREFIXES):
-            continue
-        if "python" in r["cmd"].split()[0].lower() or base.startswith("python"):
-            if target is None or r["rss"] > target["rss"]:
+        if is_python(r):
+            if target is None or r["footprint"] > target["footprint"]:
                 target = r
         else:
             giants.append(r)
+    giants.sort(key=lambda r: r["footprint"], reverse=True)
     return target, giants
 
 
@@ -221,8 +371,9 @@ def log_kill(entry):
         f.write(json.dumps(entry) + "\n")
 
 
-def send_signal(pid, sig, rss, cmd, dry=False):
+def send_signal(pid, sig, cmd, footprint=0, rss=0, dry=False):
     entry = {"ts": now_iso(), "pid": pid, "sig": sig,
+             "footprint_gb": round(footprint / GB, 2),
              "rss_gb": round(rss / GB, 2), "cmd": cmd, "dry_run": dry}
     if not dry:
         try:
@@ -287,31 +438,40 @@ def tick(dry=False):
     action = ""
     target, giants = (None, [])
     if critical and strikes >= STRIKES_TO_ACT:
-        target, giants = pick_target(parse_ps(ps_rows()))
+        lookup_error = None
+        try:
+            target, giants = pick_target(big_processes())
+        except Exception as exc:  # a reader bug must not cost the log line
+            lookup_error = "target-error:" + type(exc).__name__
         last = read_state("last_action.json", {})
         age = time.time() - last.get("ts", 0)
         if (last.get("sig") == "SIGTERM" and pid_alive(last.get("pid", -1))
                 and ESCALATE_AFTER_S <= age <= 300):
-            e = send_signal(last["pid"], "SIGKILL", 0, "(escalation)", dry)
+            send_signal(last["pid"], "SIGKILL", "(escalation)", dry=dry)
             action = "SIGKILL:{}".format(last["pid"])
             notify("Escalated to SIGKILL pid {} — memory still critical"
                    .format(last["pid"]), dry)
         elif target and (not last or age >= KILL_COOLDOWN_S):
-            send_signal(target["pid"], "SIGTERM", target["rss"],
-                        target["cmd"], dry)
+            send_signal(target["pid"], "SIGTERM", target["cmd"],
+                        target["footprint"], target["rss"], dry)
             action = "SIGTERM:{}".format(target["pid"])
             notify("Memory critical (free {:.1f}GB): SIGTERM pid {} "
-                   "({:.0f}GB python). argv in memguard-kills.log".format(
-                       free / GB, target["pid"], target["rss"] / GB), dry)
+                   "({:.0f}GB python footprint). argv in memguard-kills.log"
+                   .format(free / GB, target["pid"],
+                           target["footprint"] / GB), dry)
         elif not target:
-            action = "no-candidate"
+            action = lookup_error or "no-candidate"
             if not dry and not rate_limited("nocand.json",
                                             NOCAND_NOTIFY_EVERY_S):
-                extra = ("; biggest non-python: pid {} {:.0f}GB".format(
-                    giants[0]["pid"], giants[0]["rss"] / GB)
-                    if giants else "")
-                notify("Memory CRITICAL but no python >=20GB to kill"
-                       + extra)
+                if lookup_error:
+                    notify("Memory CRITICAL but the process lookup failed ("
+                           + lookup_error + ")")
+                else:
+                    extra = ("; biggest non-python: pid {} {:.0f}GB".format(
+                        giants[0]["pid"], giants[0]["footprint"] / GB)
+                        if giants else "")
+                    notify("Memory CRITICAL but no python >=20GB to kill"
+                           + extra)
     elif warn and not dry and not rate_limited("warn.json",
                                                WARN_NOTIFY_EVERY_S):
         notify("Memory pressure warning: level {}, free {:.1f}GB"
@@ -329,6 +489,11 @@ def tick(dry=False):
     return line
 
 
+def describe(row):
+    return "pid {} footprint {:.1f}GB rss {:.1f}GB {}".format(
+        row["pid"], row["footprint"] / GB, row["rss"] / GB, row["cmd"][:120])
+
+
 def status():
     print("state dir:", STATE_DIR)
     for name in ("strikes.json", "last_action.json"):
@@ -336,12 +501,19 @@ def status():
     try:
         with open(LOG) as f:
             lines = f.readlines()
-        print("last 5 ticks (ts,level,free_gb,comp_gb,swap_gb,strikes,"
-              "crit,warn,action):")
+        print("last 5 ticks (ts,level,free_pct,free_gb,comp_gb,swap_gb,"
+              "strikes,crit,warn,action):")
         for line in lines[-5:]:
             print(" ", line.rstrip())
     except OSError:
         print("no tick log yet at", LOG)
+    # Read-only: what a critical tick would pick right now.
+    target, giants = pick_target(big_processes())
+    print("would target:", describe(target) if target else
+          "nothing (no owned python at or above {:.0f}GB footprint)".format(
+              MIN_TARGET_FOOTPRINT / GB))
+    for g in giants[:3]:
+        print("  never signaled:", describe(g))
     if os.path.exists(KILL_LOG):
         with open(KILL_LOG) as f:
             kills = f.readlines()
@@ -352,7 +524,31 @@ def status():
 
 # --- self-tests ---------------------------------------------------------
 
-def test():
+def test(live_signal=True):
+    """Run the self-tests against a throwaway state dir and logs.
+
+    The real last_action.json drives the daemon's SIGKILL escalation, so the
+    live-signal check must never write there.
+    """
+    global STATE_DIR, LOG, KILL_LOG
+    saved = STATE_DIR, LOG, KILL_LOG
+    with tempfile.TemporaryDirectory() as tmp:
+        STATE_DIR = os.path.join(tmp, "state")
+        LOG = os.path.join(tmp, "memguard.log")
+        KILL_LOG = os.path.join(tmp, "memguard-kills.log")
+        try:
+            return _self_test(live_signal)
+        finally:
+            STATE_DIR, LOG, KILL_LOG = saved
+
+
+def _row(pid, footprint_gb, rss_gb, argv, uid=UID, exe=""):
+    return {"pid": pid, "uid": uid, "footprint": int(footprint_gb * GB),
+            "rss": int(rss_gb * GB), "exe": exe or argv[0], "argv": argv,
+            "cmd": " ".join(argv)}
+
+
+def _self_test(live_signal):
     failures = []
     total = [0]
 
@@ -362,20 +558,82 @@ def test():
         if not cond:
             failures.append(name)
 
-    rows = parse_ps([
-        "  101 maxghenis  31457280 /opt/python3.14 /opt/python3.14 sim.py --big",
-        "  102 maxghenis  52428800 /usr/bin/python3.13 /usr/bin/python3.13 dense.py",
-        "  103 maxghenis  62914560 /Applications/Claude.app/Contents/MacOS/Claude /Applications/Claude.app/Contents/MacOS/Claude",
-        "  104 maxghenis  73400320 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome /Applications/Google Chrome.app -flag",
-        "  105 root       94371840 /opt/python3.14 /opt/python3.14 rootsim.py",
-        "  106 maxghenis      1024 /usr/bin/python3 /usr/bin/python3 tiny.py",
-    ])
+    rows = [
+        _row(101, 30, 29, ["/opt/python3.14", "sim.py", "--big"]),
+        _row(102, 50, 49, ["/usr/bin/python3.13", "dense.py"]),
+        _row(103, 60, 59, ["/Applications/Claude.app/Contents/MacOS/Claude"]),
+        _row(104, 70, 69, ["/Applications/Google Chrome.app/Contents/MacOS/"
+                           "Google Chrome", "-flag"]),
+        _row(105, 90, 89, ["/opt/python3.14", "rootsim.py"], uid=0),
+        _row(106, 0.001, 0.001, ["/usr/bin/python3", "tiny.py"]),
+    ]
     target, giants = pick_target(rows)
     check("picks largest owned python over floor (pid 102)",
           target is not None and target["pid"] == 102)
-    check("never targets Claude/Chrome", all(g["pid"] == 104 for g in giants))
+    check("never targets Claude/Chrome", [g["pid"] for g in giants] == [104])
     check("ignores root-owned and small pythons",
           target["pid"] not in (105, 106))
+
+    # Pin the 2026-10-01 11:33-11:43 profile (compute-contention sampler:
+    # top MEM and ps RSS in the same sample). Nearly all of it compressed,
+    # so no row clears the floor by RSS; by footprint us_bench.py must.
+    oct1 = [
+        _row(62275, 114, 7613 / 1024, [".venv/bin/python", "us_bench.py",
+                                       "ecps"]),
+        _row(41790, 87, 621 / 1024, [".venv/bin/python", "impact.py"]),
+        _row(62807, 25, 0.8, ["/Users/maxghenis/.bun/bin/bun", "run"]),
+    ]
+    target, giants = pick_target(oct1)
+    check("10/01: us_bench.py (114GB footprint, 7.4GB RSS) is the target",
+          target is not None and target["pid"] == 62275)
+    check("10/01: 25GB non-python is reported, never targeted",
+          [g["pid"] for g in giants] == [62807])
+    check("10/01: nothing clears the floor by RSS alone",
+          all(r["rss"] < MIN_TARGET_FOOTPRINT for r in oct1))
+    target, giants = pick_target(oct1[2:])
+    check("a lone non-python giant yields no target",
+          target is None and len(giants) == 1)
+
+    looked_up = []
+    sizes = {1: (25 * GB, GB), 2: (5 * GB, 5 * GB), 3: (40 * GB, GB),
+             4: None, 5: (30 * GB, GB)}
+    owners = {1: UID, 3: 0, 5: UID}
+    big = big_processes(
+        pids=[1, 2, 3, 4, 5], usage=sizes.get,
+        uid_of=lambda p: looked_up.append(("uid", p)) or owners.get(p),
+        argv_of=lambda p: looked_up.append(("argv", p))
+        or ("/usr/bin/python3", ["python3", "x.py"]))
+    check("big_processes keeps only readable rows over the floor",
+          [r["pid"] for r in big] == [1, 3, 5])
+    check("uid read only over the floor, argv only for our uid",
+          looked_up == [("uid", 1), ("argv", 1), ("uid", 3), ("uid", 5),
+                        ("argv", 5)])
+
+    raw = ((2).to_bytes(4, sys.byteorder) + b"/usr/bin/python3\0\0\0\0"
+           + b"python3\0x.py\0HOME=/secret\0")
+    check("KERN_PROCARGS2 parse stops before the environment",
+          parse_procargs2(raw) == ("/usr/bin/python3", ["python3", "x.py"]))
+
+    # Live readers, no signals: a child holding 128MB exits when its stdin
+    # closes.
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys\nb = bytearray(128 << 20)\n"
+         "for i in range(0, len(b), 4096): b[i] = 1\n"
+         "print('ready', flush=True)\nsys.stdin.read()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        child.stdout.readline()
+        rows = big_processes(min_footprint=100 << 20, pids=[child.pid])
+        row = rows[0] if rows else None
+        check("live footprint of a 128MB child reads 128-192MB",
+              row is not None
+              and (128 << 20) <= row["footprint"] <= (192 << 20))
+        check("live uid and argv of the child",
+              row is not None and row["uid"] == UID and "-c" in row["argv"]
+              and is_python(row))
+    finally:
+        child.stdin.close()
+        child.wait(timeout=10)
 
     vm = parse_vm_stat("Mach Virtual Memory Statistics: (page size of 16384 "
                        "bytes)\nPages free: 100000.\n"
@@ -397,15 +655,19 @@ def test():
     c, w = classify(1, 12, 30 * GB, 0.0)
     check("free% 12 warns without killing", (not c) and w)
 
-    child = subprocess.Popen([sys.executable, "-c",
-                              "import time; time.sleep(60)"])
-    send_signal(child.pid, "SIGTERM", 0, "(self-test child)", dry=False)
-    try:
-        rc = child.wait(timeout=5)
-        check("live SIGTERM path terminates child", rc == -signal.SIGTERM)
-    except subprocess.TimeoutExpired:
-        child.kill()
-        check("live SIGTERM path terminates child", False)
+    if live_signal:
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import time; time.sleep(60)"])
+        send_signal(child.pid, "SIGTERM", "(self-test child)")
+        try:
+            rc = child.wait(timeout=5)
+            check("live SIGTERM path terminates child",
+                  rc == -signal.SIGTERM)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            check("live SIGTERM path terminates child", False)
+    else:
+        print("SKIP live SIGTERM path (--dry-run)")
 
     dry_line = tick(dry=True)
     check("dry tick produces csv", dry_line.count(",") == 9)
@@ -428,7 +690,7 @@ def main():
         status()
         return 0
     if cmd == "test":
-        return test()
+        return test(live_signal="--dry-run" not in args)
     print("unknown command:", cmd, file=sys.stderr)
     return 2
 
