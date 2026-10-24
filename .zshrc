@@ -33,21 +33,21 @@ source <(fzf --zsh)
 # === Claude Code ===
 unset CLAUDE_CODE_TASK_LIST_ID  # Per-session tasks only; no shared task list
 
-# === tmux ===
-# Skip auto-attach in VS Code terminals
-if [[ -z "$TMUX" && -z "$VSCODE_INJECTION" ]]; then
-  if [[ -n "$SSH_CONNECTION" ]]; then
-    # Remote: grouped session with its own window
-    # Guard: skip during tmux-resurrect restore to prevent pane explosion
-    # (restored panes spawn zsh → zsh creates grouped sessions → more panes)
-    if [[ -z "$(tmux show-environment -g TMUX_RESTORING 2>/dev/null | grep -v '^-')" ]]; then
-      tmux new-session -A -t c -s "remote-$$" \; new-window -n remote 2>/dev/null || tmux new -s c
-    fi
-  else
-    # Local: attach to main session
-    tmux attach -t c 2>/dev/null || tmux new -s c
-  fi
-fi
+# === tmux === (RETIRED 2026-08-06 — Max works in the Claude app now; auto-attach
+# disabled when the 255-window corpse farm was cleaned up. Uncomment to revive.)
+# if [[ -z "$TMUX" && -z "$VSCODE_INJECTION" ]]; then
+#   if [[ -n "$SSH_CONNECTION" ]]; then
+#     # Remote: grouped session with its own window
+#     # Guard: skip during tmux-resurrect restore to prevent pane explosion
+#     # (restored panes spawn zsh → zsh creates grouped sessions → more panes)
+#     if [[ -z "$(tmux show-environment -g TMUX_RESTORING 2>/dev/null | grep -v '^-')" ]]; then
+#       tmux new-session -A -t c -s "remote-$$" \; new-window -n remote 2>/dev/null || tmux new -s c
+#     fi
+#   else
+#     # Local: attach to main session
+#     tmux attach -t c 2>/dev/null || tmux new -s c
+#   fi
+# fi
 
 # uv: use committed lockfile as-is; `uv sync` never regenerates it.
 # Prevents spurious uv.lock drift in fresh worktrees when local dep

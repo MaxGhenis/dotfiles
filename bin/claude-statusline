@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Claude Code status line: model · 5h% · wk% · dir.
+
+Claude Code pipes a JSON blob to the statusLine command on every render
+(https://code.claude.com/docs/en/statusline) and shows whatever the command
+prints. This prints one line built from four fields:
+
+    Fable 5.1 · 5h 12% · wk 40% · chief-of-staff
+
+    model.display_name                       -> "Fable 5.1"
+    rate_limits.five_hour.used_percentage    -> "5h 12%"
+    rate_limits.seven_day.used_percentage    -> "wk 40%"
+    workspace.current_dir (else cwd)         -> its basename
+
+A missing field is left out; unparseable stdin prints "·". stdin is decoded as
+JSON bytes (BOM and UTF-16 detected, locale ignored), stdout is always UTF-8,
+and control characters in a name become spaces so the line stays one row and
+carries no terminal escapes.
+
+Render-only, on purpose. Its predecessor, subfleet v1's bin/subfleet-statusline,
+also teed rate_limits into ~/chief-of-staff/state/subfleet as a usage "tap"
+plus a liveness breadcrumb. subfleet v2 dropped that sensor (plan B "What gets
+dropped"; invariant 143: the tap is never treated as a current reading) and
+nothing reads those files any more, so this script writes nothing: no state
+file, no history, no breadcrumb. tests/test_claude_statusline.py in this repo
+pins that with an audit hook and an AST guard.
+
+It runs on every render, so it is stdlib-only, fast, and never raises: any
+failure still prints a line and exits 0.
+"""
+
+import json
+import math
+import os
+import sys
+
+SEP = " · "
+
+
+def _percentage(value):
+    """A finite number, or None. bool is an int subclass and is not a percentage."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _used_percentage(rate_limits, window):
+    limits = rate_limits.get(window) if isinstance(rate_limits, dict) else None
+    return _percentage(limits.get("used_percentage")) if isinstance(limits, dict) else None
+
+
+def _one_line(text):
+    """C0/C1 control characters (newline, CR, ESC, tab, ...) become spaces."""
+    return "".join(" " if ord(c) < 32 or 127 <= ord(c) < 160 else c for c in text)
+
+
+def render(data):
+    """The status line for one statusLine payload (any JSON value is tolerated)."""
+    if not isinstance(data, dict):
+        data = {}
+    parts = []
+
+    model = data.get("model")
+    name = model.get("display_name") if isinstance(model, dict) else None
+    if isinstance(name, str) and name:
+        parts.append(name)
+
+    rate_limits = data.get("rate_limits")
+    five_hour = _used_percentage(rate_limits, "five_hour")
+    seven_day = _used_percentage(rate_limits, "seven_day")
+    if five_hour is not None:
+        parts.append(f"5h {round(five_hour)}%")
+    if seven_day is not None:
+        parts.append(f"wk {round(seven_day)}%")
+
+    workspace = data.get("workspace")
+    cwd = workspace.get("current_dir") if isinstance(workspace, dict) else None
+    if not (isinstance(cwd, str) and cwd):
+        cwd = data.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        parts.append(os.path.basename(cwd.rstrip("/")) or cwd)
+
+    return _one_line(SEP.join(parts)) if parts else "·"
+
+
+def main():
+    try:
+        data = json.loads(sys.stdin.buffer.read())
+    except Exception:
+        data = {}
+    try:
+        line = render(data)
+    except Exception:
+        line = "·"
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        print(line, flush=True)
+    except Exception:
+        # The reader is gone (EPIPE) or stdout is unusable. Leave now, before
+        # interpreter shutdown retries the flush and prints a traceback.
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    main()
