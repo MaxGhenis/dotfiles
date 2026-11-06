@@ -569,17 +569,120 @@ def test_watch_follows_a_second_switch_during_the_portal_wait(tmp_path):
     assert [r["gateway"] for r in store.load()[0]] == [B["gateway"]]
 
 
-def test_watch_waits_for_a_baseline_network_without_internet_like_a_new_one(tmp_path):
+def test_watch_waits_for_a_baseline_network_without_internet(tmp_path):
     mac = FakeMac([], primary="en0")
     mac.wifi_schedule = [(T0, wifi(online_after=60.0, **C))]
     rc, text, store = watch(mac, tmp_path, baseline=True, max_new=1, minutes=5)
-    assert "baseline: the current Wi-Fi network has no internet yet" in text and rc == 0
-    assert "new network: gateway 172.16.224.1" in text and "online after 60s" in text
+    assert "baseline: the current Wi-Fi network has no internet yet, so netpick waits for it" in text and rc == 0
+    assert "baseline: gateway 172.16.224.1, ip 172.16.225.243, security NONE" in text and "online after 60s" in text
+    assert "new network:" not in text
     assert [r["gateway"] for r in store.load()[0]] == [C["gateway"]]
     mac = FakeMac([], primary="en0")
     mac.wifi_schedule = [(T0, wifi(online_after=1e9, **C))]  # a portal nobody signs in to
     rc, text, store = watch(mac, tmp_path, baseline=True, max_new=1, minutes=1)
     assert "no internet before the 1-minute limit" in text and mac.now <= T0 + 60 and rc == 0
+
+
+@pytest.mark.parametrize("portal", [0.0, 10.0], ids=["already online", "portal opens after 10 s"])
+@pytest.mark.parametrize("options, measured", [(dict(seen=[A["gateway"]], minutes=1), [A]), (dict(max_new=0), [A]),
+                                               (dict(max_new=1), [A, B])],
+                         ids=["--seen the current gateway", "--max 0", "--max 1 and a later switch"])
+def test_a_baseline_keeps_its_meaning_while_it_waits_for_internet(tmp_path, portal, options, measured):
+    """Round-4 review: with a portal, the baseline went down the new-network
+    path, so --seen gave it an API check, --max 0 skipped it, and --max 1 ended
+    the watch with the baseline before B appeared."""
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(online_after=portal, **A)), (T0 + 100, wifi(**B))]
+    rc, text, store = watch(mac, tmp_path, **dict(dict(baseline=True, settle=5, max_new=1, minutes=3), **options))
+    assert rc == 0 and [r["gateway"] for r in store.load()[0]] == [n["gateway"] for n in measured]
+    assert "API check" not in text and "new network: gateway 172.21.112.1" not in text and "skipped" not in text
+
+
+def test_a_baseline_measurement_ends_a_watch_with_nothing_else_to_do(tmp_path):
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(online_after=10.0, **A))]
+    rc, text, store = watch(mac, tmp_path, baseline=True, max_new=0, settle=5, minutes=3)
+    assert rc == 0 and len(store.load()[0]) == 1 and mac.now - T0 < 60
+
+
+@pytest.mark.parametrize("gap, online_after", [(T0 + 8.8, 20.0), (T0 + 10.8, 5.0)],
+                         ids=["during the wait for internet", "while DNS settles"])
+def test_a_drop_keeps_the_baseline_waiting(tmp_path, gap, online_after):
+    """A read takes 1 s, so the next one finds the network back. It's still
+    the baseline: --seen and --max 0 don't apply."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = [(T0, wifi(online_after=online_after, **C)), (gap, None),
+                         (gap + 0.5, wifi(online_after=online_after, **C))]
+    rc, text, store = watch(mac, tmp_path, baseline=True, seen=[C["gateway"]], max_new=0, minutes=5)
+    assert text.count("baseline: gateway 172.16.224.1") == 2 and "back on gateway" not in text
+    assert [r["gateway"] for r in store.load()[0]] == [C["gateway"]]
+
+
+def test_a_drop_as_a_baseline_measurement_starts_keeps_it_waiting(tmp_path):
+    """The captive check passes at T0 + 1. The measurement reads the address at
+    T0 + 2, inside the drop, so it finds no network."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 1.8, None), (T0 + 2.3, wifi(**A))]
+    rc, text, store = watch(mac, tmp_path, baseline=True, max_new=0, settle=5, minutes=5)
+    assert "baseline: measuring the current network" in text and "baseline: gateway 172.21.112.1" in text
+    assert [r["gateway"] for r in store.load()[0]] == [A["gateway"]]
+
+
+@pytest.mark.parametrize("max_new, measured", [(0, []), (1, [B])], ids=["--max 0", "--max 1"])
+def test_a_baseline_ends_when_the_wifi_moves_to_another_network(tmp_path, max_new, measured):
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(online_after=1e9, **A)), (T0 + 20, wifi(**B))]
+    rc, text, store = watch(mac, tmp_path, baseline=True, max_new=max_new, settle=5, minutes=5)
+    assert "the network changed while waiting for internet" in text
+    assert "baseline: the Wi-Fi moved to another network first, so netpick skipped the baseline" in text
+    assert rc == 0 and [r["gateway"] for r in store.load()[0]] == [n["gateway"] for n in measured]
+    assert mac.now - T0 < 60  # netpick has nothing left to wait for
+
+
+def test_a_baseline_that_lapsed_counts_as_a_new_network_on_return(tmp_path):
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(online_after=1e9, **A)), (T0 + 20, wifi(**B)), (T0 + 100, wifi(**A))]
+    rc, text, store = watch(mac, tmp_path, baseline=True, max_new=2, settle=5, minutes=5)
+    assert [r["gateway"] for r in store.load()[0]] == [B["gateway"], A["gateway"]]
+    assert "new network: gateway 172.21.112.1" in text
+
+
+def test_a_baseline_whose_portal_wait_runs_out_ends_a_watch_with_nothing_else_to_do(tmp_path):
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(online_after=1e9, **A))]
+    rc, text, store = watch(mac, tmp_path, baseline=True, max_new=0, portal_wait=60, minutes=5)
+    assert "still no internet after 1 min (no portal sign-in yet?), so netpick skipped it" in text
+    assert rc == 0 and store.load() == ([], 0) and mac.now - T0 == pytest.approx(60)
+
+
+def test_a_baseline_with_no_network_at_the_start_is_skipped(tmp_path):
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, None), (T0 + 20, wifi(**B))]
+    rc, text, store = watch(mac, tmp_path, baseline=True, max_new=0, settle=5, minutes=5)
+    assert "baseline: en0 has no network right now, so netpick skipped it" in text
+    assert rc == 0 and store.load() == ([], 0) and mac.now == T0
+    rc, text, store = watch(mac, tmp_path, baseline=True, max_new=1, settle=5, minutes=5)  # B then counts as new
+    assert "new network: gateway 10.243.10.226" in text and [r["gateway"] for r in store.load()[0]] == [B["gateway"]]
+
+
+@given(max_new=st.integers(0, 3), in_seen=st.booleans(), portal=st.sampled_from([0.0, 20.0]),
+       drop=st.none() | st.floats(0.01, 60))
+def test_a_baseline_on_a_network_i_stay_on_gets_one_measurement(max_new, in_seen, portal, drop):
+    """Invariant: whatever --seen and --max say, however long the portal takes
+    and wherever one short drop lands, a watch that starts on a network and
+    stays there measures it once, and that measurement uses none of --max."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = [(T0, wifi(online_after=portal, **A))]
+    if drop is not None:
+        mac.wifi_schedule += [(T0 + drop, None), (T0 + drop + 0.5, wifi(online_after=portal, **A))]
+    seen = [A["gateway"]] if in_seen else []
+    with tempfile.TemporaryDirectory() as d:
+        rc, text, store = watch(mac, pathlib.Path(d), baseline=True, seen=seen, max_new=max_new, settle=30,
+                                portal_wait=60, minutes=4)
+        assert rc == 0 and [r["gateway"] for r in store.load()[0]] == [A["gateway"]], text
 
 
 def test_watch_starts_no_settle_the_time_limit_would_cut_short(tmp_path):
@@ -766,16 +869,29 @@ def test_no_api_check_starts_at_the_limit(tmp_path):
     assert mac.now == T0 + 60 and all(NP.CAPTIVE_URL in a for a in mac.argvs("curl"))
 
 
-def test_a_switch_as_a_measurement_starts_marks_the_network_measured_as_tested(tmp_path):
-    """watch keys its tested set by the gateway the record measured, so a
-    switch between the settle and the measurement doesn't earn the new network
-    a second full measurement later."""
+def switch_between_the_settle_and_the_measurement():
+    """The settle's last read comes at T0 + 40, and the measurement's at T0 + 41."""
     mac = FakeMac([], primary="en0")
     mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 10, wifi(**B)), (T0 + 40.5, wifi(**C))]
-    mac.cost = lambda a: 1.0 if a[0] == "netstat" else 0.0
+    mac.cost = one_second_gateway_reads
+    return mac
+
+
+def test_a_switch_as_a_measurement_starts_gives_the_new_network_its_settle(tmp_path):
+    """A measurement at once would catch the new network's DNS before it settles."""
+    mac = switch_between_the_settle_and_the_measurement()
     rc, text, store = watch(mac, tmp_path, minutes=5, max_new=2, settle=30)
-    gateways = [r["gateway"] for r in store.load()[0]]
-    assert gateways.count(C["gateway"]) == 1, text
+    assert "the network changed as the measurement started, so netpick skipped it" in text
+    assert "new network: gateway 172.16.224.1" in text
+    assert [r["gateway"] for r in store.load()[0]] == [C["gateway"]]
+    assert min(t for t, gw, argv in mac.calls if argv[0] == "ping") >= T0 + 40.5 + 30
+
+
+def test_a_switch_as_a_measurement_starts_measures_no_seen_gateway(tmp_path):
+    mac = switch_between_the_settle_and_the_measurement()
+    rc, text, store = watch(mac, tmp_path, seen=[C["gateway"]], minutes=5, max_new=2, settle=30)
+    assert store.load() == ([], 0) and not mac.argvs("ping")
+    assert "back on gateway 172.16.224.1" in text and "API check: 4/4" in text
 
 
 # ---------------------------------------------------------------- CLI
@@ -821,6 +937,63 @@ def test_a_drop_from_a_tested_network_gets_a_check_and_no_second_measurement(tmp
     assert "back on gateway 172.16.224.1 (netpick tested it already)" in text and "API check: 4/4" in text
 
 
+@pytest.mark.parametrize("gap, online_after", [(T0 + 16, 0.0), (T0 + 14, 20.0)],
+                         ids=["while DNS settles", "during the wait for internet"])
+def test_a_tested_network_that_drops_for_one_read_still_gets_its_check(tmp_path, gap, online_after):
+    """Round-4 review: the same drop on a --seen gateway left the visit open,
+    so the network came back and stayed, and netpick never checked it."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 10, wifi(online_after=online_after, **C)), (gap, None),
+                         (gap + 0.5, wifi(online_after=online_after, **C))]
+    rc, text, store = watch(mac, tmp_path, seen=[C["gateway"]], settle=30, max_new=1, minutes=5)
+    assert text.count("back on gateway 172.16.224.1") == 2 and text.count("API check: 4/4") == 1
+    assert store.load() == ([], 0)
+
+
+def test_a_tested_network_without_internet_says_why_it_got_no_check(tmp_path):
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 10, wifi(online_after=1e9, **C))]
+    rc, text, store = watch(mac, tmp_path, seen=[C["gateway"]], max_new=1, minutes=5)
+    assert "still no internet after 1 min, so netpick didn't check it" in text and "API check" not in text
+    mac = FakeMac([], primary="en0")  # the wait runs into the limit: its last gateway read comes back empty
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 30, wifi(online_after=1e9, **C))]
+    rc, text, store = watch(mac, tmp_path, seen=[C["gateway"]], max_new=1, minutes=1)
+    assert "back on gateway 172.16.224.1" in text and "still no internet" not in text
+    mac = FakeMac([], primary="en0")  # the limit cuts a slow captive check: no minute has passed
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 58, wifi(**C))]
+    mac.cost = lambda a: 8.0 if a[0] == "curl" and a[-1] == NP.CAPTIVE_URL else 0.0
+    rc, text, store = watch(mac, tmp_path, seen=[C["gateway"]], max_new=1, minutes=1)
+    assert "back on gateway 172.16.224.1" in text and "still no internet" not in text
+
+
+def test_a_drop_while_settling_at_the_limit_keeps_the_current_network_in_the_last_table(tmp_path):
+    """The limit cuts off the settle's last gateway read on a tested network.
+    That read says nothing about the network, so the last table keeps its marker."""
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 5, wifi(**B)), (T0 + 20, wifi(**C)), (T0 + 54, wifi(**B))]
+    mac.cost = lambda argv: 1000.0 if argv[0] == "netstat" and mac.now >= T0 + 59 else 0.0  # only the last read
+    rc, text, store = watch(mac, tmp_path, settle=5, max_new=5, minutes=1, poll=1)
+    assert [r["gateway"] for r in store.load()[0]] == [B["gateway"], C["gateway"]]
+    assert "back on gateway 10.243.10.226" in text
+    tail = text.split(" done: measured 2 network(s)")[1]
+    assert " *" in tail
+
+
+@pytest.mark.parametrize("gap", [T0 + 16.8, T0 + 17.8], ids=["the route read", "the address read"])
+def test_a_drop_as_a_measurement_starts_ends_the_visit(tmp_path, gap):
+    """A settle of 5 s ends with a read at T0 + 14 and one at T0 + 16, so the
+    measurement reads the routes at T0 + 17 and the address at T0 + 18. A drop
+    across the first left a row with no gateway; a drop across the second left
+    the network unmeasured."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 10, wifi(**C)), (gap, None), (gap + 0.5, wifi(**C))]
+    rc, text, store = watch(mac, tmp_path, settle=5, max_new=1, minutes=5)
+    assert text.count("new network: gateway 172.16.224.1") == 2
+    assert [r["gateway"] for r in store.load()[0]] == [C["gateway"]]
+
+
 def test_a_gateway_read_cut_off_at_the_limit_keeps_the_current_network_in_the_last_table(tmp_path):
     mac = FakeMac([], primary="en0")
     mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 10, wifi(**B)), (T0 + 50, wifi(**C))]
@@ -853,6 +1026,30 @@ def test_watch_measures_any_network_i_stay_on_long_enough(visits, stay, portal):
         assert NETWORKS[stay]["gateway"] in [r["gateway"] for r in store.load()[0]], text
 
 
+@given(visits=st.lists(st.tuples(st.sampled_from([None, "A", "B", "C"]), st.floats(0.5, 90)), max_size=8),
+       stay=st.sampled_from(["A", "B", "C"]), portal=st.sampled_from([0.0, 20.0]))
+def test_watch_checks_any_tested_network_i_stay_on_long_enough(visits, stay, portal):
+    """Whatever came before, the last visit to a tested network that I stay on
+    long enough ends with a connection check, and no measurement of it. A drop
+    that falls between two reads ends no visit, so the check can come before it."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    schedule, t = [(T0, wifi(gateway="192.0.2.1", ip="192.0.2.5", security="WPA2_PSK"))], T0 + 3
+    for name, seconds in visits:
+        schedule.append((t, wifi(**NETWORKS[name]) if name else None))
+        t += seconds
+    schedule.append((t, wifi(online_after=portal, **NETWORKS[stay])))
+    mac.wifi_schedule = schedule
+    gateway, lines = NETWORKS[stay]["gateway"], []
+    with tempfile.TemporaryDirectory() as d:
+        store = NP.Store(pathlib.Path(d) / "history.jsonl")
+        rc = NP.watch_loop(make_prober(mac), store, seen=[gateway], settle=30, portal_wait=60, max_new=50,
+                           minutes=(t - T0 + 200) / 60, out=lines.append)
+        assert rc == 0 and gateway not in [r["gateway"] for r in store.load()[0]]
+    visits_to_it = [i for i, s in enumerate(lines) if f"back on gateway {gateway}" in s]
+    assert visits_to_it and any("API check" in s for s in lines[visits_to_it[-1]:]), lines
+
+
 def corrected_prober(mac, correction, at):
     """A Prober on a Mac whose wall clock steps by `correction` seconds at time `at`."""
     return NP.Prober(runner=mac, dns=mac.dns, resolve=mac.resolve, counters=mac.if_counters, sleep=mac.sleep,
@@ -880,7 +1077,7 @@ def test_a_wall_clock_correction_leaves_the_watch_limit_alone(tmp_path, correcti
     lines = []
     rc = NP.watch_loop(corrected_prober(mac, correction, T0 + 10), NP.Store(tmp_path / "history.jsonl"), minutes=1,
                        out=lines.append)
-    assert rc == 0 and mac.now == pytest.approx(T0 + 60) and "no internet before the 1-minute limit" in "\n".join(lines)
+    assert rc == 0 and mac.now - T0 == pytest.approx(60) and "no internet before the 1-minute limit" in "\n".join(lines)
 
 
 def test_a_wall_clock_correction_leaves_a_commands_limit_alone(tmp_path):
@@ -977,6 +1174,34 @@ def test_history_skips_unreadable_lines(tmp_path):
     recs, bad = store.load()
     assert len(recs) == 1 and bad == 3
     assert "(netpick skipped 3 unreadable line(s))" in run_cli(["history"], store=store)[1]
+
+
+@pytest.mark.parametrize("flags, scope", [([], ""), (["--since", "2h"], " within 2h"),
+                                          (["--network", "wpa3"], " for wpa3"), (["--rank"], ""), (["--by-network"], ""),
+                                          (["--network", "wpa3", "--since", "2h"], " for wpa3 within 2h")],
+                         ids=lambda v: " ".join(v) if isinstance(v, list) else None)
+def test_a_history_with_nothing_readable_still_gives_the_count(tmp_path, flags, scope):
+    """Round-4 review: with no line readable, netpick said only "No
+    measurements", so a damaged history looked empty."""
+    store = NP.Store(tmp_path / "history.jsonl")
+    store.path.write_text('{"truncated": \n["not a record"]\n')
+    rc, text, _ = run_cli(["history", *flags], store=store)
+    assert rc == 0 and text == f"No measurements in {store.path}{scope}.\n(netpick skipped 2 unreadable line(s))"
+
+
+def test_history_json_gives_the_count_on_stderr(tmp_path, capsys):
+    store = NP.Store(tmp_path / "history.jsonl")
+    store.path.write_text('{"truncated": \n["not a record"]\n')
+    rc, text, _ = run_cli(["history", "--json"], store=store)
+    assert rc == 0 and json.loads(text) == []
+    assert capsys.readouterr().err == "(netpick skipped 2 unreadable line(s))\n"
+
+
+def test_a_clean_history_mentions_no_skipped_lines(tmp_path, capsys):
+    _, _, store = run_cli(["import", CAPTURES[0]], tmp_path=tmp_path)
+    for flags in ([], ["--since", "1s"], ["--network", "no such network"], ["--json"]):
+        assert "skipped" not in run_cli(["history", *flags], store=store)[1]
+    assert capsys.readouterr().err == ""
 
 
 def test_a_record_with_malformed_fields_is_skipped_not_shown(tmp_path):

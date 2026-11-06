@@ -1854,9 +1854,11 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
     def stamp():
         return dt.datetime.fromtimestamp(prober.clock(), dt.timezone.utc).strftime("%H:%M:%SZ")
 
-    def measure_now():
+    def measure_now(gateway):
+        """Measure this gateway, or return None when the Wi-Fi has left it, even
+        for this one read. A new gateway then gets its own wait and settle."""
         with prober.until(None):  # it started before the limit, so it runs to its end
-            cands = prober.candidates([wifi])
+            cands = [c for c in prober.candidates([wifi]) if c["gateway"] == gateway]
             if not cands:
                 return None
             rec = prober.measure(cands, mode="watch", names=names)[0]
@@ -1882,42 +1884,62 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
         # The current visit's gateway. A visit ends when the gateway moves or
         # disappears, even for one read, so the same gateway can start a new one.
         last = gw
+        # The baseline network until netpick measures it. --seen and --max don't
+        # apply to it, a drop keeps it waiting, and a move to another network
+        # or a portal wait that runs out ends it.
+        pending = None
         if baseline:
             if gw and prober.captive(wifi) and left() > 0:
                 out(f"{stamp()} baseline: measuring the current network (gateway {gw})")
-                rec = measure_now()
+                rec = measure_now(gw)
                 if rec:
                     if rec.get("online"):
-                        tested.add(rec.get("gateway"))
-                    show(rec.get("gateway"))
+                        tested.add(gw)
+                    show(gw)
+                else:
+                    out("   the network changed as the measurement started, so netpick waits for it")
+                    pending, last = gw, None
             elif left() <= 0:
                 out(f"{stamp()} baseline: the {minutes:g}-minute limit has passed, so netpick skipped it")
+            elif gw:
+                out(f"{stamp()} baseline: the current Wi-Fi network has no internet yet, so netpick waits for it")
+                pending, last = gw, None
             else:
-                out(f"{stamp()} baseline: the current Wi-Fi network has no internet yet, so netpick waits for it "
-                    "like a new network")
-                last = None
+                out(f"{stamp()} baseline: {wifi} has no network right now, so netpick skipped it")
         new = 0
         out(f"{stamp()} watching {wifi} for up to {minutes:g} min and {max_new} new network(s). Pick networks in "
             "the Wi-Fi menu and sign in to any portal; netpick never joins or leaves one.")
-        while new < max_new and left() > 0:
+        while (new < max_new or pending) and left() > 0:
             gw = prober.gateway(wifi)
             if not gw and left() > 0:  # at the limit, an empty read says nothing about the network
                 last = None
+            if pending and gw and gw != pending:
+                out(f"{stamp()} baseline: the Wi-Fi moved to another network first, so netpick skipped the baseline")
+                pending = None
+                if new >= max_new:
+                    break
             ip = prober.ipaddr(wifi) if gw and gw != last else None
             if ip:
                 last = gw
-                if gw in tested:
+                if gw in tested and gw != pending:
                     out(f"{stamp()} back on gateway {gw} (netpick tested it already)")
                     quick = min(settle, 15)
-                    if (wait_online(prober, wifi, gw, min(60, max(left(), 0)), out) == "online" and left() >= quick
-                            and settle_wait(prober, wifi, gw, quick) and left() > 0):
-                        with prober.until(None):  # it started before the limit, so it runs to its end
-                            c = prober.api_check(wifi, 4)
-                        out(f"   API check: {c['by_host'][HOSTS[0]][0]}/{c['by_host'][HOSTS[0]][1]} Claude API, "
-                            f"{c['by_host'][HOSTS[1]][0]}/{c['by_host'][HOSTS[1]][1]} GitHub connections")
+                    status = wait_online(prober, wifi, gw, min(60, max(left(), 0)), out)
+                    if status == "online" and left() >= quick:
+                        status = "online" if settle_wait(prober, wifi, gw, quick) else "changed"
+                        if status == "online" and left() > 0:
+                            with prober.until(None):  # it started before the limit, so it runs to its end
+                                c = prober.api_check(wifi, 4)
+                            out(f"   API check: {c['by_host'][HOSTS[0]][0]}/{c['by_host'][HOSTS[0]][1]} Claude API, "
+                                f"{c['by_host'][HOSTS[1]][0]}/{c['by_host'][HOSTS[1]][1]} GitHub connections")
+                    if status == "changed" and left() > 0:  # the visit ended, so the same gateway can start another
+                        last = None
+                    if status == "timeout" and left() > 0:
+                        out("   still no internet after 1 min, so netpick didn't check it")
                     continue
                 sec = prober.summary(wifi).get("security") or "?"
-                out(f"{stamp()} new network: gateway {gw}, ip {ip}, security {sec}")
+                what = "baseline" if gw == pending else "new network"
+                out(f"{stamp()} {what}: gateway {gw}, ip {ip}, security {sec}")
                 status = wait_online(prober, wifi, gw, max(min(portal_wait, left()), 0), out)
                 if status != "online" and left() <= 0:
                     out(f"   no internet before the {minutes:g}-minute limit, so netpick didn't measure it")
@@ -1929,6 +1951,7 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
                 if status != "online":
                     out(f"   still no internet after {portal_wait / 60:.0f} min (no portal sign-in yet?), so netpick "
                         "skipped it")
+                    pending = None
                     continue
                 if left() <= 0 or left() < settle:
                     out(f"   the {minutes:g}-minute limit ends before DNS could settle for {settle:g}s, so netpick "
@@ -1944,12 +1967,17 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
                     last = None
                     continue
                 out(f"{stamp()} measuring")
-                rec = measure_now()
+                rec = measure_now(gw)
                 if rec:
-                    new += 1
-                    if rec.get("online"):  # by the gateway measured, in case I switched as it started
-                        tested.add(rec.get("gateway"))
-                    show(rec.get("gateway"))
+                    if gw != pending:  # the baseline uses none of --max
+                        new += 1
+                    pending = None
+                    if rec.get("online"):
+                        tested.add(gw)
+                    show(gw)
+                else:
+                    out("   the network changed as the measurement started, so netpick skipped it")
+                    last = None
             prober.sleep(min(poll, max(left(), 0)))
     out(f"{stamp()} done: measured {len(measured)} network(s)")
     if len(measured) > 1:
@@ -1971,6 +1999,7 @@ def cmd_watch(args, prober, store, out):
 def cmd_history(args, store, out, now=None):
     now = time.time() if now is None else now
     recs, bad = store.load()
+    skipped = f"(netpick skipped {bad} unreadable line(s))"
     names = store.names()
     window = parse_window(args.since)
     if window:
@@ -1980,9 +2009,14 @@ def cmd_history(args, store, out, now=None):
         recs = [r for r in recs if r["network_id"].startswith(q) or q in display_name(r, names).lower()]
     if args.json:
         out(json.dumps(recs, indent=2, ensure_ascii=False))
+        if bad:  # on stderr, so stdout stays valid JSON
+            print(skipped, file=sys.stderr, flush=True)
         return 0
     if not recs:
-        out(f"No measurements in {store.path}" + (f" within {args.since}" if window else "") + ".")
+        out(f"No measurements in {store.path}" + (f" for {args.network}" if args.network else "")
+            + (f" within {args.since}" if window else "") + ".")
+        if bad:
+            out(skipped)
         return 0
     if args.rank:
         latest = rank(latest_per_network(recs))
@@ -2016,7 +2050,7 @@ def cmd_history(args, store, out, now=None):
         shown = sorted(recs, key=lambda r: r["time"])[-args.limit:]
         out(table(shown, names, now=now, when=True))
     if bad:
-        out(f"(netpick skipped {bad} unreadable line(s))")
+        out(skipped)
     return 0
 
 
@@ -2158,7 +2192,8 @@ def build_parser():
     w = sub.add_parser("watch", help="measure each new Wi-Fi network you switch to")
     probe_flags(w)
     w.add_argument("--seen", metavar="GATEWAYS", help="comma-separated gateways to treat as tested")
-    w.add_argument("--baseline", action="store_true", help="measure the current Wi-Fi network first")
+    w.add_argument("--baseline", action="store_true",
+                   help="measure the current Wi-Fi network first, whatever --seen and --max say")
     w.add_argument("--max", type=_num(int, 0, 50), default=3, help="stop after this many new networks (default 3)")
     w.add_argument("--minutes", type=_num(float, 0, 1440), default=30.0, help="stop after this long (default 30)")
     w.add_argument("--portal-wait", type=_num(float, 0, 3600), default=480.0,
