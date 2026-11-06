@@ -4,6 +4,9 @@ load_netpick() imports bin/netpick (no .py suffix) as a module. FakeMac is a
 Mac whose links answer netpick's read-only commands from a script: every
 command goes through netpick's own allowlist first, and every call is kept in
 FakeMac.calls with the fake time and the Wi-Fi gateway at that moment.
+Commands take no fake time unless a test sets FakeMac.cost; then each one
+takes cost(argv) seconds, or its timeout when that comes first, and
+FakeMac.timeline keeps (start, end, argv) for each.
 """
 from __future__ import annotations
 
@@ -87,6 +90,8 @@ class FakeMac:
         self.conn_n = {}
         self.wifi_schedule = None
         self.lock = threading.RLock()
+        self.cost = None  # callable(argv) -> fake seconds the command takes; None: no time
+        self.timeline = []  # (start, end, argv) for each run() call
 
     # -- time
     def clock(self):
@@ -120,9 +125,17 @@ class FakeMac:
     def run(self, argv, timeout, stdin=None):
         NP.check_command(argv)
         with self.lock:
+            start = self.now
             gw = (self.link("en0") or Link("", "", "", None)).gateway
-            self.calls.append((self.now, gw, list(argv)))
-        return self.answer(list(argv), stdin)
+            self.calls.append((start, gw, list(argv)))
+        got = self.answer(list(argv), stdin)  # the answer as of the start
+        took = self.cost(list(argv)) if self.cost else 0.0
+        if took > timeout:  # Runner.run kills it at its timeout
+            got, took = NP.Proc(-9, "", "", timeout, "timeout"), timeout
+        with self.lock:
+            self.now = max(self.now, start + took)  # commands on other threads overlap
+            self.timeline.append((start, start + took, list(argv)))
+        return got
 
     def run_watched(self, argv, timeout, should_stop, poll=0.5):
         NP.check_command(argv)

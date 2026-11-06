@@ -570,8 +570,9 @@ def test_options_refuse_limits_that_would_disarm_a_check(field, bad):
     ["now", "--conns", "21"], ["now", "--nq-seconds", "4"], ["now", "--rounds", "11"], ["now", "--rounds", "nan"],
     ["watch", "--settle", "inf"], ["watch", "--minutes", "nan"], ["watch", "--minutes", "-1"],
     ["watch", "--portal-wait", "-5"], ["watch", "--poll", "0"], ["watch", "--max", "-1"], ["watch", "--budget-mb", "nan"],
-    ["history", "--limit", "0"],
-], ids=lambda a: " ".join(a))
+    ["history", "--limit", "0"], ["now", "--rounds", "9" * 400], ["history", "--limit", "9" * 400],
+    ["now", "--pings", "-" + "9" * 400],
+], ids=lambda a: " ".join(a)[:40])
 def test_cli_refuses_nonfinite_and_out_of_range_limits(argv, capsys):
     with pytest.raises(SystemExit) as e:
         NP.build_parser().parse_args(argv)
