@@ -1,0 +1,15 @@
+### appam on en0  2026-11-05T19:56:47Z
+ip: 172.21.114.244   default via: 172.21.112.1
+wifi link: Channel: 64 (5GHz, 40MHz);Security: WPA2 Personal;Signal / Noise: -48 dBm / -95 dBm;Transmit Rate: 573
+captive check: 1 (1 = online)
+== ping 1.1.1.1 x40 (0.25 s apart)
+40 packets transmitted, 40 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 6.972/29.560/86.817/21.554 ms
+== 4 Claude API + 4 GitHub connections (HEAD request, DNS excluded)
+api 4/4, github 4/4 connected; TLS done at: 0.07 0.09 0.07 0.08 0.01 0.09 0.07 0.09 s
+== networkQuality -I en0 (max 20 s, parallel up/down)
+==== SUMMARY ====
+Uplink capacity: 113.685 Mbps
+Downlink capacity: 12.715 Mbps
+Responsiveness: Low (1.274 seconds | 47 RPM)
+Idle Latency: 26.747 milliseconds | 2243 RPM

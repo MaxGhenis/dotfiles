@@ -1,0 +1,34 @@
+name: netpick
+
+on:
+  pull_request:
+    paths:
+      - bin/netpick
+      - tests/netpick_fakes.py
+      - tests/test_netpick*.py
+      - tests/fixtures/netpick/**
+      - .github/workflows/netpick.yml
+  push:
+    branches: [master]
+    paths:
+      - bin/netpick
+      - tests/netpick_fakes.py
+      - tests/test_netpick*.py
+      - tests/fixtures/netpick/**
+      - .github/workflows/netpick.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: pytest
+        run: uv run --no-project --python ${{ matrix.python }} --with pytest --with hypothesis pytest tests/test_netpick.py tests/test_netpick_probing.py -q
