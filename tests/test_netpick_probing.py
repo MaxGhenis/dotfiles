@@ -1386,7 +1386,7 @@ def test_no_damage_to_a_capture_breaks_import_or_the_history(which, keep, hits):
 
 
 def test_naming_an_interface_twice_measures_it_once(tmp_path):
-    """Two copies ran together and shared one budget entry, so each could spend the whole budget."""
+    """It gave two rows for en0, each counting 16 connections, and a recommendation that tied with itself."""
     mac = FakeMac([wifi(), tether()])
     rc, text, store = run_cli(["now", "--quick", "--interfaces", "en0,en0"], mac, tmp_path)
     recs = store.load()[0]
