@@ -238,6 +238,8 @@ def test_curl_write_out_parsers():
     assert NP.parse_curl_w("") is None
     # curl prints -w on a timeout too (exit 28): a partial transfer still gives a rate
     assert NP.parse_stream_w("28 12996792 12923027 0 0 1.005708")["speed_download"] == 12923027.0
+    for odd in ("0 inf 1 0 0 1", "0 1e400 1 0 0 1", "0 -5 1 0 0 1", "0 nan 1 0 0 1", "0 5 inf 0 0 1", "x 5 1 0 0 1"):
+        assert NP.parse_stream_w(odd) is None
     assert NP.parse_stream_w("45 0 0 0 0 0.03") == {"exit": 45, "size_download": 0, "speed_download": 0.0,
                                                     "size_upload": 0, "speed_upload": 0.0, "time_total": 0.03}
 
@@ -512,7 +514,7 @@ def test_recommendation_edge_cases():
     assert NP.recommend([down], down)["action"] == "none"
     assert NP.recommend([up, down], down)["action"] == "switch"
     assert NP.recommend([up], None)["action"] == "use"
-    assert NP.recommend([up], up)["text"].endswith("(the only link measured).")
+    assert NP.recommend([up], up)["text"].endswith("(netpick measured no other link).")
     twin = link("twin", {"conn_ratio": 1.0})
     assert NP.recommend([up, twin], twin)["text"] == "Stay on twin: up ties with it."
 
@@ -547,11 +549,11 @@ def test_networkquality_plan_examples():
     secs, why = NP.nq_plan(o, 7.5e6, {"down_mbps": 38, "up_mbps": 60})
     assert secs is None and "100 MB budget" in why
     assert NP.nq_plan(o, 0, {}) == (NP.NQ_BLIND_SECONDS, None)
-    assert NP.nq_plan(o, 2e8, {}) == (None, "skipped: the 100 MB budget is used up")
+    assert NP.nq_plan(o, 2e8, {}) == (None, "skipped: netpick has used up the 100 MB budget")
     assert NP.nq_plan(NP.Options(budget_mb=20), 0, None) == (NP.NQ_BLIND_SECONDS, None)
     assert NP.nq_plan(NP.Options(budget_mb=15), 0, None) == (
         None, "skipped: no transfer estimate, and under 20 MB of the budget left")
-    assert NP.nq_plan(NP.Options(budget_mb=0), 0, None) == (None, "skipped: the 0 MB budget is used up")
+    assert NP.nq_plan(NP.Options(budget_mb=0), 0, None) == (None, "skipped: netpick has used up the 0 MB budget")
 
 
 @pytest.mark.parametrize("field, bad", [
@@ -768,3 +770,30 @@ def test_labels_and_ids_without_ssids():
 def test_history_record_is_json_round_trippable():
     r = capture("nettest_net1_open.txt")
     assert json.loads(json.dumps(r)) == r
+
+
+@given(st.lists(st.sampled_from(["0", "5", "1.5", "-5", "inf", "-inf", "nan", "1e400", "x", "9" * 400, "9" * 5000]),
+                min_size=6, max_size=6))
+def test_a_transfer_report_gives_finite_counts_or_nothing(fields):
+    got = NP.parse_stream_w(" ".join(fields))
+    assert got is None or all(math.isfinite(v) and v >= 0 for k, v in got.items() if k != "exit")
+
+
+ANY_JSON = st.recursive(st.none() | st.booleans() | st.integers() | st.floats() | st.text(max_size=4),
+                        lambda inner: st.lists(inner, max_size=3) | st.dictionaries(st.text(max_size=4), inner, max_size=3),
+                        max_leaves=6)
+NQ_KEYS = ["dl_throughput", "ul_throughput", "responsiveness", "base_rtt", "dl_bytes_transferred",
+           "ul_bytes_transferred", "dl_phase_duration", "ul_phase_duration", "error_code", "error"]
+
+
+@given(fields=st.dictionaries(st.sampled_from(NQ_KEYS), ANY_JSON),
+       other=ANY_JSON | st.fixed_dictionaries({"interface-type": st.dictionaries(st.text(max_size=3), ANY_JSON)}))
+def test_networkquality_output_of_any_shape_parses(fields, other):
+    got = NP.parse_nq_json(json.dumps(dict(fields, other=other)))
+    assert isinstance(got, dict) and (got["bytes"] is None or (isinstance(got["bytes"], int) and got["bytes"] >= 0))
+
+
+def test_networkquality_counts_that_cant_add_up_count_as_missing():
+    assert NP.parse_nq_json('{"dl_bytes_transferred": 1e308, "ul_bytes_transferred": 1e308}')["bytes"] is None
+    assert NP.parse_nq_json('{"dl_bytes_transferred": -5, "ul_bytes_transferred": 7}')["bytes"] == 7
+    assert NP.parse_nq_json('{"other": {"interface-type": {"wifi": 3, "odd": "x"}}}')["interface_type"] == "wifi"

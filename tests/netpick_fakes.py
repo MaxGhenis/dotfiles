@@ -289,7 +289,7 @@ class FakeMac:
 
 def make_prober(mac, **opts):
     return NP.Prober(runner=mac, opts=NP.Options(**opts), dns=mac.dns, resolve=mac.resolve,
-                     counters=mac.if_counters, clock=mac.clock, sleep=mac.sleep)
+                     counters=mac.if_counters, clock=mac.clock, monotonic=mac.clock, sleep=mac.sleep)
 
 
 def wifi(**kw):

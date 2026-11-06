@@ -31,6 +31,7 @@ import contextlib
 import ctypes
 import dataclasses
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import ipaddress
@@ -325,14 +326,16 @@ def parse_nq_json(text):
         out["rpm"] = round(out["rpm"], 1)
     base = _finite(j.get("base_rtt"))
     out["base_rtt_ms"] = round(base, 1) if base is not None else None
-    moved = [j.get(k) for k in ("dl_bytes_transferred", "ul_bytes_transferred") if _finite(j.get(k)) is not None]
-    out["bytes"] = int(sum(moved)) if moved else None
+    moved = [_finite(j.get(k)) for k in ("dl_bytes_transferred", "ul_bytes_transferred")]
+    moved = [m for m in moved if m is not None and m >= 0]
+    out["bytes"] = int(sum(moved)) if moved and math.isfinite(sum(moved)) else None
     durations = [_finite(j.get(k)) for k in ("dl_phase_duration", "ul_phase_duration")]
     durations = [d for d in durations if d is not None]
     out["seconds"] = round(max(durations), 1) if durations else None
     kinds = (j.get("other") or {}).get("interface-type") if isinstance(j.get("other"), dict) else None
-    if isinstance(kinds, dict) and kinds:
-        out["interface_type"] = max(kinds, key=lambda k: kinds[k])
+    counts = {k: v for k, v in kinds.items() if _finite(v) is not None} if isinstance(kinds, dict) else {}
+    if counts:
+        out["interface_type"] = max(counts, key=counts.get)
     if out["down_mbps"] is None and out["up_mbps"] is None:
         out["error"] = str(j.get("error_code") or j.get("error") or "no throughput in output")
     return out
@@ -454,21 +457,19 @@ def parse_curl_w(text):
 
 
 def parse_stream_w(text):
-    """'%{exitcode} %{size_download} %{speed_download} %{size_upload} %{speed_upload} %{time_total}'."""
+    """'%{exitcode} %{size_download} %{speed_download} %{size_upload} %{speed_upload} %{time_total}'
+    -> dict, or None unless each value after the exit code is a finite number, 0 or more."""
     f = (text or "").split()
     if len(f) != 6:
         return None
     try:
-        return {
-            "exit": int(f[0]),
-            "size_download": int(float(f[1])),
-            "speed_download": float(f[2]),
-            "size_upload": int(float(f[3])),
-            "speed_upload": float(f[4]),
-            "time_total": float(f[5]),
-        }
+        code, nums = int(f[0]), [float(x) for x in f[1:]]
     except ValueError:
         return None
+    if not all(math.isfinite(x) and x >= 0 for x in nums):
+        return None
+    return {"exit": code, "size_download": int(nums[0]), "speed_download": nums[1], "size_upload": int(nums[2]),
+            "speed_upload": nums[3], "time_total": nums[4]}
 
 
 # CoreWLAN enums, from CoreWLANTypes.h in the macOS 26 SDK
@@ -915,7 +916,7 @@ def recommend(ranked, current=None, names=None) -> dict:
     if best is current:
         others = [r for r in online if r is not best]
         if not others:
-            return {"action": "stay", "pick": best, "text": f"Stay on {name(best)} (the only link measured)."}
+            return {"action": "stay", "pick": best, "text": f"Stay on {name(best)} (netpick measured no other link)."}
         d = deciding(best["metrics"], others[0]["metrics"])
         why = f" It beats {name(others[0])} on {FIELD_WORDS[d[0]]}" if d else " It ties"
         detail = f" ({describe(d[0], best)} vs {describe(d[0], others[0])})." if d else f" with {name(others[0])}."
@@ -954,7 +955,7 @@ def nq_plan(opts, used_bytes, stream):
         return None, "off"
     remaining = opts.budget_mb * 1e6 - used_bytes
     if not remaining > 0:
-        return None, f"skipped: the {opts.budget_mb:g} MB budget is used up"
+        return None, f"skipped: netpick has used up the {opts.budget_mb:g} MB budget"
     st = stream or {}
     mbps = (_finite(st.get("down_mbps")) or 0.0) + (_finite(st.get("up_mbps")) or 0.0)
     if mbps > 0:
@@ -1056,13 +1057,14 @@ class Prober:
     resolve, clock and sleep, so tests can drive it without a network."""
 
     def __init__(self, runner=None, *, opts=None, dns=dns_lookup, resolve=system_resolve, counters=if_counters,
-                 clock=time.time, sleep=time.sleep, log=None, resolve_timeout=RESOLVE_TIMEOUT):
+                 clock=time.time, monotonic=time.monotonic, sleep=time.sleep, log=None, resolve_timeout=RESOLVE_TIMEOUT):
         self.runner = runner or Runner()
         self.opts = opts or Options()
         self.dns = dns
         self.resolve = resolve
         self.counters = counters
-        self.clock = clock
+        self.clock = clock  # wall time, for timestamps
+        self.monotonic = monotonic  # for limits and waits: a clock correction can't stretch them
         self.sleep = sleep
         self.log = log or (lambda msg: None)
         self.resolve_timeout = resolve_timeout
@@ -1071,7 +1073,7 @@ class Prober:
     def _run(self, argv, timeout, stdin=None):
         """Run one command, cut off at self.deadline when one is set."""
         if self.deadline is not None:
-            left = self.deadline - self.clock()
+            left = self.deadline - self.monotonic()
             if left <= 0:
                 return Proc(-9, "", "", 0.0, "deadline")
             timeout = min(timeout, left)
@@ -1079,7 +1081,7 @@ class Prober:
 
     @contextlib.contextmanager
     def until(self, deadline):
-        """Within the block, no command runs past deadline (None: no limit)."""
+        """Within the block, no command runs past deadline, a monotonic time (None: no limit)."""
         saved, self.deadline = self.deadline, deadline
         try:
             yield
@@ -1154,7 +1156,7 @@ class Prober:
         routes = self.default_routes()
         ports = self.hardware_ports()
         primary = self.primary_interface()
-        names = list(only) if only else [i for i in routes if _is_iface(i)]
+        names = list(dict.fromkeys(only)) if only else [i for i in routes if _is_iface(i)]
         out = []
         for iface in names:
             if not _is_iface(iface):
@@ -1353,7 +1355,7 @@ class Prober:
         """Measure every candidate, phase by phase, all links in each phase at
         once: on a moving train, solo tests minutes apart gave the opposite
         picture from simultaneous ones (11/04)."""
-        t0 = self.clock()
+        t0, began = self.clock(), self.monotonic()
         run = utc_stamp(t0).replace("-", "").replace(":", "") + "-" + os.urandom(2).hex()
         recs = []
         for c in cands:
@@ -1363,7 +1365,7 @@ class Prober:
         live = [r for r in recs if r["online"]]
         for r in recs:
             if not r["online"]:
-                r["notes"].append("no internet (captive portal not signed in?)")
+                r["notes"].append("no internet (no captive portal sign-in yet?)")
         ips = self.pinned_ips() if live else {}
         parts = {r["interface"]: [] for r in live}
         used = {r["interface"]: 0 for r in live}  # bulk bytes per link, shared by every round's transfer and networkQuality
@@ -1414,7 +1416,7 @@ class Prober:
         for r in live:
             r.update(combine_rounds(parts[r["interface"]]))
         for r in recs:
-            r["duration_s"] = round(self.clock() - t0, 1)
+            r["duration_s"] = round(self.monotonic() - began, 1)
             finalize(r, names)
         return recs
 
@@ -1491,10 +1493,9 @@ class Store:
             return f"{self.path} is a directory; --history takes a file"
         if st and not stat.S_ISREG(st.st_mode):  # reading a named pipe would wait for a writer
             return f"--history {self.path} isn't a regular file"
-        real = os.path.realpath(self.path)
-        if "names.json" in (self.path.name.casefold(), Path(real).name.casefold()):
+        if any(n.casefold() == "names.json" for n in _link_names(self.path)):
             return f"--history can't be {self.path}: netpick keeps network names in names.json files"
-        if real == os.path.realpath(self.names_path) or _same_file(self.path, self.names_path):
+        if os.path.realpath(self.path) == os.path.realpath(self.names_path) or _same_file(self.path, self.names_path):
             return f"--history {self.path} and the names file {self.names_path} are one file"
         if st and not os.access(self.path, os.R_OK):
             return f"can't read the history {self.path}"
@@ -1545,9 +1546,14 @@ class Store:
     def read_names(self):
         """The names file's {network id: name} entries, or {} when there's no
         file. Raises OSError when the file can't be read and ValueError or
-        RecursionError when it holds no JSON object."""
+        RecursionError when it holds no JSON object. O_NONBLOCK: opening a
+        named pipe would otherwise wait for a writer."""
         try:
-            text = self.names_path.read_text(encoding="utf-8")
+            with open(self.names_path, encoding="utf-8",
+                      opener=lambda path, flags: os.open(path, flags | os.O_NONBLOCK)) as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    raise OSError(errno.EINVAL, "it isn't a regular file")
+                text = f.read()
         except FileNotFoundError:
             return {}
         data = json.loads(text)
@@ -1563,25 +1569,44 @@ class Store:
             return {}
 
     def set_name(self, nid, name):
-        # A names file that doesn't parse stops the write, so a hand edit
-        # gone wrong costs no names.
-        names = self.read_names()
-        if name:
-            names[nid] = name
-        else:
-            names.pop(nid, None)
         self.names_path.parent.mkdir(parents=True, exist_ok=True)
-        # A fresh temporary file (mkstemp creates it and fails rather than
-        # reuse a path), so the write can't land on the history.
-        fd, tmp = tempfile.mkstemp(dir=self.names_path.parent, prefix=".names-", suffix=".tmp")
+        # A lock on the directory holds off another netpick from read to
+        # replace, so two updates can't lose one; closing it lets go.
+        lock = os.open(self.names_path.parent, os.O_RDONLY)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
-                f.write(json.dumps(names, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
-            os.replace(tmp, self.names_path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            # A names file that doesn't parse stops the write, so a hand edit
+            # gone wrong costs no names.
+            names = self.read_names()
+            if name:
+                names[nid] = name
+            else:
+                names.pop(nid, None)
+            # A fresh temporary file (mkstemp creates it and fails rather than
+            # reuse a path), so the write can't land on the history.
+            fd, tmp = tempfile.mkstemp(dir=self.names_path.parent, prefix=".names-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
+                    f.write(json.dumps(names, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+                os.replace(tmp, self.names_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+        finally:
+            os.close(lock)
+
+
+def _link_names(path, limit=40) -> list:
+    """path's file name, then the file name each symbolic link in its chain points to."""
+    names, p = [], Path(path)
+    for _ in range(limit):
+        names.append(p.name)
+        try:
+            p = p.parent / os.readlink(p)
+        except OSError:  # not a link, so the chain ends here
+            break
+    return names
 
 
 def _same_file(a, b) -> bool:
@@ -1727,7 +1752,8 @@ def options_from(args) -> Options:
 
 
 def cmd_now(args, prober, store, out):
-    window = parse_window(args.recent)
+    # "all" lifts the window here, as it does for `history --since`; "0" hides the list.
+    window = math.inf if args.recent.strip().lower() == "all" else parse_window(args.recent)
     only = [s.strip() for s in args.interfaces.split(",") if s.strip()] if args.interfaces else None
     cands = prober.candidates(only)
     if not cands:
@@ -1765,7 +1791,7 @@ def cmd_now(args, prober, store, out):
         out("  " + line)
     if earlier:
         out("")
-        out(f"Measured earlier (within {args.recent}), not now:")
+        out("netpick measured these earlier" + ("" if window == math.inf else f" (within {args.recent})") + ", not now:")
         out(table(rank(earlier), names, now=prober.clock(), when=True))
         top_earlier = rank(earlier)[0]
         pick = rec.get("pick")
@@ -1777,21 +1803,22 @@ def cmd_now(args, prober, store, out):
                     "when measured; to recheck it, run `netpick watch --baseline` and pick it in the Wi-Fi menu.")
     total = sum(r.get("data_bytes") or 0 for r in recs)
     used = f"{fmt_mb(total)} MB" if total >= 1e6 else "under 1 MB"
-    out(f"\n{len(recs)} link(s), {used} used, {max(r.get('duration_s') or 0 for r in recs):.0f} s"
+    links = "1 link" if len(recs) == 1 else f"{len(recs)} links"
+    out(f"\nnetpick measured {links}, used {used} and ran for {max(r.get('duration_s') or 0 for r in recs):.0f} s"
         + (f"; history: {store.path}" if saved else ""))
     return 0
 
 
 def wait_online(prober, iface, gw, limit, out, step=3.0):
     """'online', 'timeout', or 'changed' when the gateway moves while waiting."""
-    start = prober.clock()
+    start = prober.monotonic()
     while True:
         if prober.captive(iface):
-            out(f"   online after {prober.clock() - start:.0f}s")
+            out(f"   online after {prober.monotonic() - start:.0f}s")
             return "online"
-        if prober.clock() - start >= limit:
+        if prober.monotonic() - start >= limit:
             return "timeout"
-        prober.sleep(min(step, max(limit - (prober.clock() - start), 0)))
+        prober.sleep(min(step, max(limit - (prober.monotonic() - start), 0)))
         if prober.gateway(iface) != gw:
             return "changed"
 
@@ -1799,9 +1826,9 @@ def wait_online(prober, iface, gw, limit, out, step=3.0):
 def settle_wait(prober, iface, gw, seconds, step=2.0):
     """Let DNS settle after a switch (11/05: 2 of 4 API calls failed with curl
     exit 6 in the first seconds; a minute later 35 of 35 worked)."""
-    end = prober.clock() + seconds
-    while prober.clock() < end:
-        prober.sleep(min(step, max(end - prober.clock(), 0)))
+    end = prober.monotonic() + seconds
+    while prober.monotonic() < end:
+        prober.sleep(min(step, max(end - prober.monotonic(), 0)))
         if prober.gateway(iface) != gw:
             return False
     return True
@@ -1814,15 +1841,15 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
         out("No Wi-Fi interface found.")
         return 3
     names = store.names()
-    deadline = prober.clock() + minutes * 60
-    # Gateways measured in this run or listed with --seen. A visit that ends
-    # before a measurement (the network changed, the portal never opened)
-    # leaves its gateway out, so a later visit gets a full measurement.
+    deadline = prober.monotonic() + minutes * 60
+    # Gateways measured online in this run or listed with --seen. A visit that
+    # ends before a measurement leaves its gateway out, so a later visit gets a
+    # full measurement.
     tested = {g for g in seen if g}
     measured = []
 
     def left():
-        return deadline - prober.clock()
+        return deadline - prober.monotonic()
 
     def stamp():
         return dt.datetime.fromtimestamp(prober.clock(), dt.timezone.utc).strftime("%H:%M:%SZ")
@@ -1843,7 +1870,7 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
         ranked = rank(measured)
         out(table(ranked, names, current, now=prober.clock(), when=True))
         if len(measured) > 1:
-            out("Measured one at a time, minutes apart; on a moving train conditions change between rows.")
+            out("netpick measured these one at a time, minutes apart; on a moving train conditions change between rows.")
         out(recommend(ranked, current, names)["text"])
 
     # The time limit holds for every step. Every command outside a
@@ -1852,6 +1879,9 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
     # under way runs to its end.
     with prober.until(deadline):
         gw = prober.gateway(wifi)
+        # The current visit's gateway. A visit ends when the gateway moves or
+        # disappears, even for one read, so the same gateway can start a new one.
+        last = gw
         if baseline:
             if gw and prober.captive(wifi) and left() > 0:
                 out(f"{stamp()} baseline: measuring the current network (gateway {gw})")
@@ -1861,20 +1891,23 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
                         tested.add(rec.get("gateway"))
                     show(rec.get("gateway"))
             elif left() <= 0:
-                out(f"{stamp()} baseline skipped: the {minutes:g}-minute limit has passed")
+                out(f"{stamp()} baseline: the {minutes:g}-minute limit has passed, so netpick skipped it")
             else:
-                out(f"{stamp()} baseline skipped: the current Wi-Fi network has no internet")
-        last = gw
+                out(f"{stamp()} baseline: the current Wi-Fi network has no internet yet, so netpick waits for it "
+                    "like a new network")
+                last = None
         new = 0
         out(f"{stamp()} watching {wifi} for up to {minutes:g} min and {max_new} new network(s). Pick networks in "
             "the Wi-Fi menu and sign in to any portal; netpick never joins or leaves one.")
         while new < max_new and left() > 0:
             gw = prober.gateway(wifi)
+            if not gw and left() > 0:  # at the limit, an empty read says nothing about the network
+                last = None
             ip = prober.ipaddr(wifi) if gw and gw != last else None
             if ip:
                 last = gw
                 if gw in tested:
-                    out(f"{stamp()} back on gateway {gw} (tested already)")
+                    out(f"{stamp()} back on gateway {gw} (netpick tested it already)")
                     quick = min(settle, 15)
                     if (wait_online(prober, wifi, gw, min(60, max(left(), 0)), out) == "online" and left() >= quick
                             and settle_wait(prober, wifi, gw, quick) and left() > 0):
@@ -1887,24 +1920,28 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
                 out(f"{stamp()} new network: gateway {gw}, ip {ip}, security {sec}")
                 status = wait_online(prober, wifi, gw, max(min(portal_wait, left()), 0), out)
                 if status != "online" and left() <= 0:
-                    out(f"   no internet before the {minutes:g}-minute limit; not measured")
+                    out(f"   no internet before the {minutes:g}-minute limit, so netpick didn't measure it")
                     break
                 if status == "changed":
                     out("   the network changed while waiting for internet")
+                    last = None
                     continue
                 if status != "online":
-                    out(f"   still no internet after {portal_wait / 60:.0f} min (portal not signed in?); skipped")
+                    out(f"   still no internet after {portal_wait / 60:.0f} min (no portal sign-in yet?), so netpick "
+                        "skipped it")
                     continue
                 if left() <= 0 or left() < settle:
-                    out(f"   the {minutes:g}-minute limit ends before DNS could settle for {settle:g}s; not measured")
+                    out(f"   the {minutes:g}-minute limit ends before DNS could settle for {settle:g}s, so netpick "
+                        "didn't measure it")
                     break
                 out(f"   letting DNS settle for {settle:g}s")
                 settled = settle_wait(prober, wifi, gw, settle)
                 if left() <= 0:
-                    out(f"   the {minutes:g}-minute limit came before the measurement; not measured")
+                    out(f"   the {minutes:g}-minute limit came before the measurement, so netpick didn't measure it")
                     break
                 if not settled:
-                    out("   the network changed while settling; skipped")
+                    out("   the network changed while settling, so netpick skipped it")
+                    last = None
                     continue
                 out(f"{stamp()} measuring")
                 rec = measure_now()
@@ -1950,7 +1987,7 @@ def cmd_history(args, store, out, now=None):
     if args.rank:
         latest = rank(latest_per_network(recs))
         out(table(latest, names, now=now, when=True))
-        out("Each network's latest measurement, taken at different times; recheck before acting on old rows.")
+        out("netpick took these latest measurements at different times; recheck before acting on old rows.")
     elif args.by_network:
         groups = {}
         for r in recs:
@@ -1974,12 +2011,12 @@ def cmd_history(args, store, out, now=None):
                 fmt_age(now - (parse_stamp(last["time"]) or now)),
             ])
         out(render(rows, ["network", "id", "n", "conns", "loss", "rtt ms", "up/down Mbps", "last"], right={2, 3, 4, 5, 6}))
-        out("Medians over each network's measurements.")
+        out("Each row gives one network's medians.")
     else:
         shown = sorted(recs, key=lambda r: r["time"])[-args.limit:]
         out(table(shown, names, now=now, when=True))
     if bad:
-        out(f"({bad} unreadable line(s) skipped)")
+        out(f"(netpick skipped {bad} unreadable line(s))")
     return 0
 
 
@@ -1993,9 +2030,12 @@ def cmd_import(args, store, out):
         except OSError as e:
             out(f"{path}: {e.strerror}")
             continue
-        rec = parse_capture(text, source=Path(path).name)
-        if rec is None:
-            out(f"{path}: not a nettest.sh capture")
+        try:
+            rec = parse_capture(text, source=Path(path).name)
+        except (ValueError, OverflowError):  # a number that won't convert: two run together, or 400 digits long
+            rec = None
+        if rec is None or not usable_record(rec):  # usable_record catches an impossible date, say
+            out(f"{path}: not a nettest.sh capture, or a damaged one")
             continue
         key = (rec["time"], rec["interface"], rec["source_label"])
         if key in keys:
@@ -2033,12 +2073,16 @@ def cmd_name(args, store, out):
         out(f"{args.id}: " + ("no such network id" if not matches else "ambiguous: " + ", ".join(matches)))
         return 2
     nid = matches[0]
+    name = " ".join(args.name).strip()
+    if not name and not args.clear:
+        out(f"{nid}: give it a name, or use --clear to remove the one it has")
+        return 2
     try:
-        store.set_name(nid, None if args.clear else " ".join(args.name).strip() or None)
+        store.set_name(nid, None if args.clear else name)
     except OSError as e:
         out(f"netpick: couldn't write the names file {store.names_path}: {e.strerror or e}")
         return 1
-    out(f"{nid}: " + ("name cleared" if args.clear or not args.name else f"named {' '.join(args.name).strip()!r}"))
+    out(f"{nid}: " + ("name cleared" if args.clear else f"named {name!r}"))
     return 0
 
 
@@ -2113,7 +2157,7 @@ def build_parser():
 
     w = sub.add_parser("watch", help="measure each new Wi-Fi network you switch to")
     probe_flags(w)
-    w.add_argument("--seen", metavar="GATEWAYS", help="comma-separated gateways already tested (skipped)")
+    w.add_argument("--seen", metavar="GATEWAYS", help="comma-separated gateways to treat as tested")
     w.add_argument("--baseline", action="store_true", help="measure the current Wi-Fi network first")
     w.add_argument("--max", type=_num(int, 0, 50), default=3, help="stop after this many new networks (default 3)")
     w.add_argument("--minutes", type=_num(float, 0, 1440), default=30.0, help="stop after this long (default 30)")
@@ -2163,7 +2207,11 @@ def main(argv=None, *, prober=None, store=None, out=None) -> int:
         def out(s=""):
             print(s, flush=True)
 
-    store = store or Store(getattr(args, "history", None))
+    try:
+        store = store or Store(getattr(args, "history", None))
+    except RuntimeError as e:  # "~name" for a user that doesn't exist
+        out(f"netpick: can't use that history path: {e}")
+        return 2
     for flag in ("recent", "since"):
         try:
             parse_window(getattr(args, flag, None))
@@ -2195,4 +2243,11 @@ def main(argv=None, *, prober=None, store=None, out=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:  # the reader left, as `netpick history | head` does
+        # Python flushes stdout at exit, and that flush must not fail too.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(141)

@@ -20,10 +20,10 @@ On my phone's hotspot, `netpick --quick` printed:
 #  network                                                  id        conns  loss  rtt ms  up/down Mbps  via  rpm  MB
 1  Wi-Fi WPA3 gw 10.243.10.226 · AS6167 Verizon Business *  0579294e    8/8  0.0%   72±19           —/—  —      —   —
 
-Stay on Wi-Fi WPA3 gw 10.243.10.226 · AS6167 Verizon Business (the only link measured).
+Stay on Wi-Fi WPA3 gw 10.243.10.226 · AS6167 Verizon Business (netpick measured no other link).
   en0: DNS 10.243.10.226 answered 4/4, median 11 ms, max 20 ms
 
-1 link(s), under 1 MB used, 15 s; history: ~/.local/state/netpick/history.jsonl
+netpick measured 1 link, used under 1 MB and ran for 15 s; history: ~/.local/state/netpick/history.jsonl
 ```
 
 Each row shows the HTTPS connections that completed, ping loss, round-trip time (mean ± standard deviation), and upload and download in Mbps. Under `via`, `nq` marks rates from networkQuality and `1-conn` rates from the bounded transfer. `rpm` gives networkQuality's responsiveness in round trips per minute, and `MB` the bulk data netpick counted for the transfer and networkQuality. An asterisk marks the link that carries traffic now, and progress lines go to stderr.
@@ -93,15 +93,15 @@ netpick charges each networkQuality run the larger of two counts: networkQuality
 
 A Mac's Wi-Fi joins one network at a time, so netpick can't measure two Wi-Fi networks together. `netpick watch` measures them in turn while I switch. It checks the Wi-Fi gateway every 2 s, and when a new one appears, it waits up to 8 minutes for the captive check to pass while I sign in to any portal. Then it lets DNS settle for 30 s, measures, and prints the table so far. On November 5, right after a switch, 2 of 4 API calls failed their DNS lookup, and a minute later 35 of 35 succeeded.
 
-When I switch back to a network that `watch` has measured and found online, it checks 4 Claude API and 4 GitHub connections instead of measuring again. It treats the gateways I list with `--seen`, separated by commas, the same way. If I leave a network before `watch` measures it, during the portal wait or while DNS settles, `watch` measures it in full when I come back. It stops after 3 new networks or 30 minutes (`--max`, `--minutes`). At the time limit it cuts every wait and every command outside a measurement or connection check, and it starts no settle that would end after the limit. A measurement or connection check that starts before the limit runs to its end, so a watch can end late by one of them. `--baseline` measures the current network first. Its measurements happen minutes apart, so on a train they compare moments as well as networks, and netpick prints that warning under the table.
+When I switch back to a network that `watch` has measured and found online, it checks 4 Claude API and 4 GitHub connections instead of measuring again. `watch` treats the gateways I list with `--seen` the same way; I separate their addresses with commas. If I leave a network, or its Wi-Fi drops, before `watch` measures it, `watch` measures it in full when the network comes back. It stops after 3 new networks or 30 minutes (`--max`, `--minutes`). At the time limit it cuts every wait and every command outside a measurement or connection check, and it starts no settle that would end after the limit. A measurement or connection check that starts before the limit runs to its end, so a watch can end late by one of them. `--baseline` measures the current network first, and when that network has no internet yet, `watch` waits for it as it would for a new one. `watch` takes its measurements minutes apart, so on a train the rows compare moments as well as networks, and netpick prints that warning under the table.
 
 ## Labels and ids
 
-macOS 26 redacts Wi-Fi network names (SSIDs) from command-line tools. netpick labels a Wi-Fi network instead by its security type, its gateway and the owner of the egress network, as in `Wi-Fi WPA2 gw 172.21.112.1 · AS6079 RCN`. A tethered phone or Ethernet adapter takes the name of its hardware port. netpick hashes the gateway and security type (for Wi-Fi) or the port name into an 8-character id, so a network keeps its id from visit to visit. `netpick name <id> <name>` shows a name in place of the label, and `netpick name --list` lists the names.
+macOS 26 redacts Wi-Fi network names (SSIDs) from command-line tools. netpick labels a Wi-Fi network instead by its security type, its gateway and the owner of the egress network, as in `Wi-Fi WPA2 gw 172.21.112.1 · AS6079 RCN`. A tethered phone or Ethernet adapter takes the name of its hardware port. netpick hashes the gateway and security type (for Wi-Fi) or the port name into an 8-character id, so a network keeps its id from visit to visit. `netpick name <id> <name>` shows a name in place of the label, `netpick name <id> --clear` removes it, and `netpick name --list` lists the names.
 
 ## History
 
-netpick appends each measurement as one JSON line to `~/.local/state/netpick/history.jsonl`; `$NETPICK_HISTORY` or `--history PATH` moves it. Each line holds the time, interface, label, egress, every probe's results and the ranking inputs. `netpick history` shows the latest 30 rows, `--rank` ranks each network's latest measurement, and `--by-network` gives each network's medians. `--since 2h` and `--network <id or text>` narrow any of them. When a line doesn't parse, or a field the views read holds the wrong type, netpick skips it and gives the count under the table. `netpick import` loads test captures in the format of `tests/fixtures/netpick/nettest_*.txt`. netpick keeps names in `names.json` beside the history. It refuses a `--history` path that names `names.json`, directly or through a symbolic link, and one that shares a file with the `names.json` beside it. When `names.json` doesn't parse, `netpick name` leaves it as it is and says so.
+netpick appends each measurement as one JSON line to `~/.local/state/netpick/history.jsonl`; `$NETPICK_HISTORY` or `--history PATH` moves it. Each line holds the time, interface, label, egress, every probe's results and the ranking inputs. `netpick history` shows the latest 30 rows, `--rank` ranks each network's latest measurement, and `--by-network` gives each network's medians. `--since 2h` and `--network <id or text>` narrow any of them. When a line doesn't parse, or a field the views read holds the wrong type, netpick skips it and gives the count under the table. `netpick import` loads test captures in the format of `tests/fixtures/netpick/nettest_*.txt` and names any damaged capture it skips. netpick keeps names in `names.json` beside the history. It refuses a `--history` path that names `names.json`, directly or through symbolic links, and one that shares a file with the `names.json` beside it. When `names.json` doesn't parse or isn't a regular file, `netpick name` leaves it as it is and says so.
 
 ```
 $ netpick history --rank
@@ -109,10 +109,10 @@ $ netpick history --rank
 1  Wi-Fi WPA2 gw 172.21.112.1                             34849952    8/8  0.0%    30±22        114/13  nq    47   —  6h ago
 2  Wi-Fi WPA3 gw 10.243.10.226 · AS6167 Verizon Business  0579294e    8/8  0.0%    72±19           —/—  —      —   —  15s ago
 3  Wi-Fi OPEN gw 172.16.224.1                             8e4c49c7    8/8  0.0%  132±154        15/4.5  nq    34   —  6h ago
-Each network's latest measurement, taken at different times; recheck before acting on old rows.
+netpick took these latest measurements at different times; recheck before acting on old rows.
 ```
 
-A plain `netpick` run also lists the networks it measured in the last 2 hours that it can't reach now (`--recent` sets the window), and says when one of them beat the current pick.
+A plain `netpick` run also lists the networks it measured in the last 2 hours that it can't reach now (`--recent` sets the window, and `--recent all` removes it), and says when one of them beat the current pick.
 
 ## Read-only
 
@@ -128,8 +128,8 @@ NETPICK_HYPOTHESIS=thorough uv run --no-project --with pytest --with hypothesis 
 - Parser tests read the three captures from November 5 and command output from this Mac, with placeholder MAC addresses in place of the real ones. On macOS, a differential test checks netpick's byte counters against `netstat -ib`.
 - Hypothesis tests the ranking on generated inputs. The same records always give the same order, input order matters only between exact ties, and improving one measure never lowers a network's rank. The connections band outranks every later measure, values such as NaN or text rank as missing, and a recommendation never switches inside a band. A separate test checks each band's cut point and the floating-point values on either side of it.
 - Hypothesis also checks that the networkQuality plan fits the budget at generated speeds, and that pooling rounds of ping summaries matches a computation over every sample.
-- A fake Mac answers each command from a script after netpick's own allowlist approves it. The probing tests use it to cover the phases, the budget stop, failed counter reads and lost byte counts. They also cover failed and hung networkQuality runs, a resolver that never answers, offline links, the watch loop with slow commands, and the command line.
-- On the fake Mac, Hypothesis checks three more properties. At generated speeds, budgets and round counts, no run moves more than its budget plus one half-second check of networkQuality's traffic. Hypothesis checks that bound again with counter reads that fail or run backward, transfers that lose their byte counts and networkQuality reports that count too few bytes. Over generated sequences of switches and command durations, `watch` lets no wait or command run past `--minutes`, except a measurement or connection check that started before it. And no history line, however Hypothesis damages it, makes a view fail.
+- A fake Mac answers each command from a script after netpick's own allowlist approves it. The probing tests use it to cover the phases, the budget stop, failed counter reads and lost byte counts. They also cover failed and hung networkQuality runs, a resolver that never answers and offline links. The `watch` tests add slow commands, Wi-Fi that drops and system clock corrections, and the command-line tests add a closed pipe and Ctrl-C.
+- Hypothesis also runs the fake Mac on generated inputs. At generated speeds, budgets and round counts, no run moves more than its budget plus one half-second check of networkQuality's traffic. Hypothesis checks that bound again with counter reads that fail or run backward, transfers that lose their byte counts and networkQuality reports that count too few bytes. Over generated sequences of switches and command durations, `watch` lets no wait or command run past `--minutes`, except a measurement or connection check that started before it. Over generated switches and drops, `watch` measures any network I stay on long enough. And no damage Hypothesis does to a history line or a capture makes `import` or a view fail.
 - The thorough profile runs 5,000 examples for each property.
 
 ## Limitations
