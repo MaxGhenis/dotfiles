@@ -79,9 +79,11 @@ netpick adds one standard deviation to each mean there: the café's pings averag
 
 ## Data budget
 
-The bounded transfer moves up to 7.5 MB per link. networkQuality moves as much as a link can carry for as long as it runs. On the conference Wi-Fi, a 6-second run moved 130 MB (24 MB down and 106 MB up), so a time limit alone doesn't cap its data. netpick plans each run from the bounded transfer instead. It assumes networkQuality moves twice the transfer's one-connection rate and picks the longest run, up to 20 s, that keeps the link within its budget, 100 MB by default (`--budget-mb`). When that run would last under 5 s, netpick skips networkQuality and ranks on the transfer's rates; at 100 Mbps up and down combined, the plan comes to under 4 s.
+netpick gives each link a data budget for the run, 100 MB by default (`--budget-mb`), and the bounded transfer and networkQuality both draw on it. With `--rounds`, every round draws on the same budget. netpick runs the 7.5 MB transfer when it fits in what's left and skips it otherwise.
 
-While networkQuality runs, netpick reads the interface's byte counters every half second and stops the run once the link has moved the rest of the budget. The counters include the sessions' own traffic, so the stop can come early but never later than one half-second check. networkQuality prints nothing when netpick stops it, so netpick ranks that link on the transfer's rates. Given an interface that doesn't exist, networkQuality ignored its time limit and hung for over two minutes; netpick stops it 15 s after its planned end.
+networkQuality moves as much as a link can carry for as long as it runs. On the conference Wi-Fi, a 6-second run moved 130 MB (24 MB down and 106 MB up), so a time limit alone doesn't cap its data. netpick plans each run from the bounded transfer instead. It assumes networkQuality moves twice the transfer's one-connection rate and picks the longest run, up to 20 s, that fits the rest of the budget. When that run would last under 5 s, netpick skips networkQuality and ranks on the transfer's rates; at 100 Mbps up and down combined, the plan comes to under 4 s. With no transfer rates to plan from, netpick runs networkQuality for at most 8 s, and only when 20 MB or more of the budget remains.
+
+While networkQuality runs, netpick reads the interface's byte counters every half second and stops the run once the link has moved the rest of the budget. It reads the counters `netstat -ib` prints, from the kernel through a `sysctl` call that takes about 13 microseconds on my Mac. The counters include the sessions' own traffic, so the stop can come early but never later than one half-second check. When netpick can't read the counters, it skips networkQuality, and a read that fails during a run stops it. networkQuality prints nothing when netpick stops it, so netpick ranks that link on the transfer's rates. Given an interface that doesn't exist, networkQuality ignored its time limit and hung for over two minutes; netpick stops it 15 s after its planned end.
 
 `--quick` keeps only the ping, DNS and connection phases, which use well under 1 MB per link. `--no-nq` and `--no-transfer` each drop one phase.
 
@@ -89,7 +91,7 @@ While networkQuality runs, netpick reads the interface's byte counters every hal
 
 A Mac's Wi-Fi joins one network at a time, so netpick can't measure two Wi-Fi networks together. `netpick watch` measures them in turn while I switch. It checks the Wi-Fi gateway every 2 s, and when a new one appears, it waits up to 8 minutes for the captive check to pass while I sign in to any portal. Then it lets DNS settle for 30 s, measures, and prints the table so far. On November 5, right after a switch, 2 of 4 API calls failed their DNS lookup, and a minute later 35 of 35 succeeded.
 
-When I switch back to a gateway it has seen, `watch` checks 4 Claude API and 4 GitHub connections instead of measuring again. It stops after 3 new networks or 30 minutes (`--max`, `--minutes`). `--baseline` measures the current network first, and `--seen` takes a comma-separated list of gateways that earlier runs measured. Its measurements happen minutes apart, so on a train they compare moments as well as networks, and netpick prints that warning under the table.
+When I switch back to a network that `watch` has measured, it checks 4 Claude API and 4 GitHub connections instead of measuring again. It treats the gateways I list with `--seen`, separated by commas, the same way. If I leave a network before `watch` measures it, during the portal wait or while DNS settles, `watch` measures it in full when I come back. It stops after 3 new networks or 30 minutes (`--max`, `--minutes`). It cuts every wait at the time limit and starts no settle that would end after it. It finishes any measurement it has started, so a watch can end up to one measurement late. `--baseline` measures the current network first. Its measurements happen minutes apart, so on a train they compare moments as well as networks, and netpick prints that warning under the table.
 
 ## Labels and ids
 
@@ -97,7 +99,7 @@ macOS 26 redacts Wi-Fi network names (SSIDs) from command-line tools. netpick la
 
 ## History
 
-netpick appends each measurement as one JSON line to `~/.local/state/netpick/history.jsonl`; `$NETPICK_HISTORY` or `--history PATH` moves it. Each line holds the time, interface, label, egress, every probe's results and the ranking inputs. `netpick history` shows the latest 30 rows, `--rank` ranks each network's latest measurement, and `--by-network` gives each network's medians. `--since 2h` and `--network <id or text>` narrow any of them. `netpick import` loads test captures in the format of `tests/fixtures/netpick/nettest_*.txt`.
+netpick appends each measurement as one JSON line to `~/.local/state/netpick/history.jsonl`; `$NETPICK_HISTORY` or `--history PATH` moves it. Each line holds the time, interface, label, egress, every probe's results and the ranking inputs. `netpick history` shows the latest 30 rows, `--rank` ranks each network's latest measurement, and `--by-network` gives each network's medians. `--since 2h` and `--network <id or text>` narrow any of them. When a line doesn't parse or holds a field of the wrong type, netpick skips it and gives the count under the table. `netpick import` loads test captures in the format of `tests/fixtures/netpick/nettest_*.txt`. netpick keeps names in `names.json` beside the history and refuses a `--history` file by that name, directly or through a link. When `names.json` doesn't parse, `netpick name` leaves it as it is and says so.
 
 ```
 $ netpick history --rank
@@ -112,19 +114,20 @@ A plain `netpick` run also lists the networks it measured in the last 2 hours th
 
 ## Read-only
 
-netpick runs eight macOS tools by absolute path, and an allowlist refuses any other command, any probe that names no `en` interface and any `osascript` beyond its read-only CoreWLAN script. It never joins or leaves a Wi-Fi network, changes the service order or any other setting, or reads the keychain, and it stops only its own child processes. On November 4, a command-line join of a WPA3 phone hotspot (`networksetup -setairportnetwork`) failed with error -3900 and left the Mac and every session on it offline for about 90 seconds.
+netpick runs eight macOS tools by absolute path, and an allowlist refuses any other command, any probe that names no `en` interface and any `osascript` beyond its read-only CoreWLAN script. It reads byte counters with one `sysctl` call that sets no value. It never joins or leaves a Wi-Fi network, changes the service order or any other setting, or reads the keychain, and it stops only its own child processes. On November 4, a command-line join of a WPA3 phone hotspot (`networksetup -setairportnetwork`) failed with error -3900 and left the Mac and every session on it offline for about 90 seconds.
 
 ## Tests
 
 ```bash
 uv run --no-project --with pytest --with hypothesis pytest tests/test_netpick.py tests/test_netpick_probing.py -q
-NETPICK_HYPOTHESIS=thorough uv run --no-project --with pytest --with hypothesis pytest tests/test_netpick.py -q
+NETPICK_HYPOTHESIS=thorough uv run --no-project --with pytest --with hypothesis pytest tests/test_netpick.py tests/test_netpick_probing.py -q
 ```
 
-- Parser tests read the three captures from November 5 and command output from this Mac, with placeholder MAC addresses in place of the real ones.
-- Hypothesis tests the ranking on generated inputs. The same records always give the same order, input order matters only between exact ties, and improving one measure never lowers a network's rank. The connections band outranks every later measure, values such as NaN or text rank as missing, and a recommendation never switches inside a band.
+- Parser tests read the three captures from November 5 and command output from this Mac, with placeholder MAC addresses in place of the real ones. On macOS, a differential test checks netpick's byte counters against `netstat -ib`.
+- Hypothesis tests the ranking on generated inputs. The same records always give the same order, input order matters only between exact ties, and improving one measure never lowers a network's rank. The connections band outranks every later measure, values such as NaN or text rank as missing, and a recommendation never switches inside a band. A separate test checks each band's cut point and the floating-point values on either side of it.
 - Hypothesis also checks that the networkQuality plan fits the budget at generated speeds, and that pooling rounds of ping summaries matches a computation over every sample.
-- A fake Mac answers each command from a script after netpick's own allowlist approves it. The probing tests use it to cover the phases, the budget stop, failed and hung networkQuality runs, offline links, the watch loop and the command line.
+- A fake Mac answers each command from a script after netpick's own allowlist approves it. The probing tests use it to cover the phases, the budget stop, failed counter reads, failed and hung networkQuality runs, a resolver that never answers, offline links, the watch loop and the command line.
+- On the fake Mac, Hypothesis checks three more properties. At generated speeds, budgets and round counts, no run moves more than its budget plus one half-second check of networkQuality's traffic. Over generated sequences of switches, `watch` never waits past `--minutes`. And no history line, however Hypothesis damages it, makes a view fail.
 - The thorough profile runs 5,000 examples for each property.
 
 ## Limitations

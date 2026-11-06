@@ -13,9 +13,17 @@ import importlib.machinery
 import importlib.util
 import json
 import math
+import os
 import pathlib
 import sys
 import threading
+
+from hypothesis import settings
+
+# Quick by default; NETPICK_HYPOTHESIS=thorough runs 25 times the examples.
+settings.register_profile("netpick", max_examples=200, deadline=None)
+settings.register_profile("thorough", max_examples=5000, deadline=None)
+settings.load_profile(os.environ.get("NETPICK_HYPOTHESIS", "netpick"))
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "netpick"
@@ -27,7 +35,12 @@ def load_netpick():
     spec = importlib.util.spec_from_loader("netpick", loader)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["netpick"] = mod  # dataclasses look the module up by name
-    loader.exec_module(mod)
+    write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True  # leave no __pycache__ in bin/
+    try:
+        loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = write_bytecode
     return mod
 
 
@@ -55,6 +68,7 @@ class Link:
     rpm: float = 300.0
     org: str = "AS64500 Example Networks"
     dns_ok: bool = True
+    dns_reply: str | None = None  # ipconfig getoption domain_name_server output; None: the gateway
     appeared: float = -math.inf  # set by FakeMac when the link comes up
 
 
@@ -69,7 +83,7 @@ class FakeMac:
         self.primary = primary or links[0].iface
         self.now = now
         self.calls = []  # (time, en0 gateway, argv)
-        self.counters = {}
+        self.octets = {}  # iface -> (bytes in, bytes out), what netpick's counter reader sees
         self.conn_n = {}
         self.wifi_schedule = None
         self.lock = threading.RLock()
@@ -146,13 +160,20 @@ class FakeMac:
 
     def bump(self, iface, down_bytes, up_bytes):
         with self.lock:
-            ib, ob = self.counters.get(iface, (8_000_000_000, 1_000_000_000))
-            self.counters[iface] = (ib + int(down_bytes), ob + int(up_bytes))
+            ib, ob = self.octets.get(iface, (8_000_000_000, 1_000_000_000))
+            self.octets[iface] = (ib + int(down_bytes), ob + int(up_bytes))
+
+    # -- netpick's counters hook (the kernel's interface byte counters)
+    def if_counters(self, iface):
+        if self.link(iface) is None:
+            return None
+        with self.lock:
+            return self.octets.get(iface, (8_000_000_000, 1_000_000_000))
 
     # -- netpick's dns and resolve hooks
     def dns(self, server, host, iface):
         lk = self.link(iface)
-        if lk is None or not lk.dns_ok or server != lk.gateway:
+        if lk is None or not lk.dns_ok or server != (NP.first_ipv4(lk.dns_reply) or lk.gateway):
             return False, None, "timeout"
         return True, 20.0, "ok"
 
@@ -171,10 +192,6 @@ class FakeMac:
                 flags = "UGScg" if lk.iface == self.primary else "UGScIg"
                 lines.append(f"default            {lk.gateway:<18} {flags:<19} {lk.iface:>5}")
             return P(0, "\n".join(lines) + "\n")
-        if cmd == "netstat" and a[1] == "-ibn":
-            ib, ob = self.counters.get(a[3], (8_000_000_000, 1_000_000_000))
-            head = "Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll"
-            return P(0, f"{head}\n{a[3]}  1500  <Link#16>  00:00:5e:00:53:01  1 0 {ib}  1 0 {ob} 0\n")
         if cmd == "route":
             if self.link(self.primary):
                 return P(0, f"   route to: default\n  interface: {self.primary}\n")
@@ -193,7 +210,7 @@ class FakeMac:
                 kind = "WiFi" if lk.port == "Wi-Fi" else "Ethernet"
                 sec = f"  Security : {lk.security}\n" if lk.security else ""
                 return P(0, f"<dictionary> {{\n  InterfaceType : {kind}\n  SSID : <redacted>\n{sec}}}\n")
-            return P(0, lk.gateway + "\n")  # getoption domain_name_server: the router answers DNS
+            return P(0, lk.dns_reply or lk.gateway + "\n")  # getoption domain_name_server: the router answers DNS
         if cmd == "osascript":
             lk = self.link(a[5])
             if lk is None or lk.port != "Wi-Fi":
@@ -259,7 +276,7 @@ class FakeMac:
 
 def make_prober(mac, **opts):
     return NP.Prober(runner=mac, opts=NP.Options(**opts), dns=mac.dns, resolve=mac.resolve,
-                     clock=mac.clock, sleep=mac.sleep)
+                     counters=mac.if_counters, clock=mac.clock, sleep=mac.sleep)
 
 
 def wifi(**kw):

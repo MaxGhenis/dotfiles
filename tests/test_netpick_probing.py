@@ -6,11 +6,18 @@ so these tests also show that a whole run stays inside it.
 """
 from __future__ import annotations
 
+import copy
 import json
+import pathlib
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from netpick_fakes import FIXTURES, NP, SCRIPT, T0, FakeMac, make_prober, tether, wifi
 
@@ -155,6 +162,109 @@ def test_quick_mode_moves_no_bulk_data():
     assert all(r["data_bytes"] == 0 and r["metrics"]["up_mbps"] is None for r in recs)
 
 
+def moved_on(mac, iface):
+    """Bytes the fake link carried for netpick (FakeMac counters start at 9 GB)."""
+    return sum(mac.octets.get(iface, (8_000_000_000, 1_000_000_000))) - 9_000_000_000
+
+
+def test_a_small_budget_skips_the_transfer_and_networkquality():
+    """Review finding 1: a 1 MB budget used to run the 7.5 MB transfer anyway."""
+    mac = FakeMac([wifi()])
+    rec = make_prober(mac, budget_mb=1).measure(make_prober(mac).candidates())[0]
+    assert rec["stream"]["skipped"] == "skipped: its 7.5 MB would pass the 1 MB budget"
+    assert rec["nq"]["skipped"] == "skipped: no transfer estimate, and under 20 MB of the budget left"
+    assert rec["data_bytes"] == 0 == moved_on(mac, "en0")
+    assert not [k for k, _ in kinds(mac) if k in ("stream", "nq")]
+    assert "en0: bounded transfer skipped: its 7.5 MB would pass the 1 MB budget" in NP.notes_for([rec])
+
+
+def test_rounds_share_one_budget():
+    """Review finding 1: 20 rounds on the 100 MB budget used to move 150 MB of
+    transfers. Round 1 runs the transfer and a 12 s networkQuality run (60 MB);
+    later rounds run the transfer while its 7.5 MB still fits."""
+    mac = FakeMac([wifi()])
+    rec = make_prober(mac).measure(make_prober(mac).candidates(), rounds=20)[0]
+    assert len(mac.argvs("networkQuality")) == 1 and len([k for k, _ in kinds(mac) if k == "stream"]) == 2 * 5
+    assert (rec["stream"]["bytes"], rec["nq"]["bytes"]) == (5 * 7_500_000, 60_000_000)
+    assert rec["data_bytes"] == 97_500_000 == moved_on(mac, "en0")
+
+
+@given(budget=st.floats(0, 300), rounds=st.integers(1, 5), down=st.floats(0.5, 500), up=st.floats(0.5, 500),
+       nq_down=st.floats(0, 2000), nq_up=st.floats(0, 2000), sizes=st.tuples(st.floats(0, 20), st.floats(0, 20)),
+       longest=st.integers(NP.NQ_MIN_SECONDS, 60))
+def test_no_run_moves_more_than_its_budget(budget, rounds, down, up, nq_down, nq_up, sizes, longest):
+    """Invariant: a link's data in one run, over every round's transfer and
+    networkQuality, stays within the budget plus at most one half-second
+    watchdog check of networkQuality's own rate, which can be far above the
+    plan's estimate. netpick's count matches what the link carried."""
+    mac = FakeMac([wifi(down_mbps=down, up_mbps=up, nq_down=nq_down, nq_up=nq_up)])
+    opts = dict(budget_mb=budget, stream_down_mb=sizes[0], stream_up_mb=sizes[1], nq_seconds=longest)
+    rec = make_prober(mac, **opts).measure(make_prober(mac).candidates(), rounds=rounds)[0]
+    one_check = (nq_down + nq_up) * 1e6 / 8 * 0.5
+    moved = moved_on(mac, "en0")
+    assert moved <= budget * 1e6 + one_check + 1000
+    assert abs(rec["data_bytes"] - moved) <= 1000  # the fake rounds each half second's bytes down
+
+
+def test_networkquality_needs_byte_counters_to_run():
+    """Review finding 2: with no counters the watchdog used to be off, and an
+    800 Mbps run moved 2 GB under a 100 MB budget."""
+    mac = FakeMac([wifi(down_mbps=2.0, up_mbps=1.0, nq_down=400.0, nq_up=400.0)])
+    p = NP.Prober(runner=mac, dns=mac.dns, resolve=mac.resolve, counters=lambda iface: None, clock=mac.clock,
+                  sleep=mac.sleep)
+    rec = p.measure(p.candidates())[0]
+    assert rec["nq"] == {"skipped": "skipped: no byte counters for en0 to hold it to the budget", "bytes": 0}
+    assert not mac.argvs("networkQuality") and rec["data_bytes"] == 7_500_000 == moved_on(mac, "en0")
+
+
+def test_a_failed_counter_read_stops_networkquality():
+    """The third read during the run fails: netpick stops networkQuality and
+    counts the 10 MB that the last good read saw (two checks at 80 Mbps)."""
+    mac = FakeMac([wifi(nq_down=40.0, nq_up=40.0)])
+    reads = []
+
+    def failing(iface):
+        reads.append(iface)
+        return mac.if_counters(iface) if len(reads) <= 3 else None
+
+    p = NP.Prober(runner=mac, dns=mac.dns, resolve=mac.resolve, counters=failing, clock=mac.clock, sleep=mac.sleep)
+    nq = p.measure(p.candidates())[0]["nq"]
+    assert (nq["stopped"], nq["bytes"]) == ("counters", 10_000_000)
+
+
+def test_counters_that_go_backward_stop_networkquality():
+    mac = FakeMac([wifi()])
+    reads = []
+
+    def resetting(iface):  # the interface came back with fresh counters
+        reads.append(iface)
+        ib, ob = mac.if_counters(iface)
+        return (ib, ob) if len(reads) < 3 else (ib - 8_000_000_000, ob - 1_000_000_000)
+
+    p = NP.Prober(runner=mac, dns=mac.dns, resolve=mac.resolve, counters=resetting, clock=mac.clock, sleep=mac.sleep)
+    nq = p.measure(p.candidates())[0]["nq"]
+    assert (nq["stopped"], nq["bytes"]) == ("counters", 2_500_000)  # one check at 40 Mbps
+
+
+def test_watchdog_on_the_real_runner_stops_within_a_check(tmp_path, monkeypatch):
+    """Review finding 3, on the production path: Runner.run_watched with a
+    stand-in networkQuality that never ends and counters that grow 200 MB a
+    second. The budget runs out at 0.5 s; the stop comes at the next check,
+    not after a slow read (netstat once took 2 s here)."""
+    stand_in = tmp_path / "networkQuality"
+    stand_in.write_text("#!/bin/sh\nexec sleep 30\n")
+    stand_in.chmod(0o755)
+    monkeypatch.setitem(NP.TOOL_PATHS, "networkQuality", str(stand_in))
+    t0 = time.monotonic()
+
+    def counters(iface):
+        return int((time.monotonic() - t0) * 200e6), 0
+
+    got = NP.Prober(runner=NP.Runner(), counters=counters).nq("en0", 0, {"down_mbps": 2.0, "up_mbps": 1.0})
+    assert (got["stopped"], got["planned_s"]) == ("budget", 20)
+    assert got["seconds"] < 2.5 and 100e6 <= got["bytes"] < 500e6
+
+
 # ---------------------------------------------------------------- offline links and failures
 
 
@@ -221,6 +331,48 @@ def test_system_resolve_keeps_public_answers_only(monkeypatch):
     assert NP.system_resolve("api.anthropic.com") is None
     monkeypatch.setattr(NP.socket, "getaddrinfo", fake("160.79.104.10"))
     assert NP.system_resolve("api.anthropic.com") == "160.79.104.10"
+
+
+def test_a_hung_resolver_costs_its_timeout_not_the_run():
+    """Review finding 4: getaddrinfo has no timeout, and a resolver that never
+    answered held the measurement until the test released it."""
+    release = threading.Event()
+
+    def hung(host):
+        release.wait(30)
+        return "93.184.216.34"
+
+    mac = FakeMac([wifi()])
+    p = NP.Prober(runner=mac, opts=NP.Options(stream=False, nq=False), dns=mac.dns, resolve=hung,
+                  counters=mac.if_counters, clock=mac.clock, sleep=mac.sleep, resolve_timeout=0.2)
+    try:
+        t = time.monotonic()
+        rec = p.measure(p.candidates())[0]
+        assert time.monotonic() - t < 5 and rec["conns"]["ok"] == 8
+        pinned = {a[a.index("--resolve") + 1] for a in mac.argvs("curl") if "--resolve" in a}
+        assert pinned == {f"{h}:443:{ip}" for h, ip in NP.FALLBACK_IPS.items()}
+        t = time.monotonic()
+        assert p.api_check("en0")["ok"] == 8 and time.monotonic() - t < 5
+    finally:
+        release.set()
+
+
+def test_resolver_errors_and_junk_use_the_fixed_addresses():
+    def broken(host):
+        raise OSError("no route to host")
+
+    for resolve in (broken, lambda h: None, lambda h: "not an address", lambda h: "300.1.1.1"):
+        assert NP.Prober(runner=FakeMac([wifi()]), resolve=resolve).pinned_ips() == NP.FALLBACK_IPS
+    assert NP.Prober(runner=FakeMac([wifi()]), resolve=lambda h: "160.79.104.99").pinned_ips() == {
+        h: "160.79.104.99" for h in NP.HOSTS}
+
+
+def test_dns_uses_the_first_of_several_dhcp_servers():
+    """Review finding 10: '1.1.1.1 8.8.8.8' used to read as no server at all."""
+    mac = FakeMac([wifi(dns_reply="1.1.1.1 8.8.8.8\n")])
+    rec = make_prober(mac, stream=False, nq=False).measure(make_prober(mac).candidates())[0]
+    assert rec["dns_server"] == "1.1.1.1"
+    assert (rec["dns"]["server"], rec["dns"]["ok"], rec["dns"]["attempts"]) == ("1.1.1.1", 4, 4)
 
 
 # ---------------------------------------------------------------- watch mode
@@ -300,6 +452,68 @@ def test_watch_baseline_without_internet_is_skipped(tmp_path):
     assert "baseline skipped: the current Wi-Fi network has no internet" in text and rc == 0
 
 
+def test_watch_starts_no_settle_the_time_limit_would_cut_short(tmp_path):
+    """Review finding 8: a network that appeared 58 s into a 1-minute watch got
+    the full 30 s settle and a measurement, so the watch ended at 90 s."""
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 58, wifi(**B))]
+    rc, text, store = watch(mac, tmp_path, minutes=1, max_new=1)
+    assert "new network: gateway 10.243.10.226" in text
+    assert "the 1-minute limit ends before DNS could settle for 30s; not measured" in text
+    assert store.load() == ([], 0) and not mac.argvs("ping") and mac.now <= T0 + 60
+
+
+def test_watch_waits_for_a_portal_and_a_return_only_until_the_time_limit(tmp_path):
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 50, wifi(online_after=1e9, **C))]
+    rc, text, _ = watch(mac, tmp_path, minutes=1, max_new=1)
+    assert "no internet before the 1-minute limit; not measured" in text and mac.now <= T0 + 60
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 50, wifi(**B))]  # back on a tested network 10 s before the end
+    rc, text, _ = watch(mac, tmp_path, seen=[B["gateway"]], minutes=1, max_new=1)
+    assert "back on gateway 10.243.10.226 (tested already)" in text and "API check" not in text
+    assert mac.now <= T0 + 60 and all(NP.CAPTIVE_URL in a for a in mac.argvs("curl"))  # captive checks only
+
+
+@pytest.mark.parametrize("first_visit", ["left during the portal wait", "portal wait ran out"])
+def test_a_network_left_before_its_measurement_gets_one_on_return(tmp_path, first_visit):
+    """Review finding 9: watch marked a gateway tested when it first saw it,
+    so a return after the portal opened got only the API check."""
+    mac = FakeMac([], primary="en0")
+    back = T0 + (90 if first_visit == "left during the portal wait" else 300)
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 60, wifi(online_after=1e9, **C)), (back, wifi(**A)),
+                         (back + 110, wifi(online_after=10.0, **C))]
+    rc, text, store = watch(mac, tmp_path, seen=[A["gateway"]], portal_wait=120, max_new=1, minutes=15)
+    assert ("the network changed while waiting for internet" if back == T0 + 90
+            else "still no internet after 2 min (portal not signed in?); skipped") in text
+    assert text.count("new network: gateway 172.16.224.1") == 2
+    assert "172.16.224.1 (tested already)" not in text
+    assert [r["gateway"] for r in store.load()[0]] == [C["gateway"]]
+
+
+@given(switches=st.lists(st.tuples(st.floats(1, 900), st.sampled_from([A, B, C]),
+                                   st.sampled_from([0.0, 20.0, 1e9])), max_size=6),
+       minutes=st.floats(0, 12), settle=st.sampled_from([0.0, 10.0, 30.0]),
+       portal_wait=st.sampled_from([0.0, 60.0, 480.0]), baseline=st.booleans(), max_new=st.integers(0, 3))
+def test_watch_never_waits_past_its_time_limit(switches, minutes, settle, portal_wait, baseline, max_new):
+    """Invariant, for any sequence of switches: no wait, settle or poll runs
+    past --minutes (the fake's measurements take no time), a network that
+    measured online is never measured again, and at most --max new ones are."""
+    mac = FakeMac([], primary="en0")
+    mac.wifi_schedule = [(T0, wifi(**A))] + sorted(
+        ((T0 + t, wifi(online_after=after, **net)) for t, net, after in switches), key=lambda s: s[0])
+    with tempfile.TemporaryDirectory() as d:
+        store = NP.Store(pathlib.Path(d) / "history.jsonl")
+        rc = NP.watch_loop(make_prober(mac), store, baseline=baseline, max_new=max_new, minutes=minutes,
+                           portal_wait=portal_wait, settle=settle, out=lambda s: None)
+        recs, bad = store.load()
+    assert rc == 0 and bad == 0
+    assert mac.now <= T0 + minutes * 60
+    online = [r["gateway"] for r in recs if r["online"]]
+    assert len(online) == len(set(online))
+    assert len(recs) <= max_new + baseline
+
+
 def test_watch_without_wifi_hardware(tmp_path):
     class NoWifi(FakeMac):
         def answer(self, a, stdin):
@@ -368,6 +582,190 @@ def test_history_skips_unreadable_lines(tmp_path):
     recs, bad = store.load()
     assert len(recs) == 1 and bad == 3
     assert "(3 unreadable line(s) skipped)" in run_cli(["history"], store=store)[1]
+
+
+def test_a_record_with_malformed_fields_is_skipped_not_shown(tmp_path):
+    """Review finding 7: a line with a valid time and id but `"conns": [1]`
+    loaded, then crashed `netpick history` with AttributeError."""
+    _, _, store = run_cli(["import", CAPTURES[0]], tmp_path=tmp_path)
+    good = json.loads(store.path.read_text())
+    broken = [dict(good, online=True, conns=[1]), dict(good, ping={"sent": "40"}), dict(good, online="yes"),
+              dict(good, metrics=dict(good["metrics"], via=3)), dict(good, notes="not a list"),
+              dict(good, data_bytes=float("nan")), dict(good, egress={"org": 7}), dict(good, time="yesterday"),
+              dict(good, network_id=""), dict(good, label=["x"]), dict(good, nq={"bytes": 10**400})]
+    with open(store.path, "a") as f:
+        f.writelines(json.dumps(r) + "\n" for r in broken)
+    assert store.load() == ([good], len(broken))
+    for view in VIEWS:
+        assert run_cli(view, store=store)[0] == 0
+    assert f"({len(broken)} unreadable line(s) skipped)" in run_cli(["history"], store=store)[1]
+
+
+VIEWS = (["history"], ["history", "--rank"], ["history", "--by-network"], ["history", "--json"],
+         ["history", "--network", "wpa"], ["history", "--since", "30d"], ["name", "--list"])
+
+
+def base_records():
+    """Valid history lines as they read back from the file: the three captures,
+    a watch run over a Wi-Fi network and a tether, and an offline network."""
+    recs = [NP.parse_capture(pathlib.Path(p).read_text(), source=pathlib.Path(p).name) for p in CAPTURES]
+    mac = FakeMac([wifi(**B), tether()], now=T0 - 600)
+    recs += make_prober(mac).measure(make_prober(mac).candidates(), mode="watch")
+    off = FakeMac([wifi(online_after=1e9, **C)], now=T0 - 300)
+    recs += make_prober(off).measure(make_prober(off).candidates(), mode="watch")
+    return [json.loads(json.dumps(r)) for r in recs]
+
+
+BASE = base_records()
+KEYS = sorted({k for r in BASE for v in (r, *(x for x in r.values() if isinstance(x, dict))) for k in v})
+JSON_VALUES = st.recursive(
+    st.none() | st.booleans() | st.integers() | st.floats() | st.text(max_size=6),
+    lambda kids: st.lists(kids, max_size=3) | st.dictionaries(st.text(max_size=6), kids, max_size=3),
+    max_leaves=5,
+)
+
+
+def paths(x, here=()):
+    yield here
+    if isinstance(x, dict):
+        for k, v in x.items():
+            yield from paths(v, (*here, k))
+    elif isinstance(x, list):
+        for i, v in enumerate(x):
+            yield from paths(v, (*here, i))
+
+
+def at(x, path):
+    for p in path:
+        x = x[p]
+    return x
+
+
+@st.composite
+def damaged_record(draw):
+    """A valid record with one to three changes: a value anywhere replaced by
+    arbitrary JSON (NaN, huge integers and lone surrogates included), a known
+    field set to one, or a field removed."""
+    rec = copy.deepcopy(draw(st.sampled_from(BASE)))
+    for _ in range(draw(st.integers(1, 3))):
+        where = draw(st.sampled_from(list(paths(rec))), label="path")
+        how = draw(st.sampled_from(("replace", "set", "drop")), label="how")
+        target = at(rec, where)
+        if how == "replace" or not isinstance(target, dict):
+            value = draw(JSON_VALUES, label="value")
+            if where:
+                at(rec, where[:-1])[where[-1]] = value
+            else:
+                rec = value
+        elif how == "set":
+            target[draw(st.sampled_from(KEYS), label="key")] = draw(JSON_VALUES, label="value")
+        elif target:
+            del target[draw(st.sampled_from(sorted(target)), label="field")]
+    return rec
+
+
+@given(st.lists(damaged_record(), min_size=1, max_size=4), st.lists(st.sampled_from(BASE), max_size=3))
+def test_no_history_line_crashes_a_view(damaged, intact):
+    """Invariant: every line is shown or counted as skipped, every intact line
+    is shown, and no line makes a view fail: the history views, `name`, the
+    list of networks measured earlier in a plain run, and `import`."""
+    with tempfile.TemporaryDirectory() as d:
+        store = NP.Store(pathlib.Path(d) / "history.jsonl")
+        lines = [json.dumps(r) for r in [*damaged, *intact]]
+        store.path.write_text("".join(line + "\n" for line in lines))
+        recs, bad = store.load()
+        assert len(recs) + bad == len(lines) and len(recs) >= len(intact)
+        for view in VIEWS:
+            assert NP.main(view, store=store, out=lambda s="": None) == 0
+        assert NP.main(["name", "0", "x"], store=store, out=lambda s="": None) in (0, 2)
+        prober = make_prober(FakeMac([wifi(**A)]))
+        assert NP.main(["--quick", "--no-history"], prober=prober, store=store, out=lambda s="": None) == 0
+        assert NP.main(["import", CAPTURES[0]], store=store, out=lambda s="": None) == 0
+
+
+@pytest.mark.parametrize("history", ["names.json", "link-to-names.jsonl", "."])
+@pytest.mark.parametrize("cmd", [["import", CAPTURES[0]], ["name", "34849952", "x"], ["name", "--list"], ["history"],
+                                 ["now", "--quick"], ["watch", "--minutes", "1"]], ids=lambda c: c[0])
+def test_a_history_path_that_could_lose_data_is_refused(tmp_path, history, cmd):
+    """Review finding 6: with `--history names.json`, import then name replaced
+    the history with the names dictionary. Every command now refuses such a
+    path before it reads or writes anything."""
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "names.json").write_text('{"34849952": "APPAM"}\n')
+    (tmp_path / "link-to-names.jsonl").symlink_to(other / "names.json")
+    (tmp_path / "names.json").write_text('{"34849952": "APPAM"}\n')
+    before = {p: p.read_bytes() for p in (tmp_path / "names.json", other / "names.json")}
+    mac = FakeMac([wifi()])
+    lines = []
+    rc = NP.main([*cmd, "--history", str(tmp_path / history)], prober=make_prober(mac), out=lines.append)
+    assert rc == 2 and lines[0].startswith("netpick: ") and len(lines) == 1
+    assert ("is a directory" if history == "." else "netpick keeps network names in names.json files") in lines[0]
+    assert {p: p.read_bytes() for p in before} == before and not mac.calls
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["link-to-names.jsonl", "names.json", "other"]
+
+
+def test_saving_a_name_leaves_the_history_alone(tmp_path):
+    _, _, store = run_cli(["import", *CAPTURES], tmp_path=tmp_path)
+    before = store.path.read_bytes()
+    nid = NP.network_id({"kind": "wifi", "gateway": "172.21.112.1", "security_class": "wpa2"})
+    assert run_cli(["name", nid, "APPAM"], store=store)[0] == 0
+    assert run_cli(["name", nid, "APPAM venue"], store=store)[0] == 0
+    assert store.path.read_bytes() == before and store.names() == {nid: "APPAM venue"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["history.jsonl", "names.json"]  # no temporary file left
+
+
+def test_a_names_file_that_cant_be_written_is_reported(tmp_path, monkeypatch):
+    _, _, store = run_cli(["import", CAPTURES[0]], tmp_path=tmp_path)
+    def refuse(*a, **k):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(NP.tempfile, "mkstemp", refuse)
+    rc, text, _ = run_cli(["name", "34849952", "APPAM"], store=store)
+    assert rc == 1 and text == f"netpick: couldn't write the names file {store.names_path}: Permission denied"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["history.jsonl"]
+
+
+def test_a_names_file_that_cant_be_read_is_reported(tmp_path):
+    _, _, store = run_cli(["import", CAPTURES[0]], tmp_path=tmp_path)
+    store.names_path.mkdir()  # something else holds the name
+    for cmd in (["name", "34849952", "APPAM"], ["name", "--list"]):
+        rc, text, _ = run_cli(cmd, store=store)
+        assert rc == 1 and text == f"netpick: couldn't read the names file {store.names_path}: Is a directory"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["history.jsonl", "names.json"]
+
+
+@pytest.mark.parametrize("damaged", ['{"34849952": "APPAM", "aaaa1111": "one"', '["APPAM"]', "\udcff",
+                                     "[" * 100_000 + "]" * 100_000])
+def test_a_names_file_that_doesnt_parse_keeps_its_names(tmp_path, damaged):
+    """A hand edit that leaves names.json unparseable: before, the next
+    `netpick name` replaced the file with that one name and lost the rest."""
+    _, _, store = run_cli(["import", CAPTURES[0]], tmp_path=tmp_path)
+    store.names_path.write_bytes(damaged.encode("utf-8", "surrogateescape"))
+    before = store.names_path.read_bytes()
+    for cmd in (["name", "34849952", "APPAM venue"], ["name", "--list"]):
+        rc, text, _ = run_cli(cmd, store=store)
+        assert rc == 1 and text == (f"netpick: the names file {store.names_path} doesn't parse as a JSON object, "
+                                    "so netpick leaves it as it is; fix or remove it")
+    with pytest.raises((ValueError, RecursionError)):
+        store.set_name("34849952", "APPAM venue")
+    assert store.names_path.read_bytes() == before and store.names() == {}
+    for view in VIEWS[:-1]:
+        assert run_cli(view, store=store)[0] == 0  # the views show the networks without names
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["history.jsonl", "names.json"]
+
+
+def test_odd_characters_survive_the_history_and_names_files(tmp_path):
+    """A lone surrogate, which only a damaged or hostile input can produce
+    (here an egress owner's name), goes to the files as its JSON escape."""
+    rec = NP.parse_capture((FIXTURES / "nettest_appam.txt").read_text())
+    rec["egress"] = {"org": "AS64500 Café \ud83d"}
+    NP.finalize(rec)
+    store = NP.Store(tmp_path / "history.jsonl")
+    store.append([rec])
+    assert store.load() == ([json.loads(json.dumps(rec))], 0) and "\ud83d" in store.load()[0][0]["label"]
+    store.set_name(rec["network_id"], "n\udcff")
+    assert store.names() == {rec["network_id"]: "n\udcff"}
+    assert "Café" in store.path.read_text(encoding="utf-8")  # other text stays readable
 
 
 def test_bad_windows_exit_2_before_measuring(tmp_path):
@@ -457,4 +855,11 @@ def test_the_script_runs_as_a_program(tmp_path):
                          env=env, timeout=30)
     assert "imported 1 measurement(s)" in got.stdout
     assert json.loads((tmp_path / "state" / "history.jsonl").read_text())["source_label"] == "appam"
+    # a label the terminal can't encode prints as its escape, with stdout held to strict UTF-8
+    rec = NP.parse_capture((FIXTURES / "nettest_appam.txt").read_text())
+    rec["egress"] = {"org": "AS64500 \ud83d"}
+    NP.Store(tmp_path / "state" / "history.jsonl").append([NP.finalize(rec)])
+    got = subprocess.run([sys.executable, str(SCRIPT), "history"], capture_output=True, text=True,
+                         env=dict(env, PYTHONIOENCODING="utf-8:strict"), timeout=30)
+    assert got.returncode == 0 and "AS64500 \\ud83d" in got.stdout, got.stderr
 

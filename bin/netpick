@@ -8,13 +8,13 @@
 It measures each candidate link with every probe bound to that link's
 interface, ranks the links for a workload of about 30 Claude Code sessions,
 Subfleet lanes and git, prints a table and a recommendation, and appends each
-measurement to a JSONL history. It never switches networks: only Max's clicks
-in the Wi-Fi menu, or plugging in a tether, move the route.
+measurement to a JSONL history. It never switches networks: only a click in
+the Wi-Fi menu, or plugging in a tether, moves the route.
 
     netpick                   measure the live links (Wi-Fi plus any tether or
                               Ethernet, at the same moment) and recommend one
-    netpick watch --baseline  measure this Wi-Fi network, then each new one Max
-                              picks in the Wi-Fi menu (waits for a portal sign-in)
+    netpick watch --baseline  measure this Wi-Fi network, then each new one you
+                              pick in the Wi-Fi menu (waits for a portal sign-in)
     netpick history           past measurements (--rank, --by-network)
     netpick import FILE...    load nettest.sh captures into the history
     netpick name ID NAME      give a network a friendly name
@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
+import ctypes
 import dataclasses
 import datetime as dt
 import fcntl
@@ -41,6 +43,8 @@ import statistics
 import struct
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -59,6 +63,8 @@ IP_BOUND_IF = 25  # <netinet/in.h> in the macOS 26 SDK: bind a socket to one int
 NQ_SAFETY = 2.0  # assume networkQuality moves this many times the one-stream rate
 NQ_MIN_SECONDS = 5  # a shorter networkQuality run says little; skip it instead
 NQ_BLIND_SECONDS = 8  # run length when no transfer estimate exists
+NQ_BLIND_MIN_MB = 20  # a blind run needs this much budget left, or the watchdog ends it with nothing to show
+RESOLVE_TIMEOUT = 3.0  # seconds to wait for the system resolver before using fixed addresses
 
 
 @dataclasses.dataclass
@@ -74,6 +80,18 @@ class Options:
     nq: bool = True
     nq_seconds: int = 20
     budget_mb: float = 100.0
+
+    def __post_init__(self):
+        # A NaN budget would make every budget comparison false, so the
+        # watchdog would never stop networkQuality: refuse it here as well as
+        # on the command line.
+        for name in ("ping_interval", "stream_down_mb", "stream_up_mb", "stream_seconds", "budget_mb"):
+            if _finite(getattr(self, name)) is None or getattr(self, name) < 0:
+                raise ValueError(f"Options.{name} must be a finite number, 0 or more, not {getattr(self, name)!r}")
+        for name in ("pings", "conns", "dns_tries", "nq_seconds"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"Options.{name} must be a whole number, 0 or more, not {v!r}")
 
 
 # ---------------------------------------------------------------- commands
@@ -135,9 +153,9 @@ READ_ONLY = {
     "ping": lambda a: _iface_after(a, "-b"),
     "curl": lambda a: _iface_after(a, "--interface"),
     "networkQuality": lambda a: _iface_after(a, "-I"),
-    # reads of routes, addresses, byte counters and Wi-Fi link stats
-    "netstat": lambda a: a[1:] == ["-rn", "-f", "inet"]
-    or (len(a) == 4 and a[1:3] == ["-ibn", "-I"] and _is_iface(a[3])),
+    # reads of routes, addresses and Wi-Fi link stats (byte counters come
+    # from the kernel through if_counters, not from a command)
+    "netstat": lambda a: a[1:] == ["-rn", "-f", "inet"],
     "ipconfig": _ipconfig_ok,
     "networksetup": lambda a: a[1:] == ["-listallhardwareports"],
     "route": lambda a: a[1:] == ["-n", "get", "default"],
@@ -227,7 +245,17 @@ def _is_ipv4(s) -> bool:
 def _finite(x):
     if isinstance(x, bool) or not isinstance(x, (int, float)):
         return None
-    return float(x) if math.isfinite(x) else None
+    try:
+        x = float(x)
+    except OverflowError:  # an int too large for a float, such as one read from a damaged history line
+        return None
+    return x if math.isfinite(x) else None
+
+
+def first_ipv4(text):
+    """The first IPv4 address among text's whitespace- or comma-separated
+    words: a DHCP option can list more than one DNS server."""
+    return next((w for w in re.split(r"[\s,]+", text or "") if _is_ipv4(w)), None)
 
 
 PING_COUNTS = re.compile(
@@ -326,17 +354,59 @@ def parse_default_routes(text):
     return routes
 
 
-def parse_if_bytes(text, iface):
-    """`netstat -ibn -I <if>` -> (bytes in, bytes out) from the link-layer row.
-    Read from the right, because the Address column can be empty."""
-    for line in (text or "").splitlines():
-        f = line.split()
-        if len(f) >= 9 and f[0] == iface and f[2].startswith("<Link#"):
-            try:
-                return int(f[-5]), int(f[-2])
-            except ValueError:
-                return None
-    return None
+# Interface byte counters come from the kernel's interface MIB:
+# sysctl {CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, <index>,
+# IFDATA_GENERAL} returns struct ifmibdata (<net/if_mib.h>): a 16-byte name,
+# five unsigned ints and a 16-byte filler, then struct if_data64 (packed to 4
+# bytes), whose received and sent byte counts sit 64 and 72 bytes in. These
+# are the counters `netstat -ib` prints. NET_RT_IFLIST2 gave counts rounded to
+# 1 KiB and cut to 32 bits on macOS 26 (2026-11-05), so netpick reads the MIB.
+IFMIB_IFDATA_GENERAL = (4, 18, 0, 2, None, 1)  # None: the interface index
+IFMIB_NAME_LEN = 16
+IFMIB_DATA_AT = 52  # offset of if_data64 in ifmibdata
+IFDATA64_IBYTES_AT = 64  # offset of ifi_ibytes in if_data64; ifi_obytes follows
+
+_sysctl_fn = None
+
+
+def _sysctl():
+    global _sysctl_fn
+    if _sysctl_fn is None:
+        fn = ctypes.CDLL(None, use_errno=True).sysctl
+        fn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                       ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+        fn.restype = ctypes.c_int
+        _sysctl_fn = fn
+    return _sysctl_fn
+
+
+def parse_ifmib(data, iface):
+    """struct ifmibdata bytes -> (bytes in, bytes out), or None when the
+    record is short or names another interface."""
+    end = IFMIB_DATA_AT + IFDATA64_IBYTES_AT + 16
+    if not isinstance(data, (bytes, bytearray)) or len(data) < end:
+        return None
+    if data[:IFMIB_NAME_LEN].split(b"\0", 1)[0] != iface.encode("ascii", "replace"):
+        return None
+    return struct.unpack_from("=QQ", data, IFMIB_DATA_AT + IFDATA64_IBYTES_AT)
+
+
+def if_counters(iface):
+    """(bytes in, bytes out) on iface since boot, or None. One read-only
+    sysctl call, well under a millisecond and no process: the budget
+    watchdog reads this every half second while networkQuality runs, so a
+    slow command can never hold up a stop."""
+    try:
+        index = socket.if_nametoindex(iface)
+        sysctl = _sysctl()
+    except (OSError, ValueError, AttributeError):
+        return None
+    mib = (ctypes.c_int * 6)(*(index if x is None else x for x in IFMIB_IFDATA_GENERAL))
+    buf = ctypes.create_string_buffer(512)  # ifmibdata is 180 bytes on macOS 26
+    size = ctypes.c_size_t(ctypes.sizeof(buf))
+    if sysctl(mib, 6, buf, ctypes.byref(size), None, 0) != 0:  # no new value: a read
+        return None
+    return parse_ifmib(buf.raw[: size.value], iface)
 
 
 def parse_hardware_ports(text):
@@ -561,7 +631,7 @@ def utc_stamp(ts) -> str:
 def parse_stamp(s):
     try:
         return dt.datetime.fromisoformat(s).timestamp()
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
 
 
@@ -882,13 +952,15 @@ def nq_plan(opts, used_bytes, stream):
     if not opts.nq:
         return None, "off"
     remaining = opts.budget_mb * 1e6 - used_bytes
-    if remaining <= 0:
+    if not remaining > 0:
         return None, f"skipped: the {opts.budget_mb:g} MB budget is used up"
     st = stream or {}
     mbps = (_finite(st.get("down_mbps")) or 0.0) + (_finite(st.get("up_mbps")) or 0.0)
     if mbps > 0:
         rate = NQ_SAFETY * mbps * 1e6 / 8  # bytes per second
         secs = int(min(opts.nq_seconds, remaining // rate))  # a near-zero rate gives inf
+    elif remaining < NQ_BLIND_MIN_MB * 1e6:
+        return None, f"skipped: no transfer estimate, and under {NQ_BLIND_MIN_MB} MB of the budget left"
     else:
         secs = min(opts.nq_seconds, NQ_BLIND_SECONDS)
     if secs < NQ_MIN_SECONDS:
@@ -951,12 +1023,15 @@ def combine_rounds(parts) -> dict:
             "failures": [f for d in dnss for f in d.get("failures", [])],
         }
     streams = [p["stream"] for p in parts if p.get("stream")]
-    if streams:
+    ran = [s for s in streams if not s.get("skipped")]
+    if ran:
         out["stream"] = {
-            "down_mbps": _median([s.get("down_mbps") for s in streams]),
-            "up_mbps": _median([s.get("up_mbps") for s in streams]),
+            "down_mbps": _median([s.get("down_mbps") for s in ran]),
+            "up_mbps": _median([s.get("up_mbps") for s in ran]),
             "bytes": sum(s.get("bytes") or 0 for s in streams),
         }
+    elif streams:  # every round skipped it: keep the reason
+        out["stream"] = dict(streams[-1])
     nqs = [p["nq"] for p in parts if p.get("nq")]
     if nqs:
         done = [n for n in nqs if n.get("down_mbps") is not None or n.get("up_mbps") is not None]
@@ -979,15 +1054,17 @@ class Prober:
     """Measures links. Every external effect goes through runner, dns,
     resolve, clock and sleep, so tests can drive it without a network."""
 
-    def __init__(self, runner=None, *, opts=None, dns=dns_lookup, resolve=system_resolve,
-                 clock=time.time, sleep=time.sleep, log=None):
+    def __init__(self, runner=None, *, opts=None, dns=dns_lookup, resolve=system_resolve, counters=if_counters,
+                 clock=time.time, sleep=time.sleep, log=None, resolve_timeout=RESOLVE_TIMEOUT):
         self.runner = runner or Runner()
         self.opts = opts or Options()
         self.dns = dns
         self.resolve = resolve
+        self.counters = counters
         self.clock = clock
         self.sleep = sleep
         self.log = log or (lambda msg: None)
+        self.resolve_timeout = resolve_timeout
 
     # -- reads (no traffic)
     def default_routes(self):
@@ -1017,16 +1094,33 @@ class Prober:
 
     def dns_server(self, iface):
         p = self.runner.run(["ipconfig", "getoption", iface, "domain_name_server"], 5)
-        ip = p.out.strip()
-        return ip if p.rc == 0 and _is_ipv4(ip) else None
+        return first_ipv4(p.out) if p.rc == 0 else None
 
     def wlan(self, iface):
         p = self.runner.run(["osascript", "-l", "JavaScript", "-e", WLAN_JXA, iface], 10)
         return parse_wlan_json(p.out) if p.rc == 0 else None
 
-    def if_bytes(self, iface):
-        p = self.runner.run(["netstat", "-ibn", "-I", iface], 5)
-        return parse_if_bytes(p.out, iface) if p.rc == 0 else None
+    def pinned_ips(self):
+        """The address each connection probe pins with --resolve: the primary
+        network's answer when it comes back in time with a public address,
+        else a fixed one. getaddrinfo has no timeout of its own and can block
+        for minutes, so each lookup runs in a daemon thread that netpick
+        abandons at the deadline (a daemon thread never holds up exit)."""
+        got = {}
+
+        def look(host):
+            try:
+                got[host] = self.resolve(host)
+            except Exception:  # a resolver error means: use the fixed address
+                got[host] = None
+
+        threads = [threading.Thread(target=look, args=(h,), name=f"netpick resolve {h}", daemon=True) for h in HOSTS]
+        for t in threads:
+            t.start()
+        deadline = time.monotonic() + self.resolve_timeout
+        for t in threads:
+            t.join(max(deadline - time.monotonic(), 0))
+        return {h: (got.get(h) if _is_ipv4(got.get(h)) else None) or FALLBACK_IPS[h] for h in HOSTS}
 
     def wifi_interface(self):
         for dev, port in self.hardware_ports().items():
@@ -1118,10 +1212,15 @@ class Prober:
         return {"attempted": sum(v[1] for v in by_host.values()), "ok": sum(v[0] for v in by_host.values()),
                 "by_host": by_host, "tls_s": tls, "failures": failures}
 
-    def stream(self, iface):
+    def stream(self, iface, used_bytes=0):
         """One bounded download and upload (5 MB / 2.5 MB by default): a
-        one-connection rate, and the estimate the networkQuality plan uses."""
+        one-connection rate, and the estimate the networkQuality plan uses.
+        It runs only when the link's budget still covers all of it."""
         o = self.opts
+        planned = (o.stream_down_mb + o.stream_up_mb) * 1e6
+        if not planned <= o.budget_mb * 1e6 - used_bytes:
+            return {"skipped": f"skipped: its {planned / 1e6:g} MB would pass the {o.budget_mb:g} MB budget",
+                    "down_mbps": None, "up_mbps": None, "bytes": 0}
         fmt = "%{exitcode} %{size_download} %{speed_download} %{size_upload} %{speed_upload} %{time_total}"
         out = {"down_mbps": None, "up_mbps": None, "bytes": 0}
         down = ["curl", "--interface", iface, "-s", "-o", "/dev/null", "-m", f"{o.stream_seconds:g}", "-w", fmt,
@@ -1147,33 +1246,40 @@ class Prober:
         if secs is None:
             return {"skipped": why, "bytes": 0}
         remaining = self.opts.budget_mb * 1e6 - used_bytes
-        start = self.if_bytes(iface)
+        start = self.counters(iface)
+        if start is None:  # no way to watch the budget, so no run
+            return {"skipped": f"skipped: no byte counters for {iface} to hold it to the budget", "bytes": 0}
+        last = start  # the latest good reading
 
         def should_stop(_elapsed):
             # Counts everything on the link, the fleet's own traffic included,
-            # so it stops early rather than late.
-            now = self.if_bytes(iface) if start else None
-            if now and sum(now) - sum(start) >= remaining:
-                return "budget"
-            return None
+            # so it stops early rather than late. A failed or backward reading
+            # (the link went away) stops the run too.
+            nonlocal last
+            now = self.counters(iface)
+            if now is None or sum(now) < sum(last):
+                return "counters"
+            last = now
+            return "budget" if sum(now) - sum(start) >= remaining else None
 
         p = self.runner.run_watched(["networkQuality", "-I", iface, "-M", str(secs), "-c"], secs + 15, should_stop)
-        end = self.if_bytes(iface) if start else None
-        moved = sum(end) - sum(start) if start and end else None
+        end = self.counters(iface)
+        if end is not None and sum(end) >= sum(last):
+            last = end
+        moved = sum(last) - sum(start)  # a failed final read still counts what the last good one saw
         if p.stopped:
-            return {"stopped": p.stopped, "planned_s": secs, "seconds": round(p.seconds, 1), "bytes": moved or 0}
+            return {"stopped": p.stopped, "planned_s": secs, "seconds": round(p.seconds, 1), "bytes": moved}
         got = parse_nq_json(p.out)
         if not got or got.get("error"):
             err = (got or {}).get("error") or (p.err.strip()[-200:] or f"exit {p.rc}")
-            return {"error": err, "planned_s": secs, "bytes": (got or {}).get("bytes") or moved or 0}
+            return {"error": err, "planned_s": secs, "bytes": (got or {}).get("bytes") or moved}
         got["planned_s"] = secs
         if got.get("bytes") is None:
-            got["bytes"] = moved or 0
+            got["bytes"] = moved
         return got
 
     def api_check(self, iface, n=4):
-        ips = {h: self.resolve(h) or FALLBACK_IPS[h] for h in HOSTS}
-        return self.conns(iface, ips, per_host=n)
+        return self.conns(iface, self.pinned_ips(), per_host=n)
 
     # -- one measurement run over several links at the same moment
     def _phase(self, name, recs, fn):
@@ -1216,9 +1322,9 @@ class Prober:
         for r in recs:
             if not r["online"]:
                 r["notes"].append("no internet (captive portal not signed in?)")
-        ips = {h: self.resolve(h) or FALLBACK_IPS[h] for h in HOSTS} if live else {}
+        ips = self.pinned_ips() if live else {}
         parts = {r["interface"]: [] for r in live}
-        used = {r["interface"]: 0 for r in live}
+        used = {r["interface"]: 0 for r in live}  # bulk bytes per link, shared by every round's transfer and networkQuality
         for k in range(max(1, rounds)):
             part = {r["interface"]: {} for r in live}
             if rounds > 1:
@@ -1233,7 +1339,7 @@ class Prober:
 
             def do_stream(r, part=part):
                 if self.opts.stream:
-                    st = self.stream(r["interface"])
+                    st = self.stream(r["interface"], used[r["interface"]])
                     used[r["interface"]] += st["bytes"]
                     part[r["interface"]]["stream"] = st
 
@@ -1267,6 +1373,48 @@ def state_dir() -> Path:
     return Path(os.environ.get("NETPICK_HOME") or Path.home() / ".local" / "state" / "netpick")
 
 
+# What a history line must look like for the views to show it. A line that
+# doesn't match is skipped and counted, never shown half-read.
+_STR_FIELDS = ("label", "name", "kind", "security", "security_class", "gateway", "port", "interface", "mode",
+               "source_label", "run", "ip", "dns_server")
+_DICT_FIELDS = ("metrics", "ping", "conns", "dns", "stream", "nq", "egress", "wifi")
+_NUM_FIELDS = {
+    None: ("data_bytes", "duration_s", "rounds"),
+    "metrics": ("conn_ratio", "loss_pct", "latency_ms", "up_mbps", "down_mbps", "rpm"),
+    "ping": ("sent", "received", "loss_pct", "min_ms", "avg_ms", "max_ms", "stddev_ms"),
+    "conns": ("attempted", "ok"),
+    "dns": ("attempts", "ok", "median_ms", "max_ms"),
+    "stream": ("down_mbps", "up_mbps", "bytes"),
+    "nq": ("down_mbps", "up_mbps", "rpm", "base_rtt_ms", "bytes", "seconds", "planned_s"),
+}
+_SUB_STR_FIELDS = {"metrics": ("via",), "egress": ("org",), "nq": ("skipped", "stopped", "error"),
+                   "stream": ("skipped",), "dns": ("server",)}
+
+
+def usable_record(r) -> bool:
+    """Whether a parsed history line holds a record the views can show."""
+    if not isinstance(r, dict) or not isinstance(r.get("network_id"), str) or not r["network_id"]:
+        return False
+    if not isinstance(r.get("time"), str) or parse_stamp(r["time"]) is None:
+        return False
+    if any(r.get(k) is not None and not isinstance(r[k], str) for k in _STR_FIELDS):
+        return False
+    if r.get("online") is not None and not isinstance(r["online"], bool):
+        return False
+    if any(r.get(k) is not None and not isinstance(r[k], dict) for k in _DICT_FIELDS):
+        return False
+    for where, fields in _NUM_FIELDS.items():
+        d = r if where is None else (r.get(where) or {})
+        if any(d.get(f) is not None and _finite(d[f]) is None for f in fields):
+            return False
+    for where, fields in _SUB_STR_FIELDS.items():
+        d = r.get(where) or {}
+        if any(d.get(f) is not None and not isinstance(d[f], str) for f in fields):
+            return False
+    notes = r.get("notes")
+    return notes is None or (isinstance(notes, list) and all(isinstance(n, str) for n in notes))
+
+
 class Store:
     """Append-only JSONL history plus a names file next to it."""
 
@@ -1274,11 +1422,24 @@ class Store:
         self.path = Path(path or os.environ.get("NETPICK_HISTORY") or state_dir() / "history.jsonl").expanduser()
         self.names_path = self.path.with_name("names.json")
 
+    def problem(self):
+        """Why netpick can't use this history path, or None. Saving a name
+        replaces the names.json next to the history whole, so a history kept
+        in a file by that name, directly or through a link, could be lost."""
+        if self.path.is_dir():
+            return f"{self.path} is a directory; --history takes a file"
+        if Path(os.path.realpath(self.path)).name == self.names_path.name:
+            return f"--history can't be {self.path}: netpick keeps network names in names.json files"
+        return None
+
+    # errors="backslashreplace" in both writers: a lone surrogate, which only
+    # a damaged or hostile input can produce, goes to the file as its JSON
+    # escape, so the line still parses to the same text instead of failing.
     def append(self, records):
         if not records:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as f:
+        with open(self.path, "a", encoding="utf-8", errors="backslashreplace") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             for r in records:
                 f.write(json.dumps(r, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
@@ -1296,32 +1457,65 @@ class Store:
                     continue
                 try:
                     r = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     bad += 1
                     continue
-                if isinstance(r, dict) and r.get("time") and r.get("network_id"):
+                if usable_record(r):
                     recs.append(r)
                 else:
                     bad += 1
         return recs, bad
 
-    def names(self):
+    def read_names(self):
+        """The names file's {network id: name} entries, or {} when there's no
+        file. Raises OSError when the file can't be read and ValueError or
+        RecursionError when it holds no JSON object."""
         try:
-            data = json.loads(self.names_path.read_text())
-        except (OSError, ValueError):
+            text = self.names_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return {}
-        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(data, dict) else {}
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("it holds no JSON object")
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+    def names(self):
+        """The names to show: none when the file can't be read."""
+        try:
+            return self.read_names()
+        except (OSError, ValueError, RecursionError):
+            return {}
 
     def set_name(self, nid, name):
-        names = self.names()
+        # A names file that doesn't parse stops the write, so a hand edit
+        # gone wrong costs no names.
+        names = self.read_names()
         if name:
             names[nid] = name
         else:
             names.pop(nid, None)
         self.names_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.names_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(names, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
-        tmp.replace(self.names_path)
+        # A fresh temporary file (mkstemp creates it and fails rather than
+        # reuse a path), so the write can't land on the history.
+        fd, tmp = tempfile.mkstemp(dir=self.names_path.parent, prefix=".names-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
+                f.write(json.dumps(names, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+            os.replace(tmp, self.names_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+
+
+def save(store, records, out) -> bool:
+    """Append records to the history; on a write error, say so and go on."""
+    try:
+        store.append(records)
+        return True
+    except OSError as e:
+        out(f"netpick: couldn't write the history {store.path}: {e.strerror or e}")
+        return False
 
 
 def parse_window(s):
@@ -1426,6 +1620,9 @@ def notes_for(recs) -> list:
             med = d.get("median_ms")
             lines.append(f"{tag}: DNS {d['server']} answered {d['ok']}/{d['attempts']}"
                          + (f", median {med:.0f} ms, max {d['max_ms']:.0f} ms" if med is not None else ""))
+        st = r.get("stream") or {}
+        if st.get("skipped"):
+            lines.append(f"{tag}: bounded transfer {st['skipped']}")
         for n in r.get("notes") or []:
             lines.append(f"{tag}: {n}")
     return lines
@@ -1454,8 +1651,7 @@ def cmd_now(args, prober, store, out):
         return 3
     names = store.names()
     recs = prober.measure(cands, mode="now", rounds=args.rounds, names=names)
-    if not args.no_history:
-        store.append(recs)
+    saved = not args.no_history and save(store, recs, out)
     ranked = rank(recs)
     current = next((r for r in recs if r.get("primary")), None)
     rec = recommend(ranked, current, names)
@@ -1490,14 +1686,15 @@ def cmd_now(args, prober, store, out):
         top_earlier = rank(earlier)[0]
         pick = rec.get("pick")
         if pick and top_earlier.get("online"):
-            d = deciding(top_earlier["metrics"], pick["metrics"])
-            if d and d[1] and rank_key(top_earlier["metrics"]) < rank_key(pick["metrics"]):
+            then = top_earlier.get("metrics") or compute_metrics(top_earlier)
+            d = deciding(then, pick["metrics"])
+            if d and d[1] and rank_key(then) < rank_key(pick["metrics"]):
                 out(f"{display_name(top_earlier, names)} beat {display_name(pick, names)} on {FIELD_WORDS[d[0]]} "
                     "when measured; to recheck it, run `netpick watch --baseline` and pick it in the Wi-Fi menu.")
     total = sum(r.get("data_bytes") or 0 for r in recs)
     used = f"{fmt_mb(total)} MB" if total >= 1e6 else "under 1 MB"
     out(f"\n{len(recs)} link(s), {used} used, {max(r.get('duration_s') or 0 for r in recs):.0f} s"
-        + ("" if args.no_history else f"; history: {store.path}"))
+        + (f"; history: {store.path}" if saved else ""))
     return 0
 
 
@@ -1510,7 +1707,7 @@ def wait_online(prober, iface, gw, limit, out, step=3.0):
             return "online"
         if prober.clock() - start >= limit:
             return "timeout"
-        prober.sleep(step)
+        prober.sleep(min(step, max(limit - (prober.clock() - start), 0)))
         if prober.gateway(iface) != gw:
             return "changed"
 
@@ -1533,9 +1730,15 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
         out("No Wi-Fi interface found.")
         return 3
     names = store.names()
-    start = prober.clock()
-    seen = {g for g in seen if g}
+    deadline = prober.clock() + minutes * 60
+    # Gateways measured in this run or listed with --seen. A visit that ends
+    # before a measurement (the network changed, the portal never opened)
+    # leaves its gateway out, so a later visit gets a full measurement.
+    tested = {g for g in seen if g}
     measured = []
+
+    def left():
+        return deadline - prober.clock()
 
     def stamp():
         return dt.datetime.fromtimestamp(prober.clock(), dt.timezone.utc).strftime("%H:%M:%SZ")
@@ -1546,7 +1749,7 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
             return None
         rec = prober.measure(cands, mode="watch", names=names)[0]
         if record:
-            store.append([rec])
+            save(store, [rec], out)
         measured.append(rec)
         return rec
 
@@ -1563,47 +1766,61 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
     if baseline:
         if gw and prober.captive(wifi):
             out(f"{stamp()} baseline: measuring the current network (gateway {gw})")
-            if measure_now():
+            rec = measure_now()
+            if rec:
+                if rec.get("online"):
+                    tested.add(gw)
                 show()
         else:
             out(f"{stamp()} baseline skipped: the current Wi-Fi network has no internet")
-    if gw:
-        seen.add(gw)
     last = gw
     new = 0
     out(f"{stamp()} watching {wifi} for up to {minutes:g} min and {max_new} new network(s). Pick networks in the "
         "Wi-Fi menu and sign in to any portal; netpick never joins or leaves one.")
-    while new < max_new and prober.clock() - start < minutes * 60:
+    # The time limit holds for every step: no wait runs past it, and no
+    # settle or measurement starts that it would cut short. A measurement
+    # already under way finishes.
+    while new < max_new and left() > 0:
         gw = prober.gateway(wifi)
         if gw and gw != last and prober.ipaddr(wifi):
             last = gw
-            if gw in seen:
+            if gw in tested:
                 out(f"{stamp()} back on gateway {gw} (tested already)")
-                if wait_online(prober, wifi, gw, 60, out) == "online" and settle_wait(prober, wifi, gw, min(settle, 15)):
+                quick = min(settle, 15)
+                if (wait_online(prober, wifi, gw, min(60, max(left(), 0)), out) == "online" and left() >= quick
+                        and settle_wait(prober, wifi, gw, quick)):
                     c = prober.api_check(wifi, 4)
                     out(f"   API check: {c['by_host'][HOSTS[0]][0]}/{c['by_host'][HOSTS[0]][1]} Claude API, "
                         f"{c['by_host'][HOSTS[1]][0]}/{c['by_host'][HOSTS[1]][1]} GitHub connections")
                 continue
-            seen.add(gw)
             sec = prober.summary(wifi).get("security") or "?"
             out(f"{stamp()} new network: gateway {gw}, ip {prober.ipaddr(wifi)}, security {sec}")
-            left = minutes * 60 - (prober.clock() - start)
-            status = wait_online(prober, wifi, gw, max(min(portal_wait, left), 0), out)
+            limit = max(min(portal_wait, left()), 0)
+            status = wait_online(prober, wifi, gw, limit, out)
             if status == "changed":
                 out("   the network changed while waiting for internet")
                 continue
             if status != "online":
-                out(f"   still no internet after {min(portal_wait, left) / 60:.0f} min (portal not signed in?); skipped")
+                if limit < portal_wait:
+                    out(f"   no internet before the {minutes:g}-minute limit; not measured")
+                    break
+                out(f"   still no internet after {portal_wait / 60:.0f} min (portal not signed in?); skipped")
                 continue
+            if left() < settle:
+                out(f"   the {minutes:g}-minute limit ends before DNS could settle for {settle:g}s; not measured")
+                break
             out(f"   letting DNS settle for {settle:g}s")
             if not settle_wait(prober, wifi, gw, settle):
                 out("   the network changed while settling; skipped")
                 continue
             out(f"{stamp()} measuring")
-            if measure_now():
+            rec = measure_now()
+            if rec:
                 new += 1
+                if rec.get("online"):
+                    tested.add(gw)
                 show()
-        prober.sleep(poll)
+        prober.sleep(min(poll, max(left(), 0)))
     out(f"{stamp()} done: measured {len(measured)} network(s)")
     if len(measured) > 1:
         show()
@@ -1694,13 +1911,22 @@ def cmd_import(args, store, out):
         keys.add(key)
         added.append(rec)
         out(f"{path}: {rec['source_label']} at {rec['time']} -> {rec['network_id']} ({rec['label']})")
-    store.append(added)
+    if not save(store, added, out):
+        return 1
     out(f"imported {len(added)} measurement(s) into {store.path}")
     return 0
 
 
 def cmd_name(args, store, out):
-    names = store.names()
+    try:
+        names = store.read_names()
+    except OSError as e:
+        out(f"netpick: couldn't read the names file {store.names_path}: {e.strerror or e}")
+        return 1
+    except (ValueError, RecursionError):
+        out(f"netpick: the names file {store.names_path} doesn't parse as a JSON object, "
+            "so netpick leaves it as it is; fix or remove it")
+        return 1
     if args.list or not args.id:
         if not names:
             out("No names yet. Use: netpick name ID NAME (ids appear in netpick's tables).")
@@ -1714,7 +1940,11 @@ def cmd_name(args, store, out):
         out(f"{args.id}: " + ("no such network id" if not matches else "ambiguous: " + ", ".join(matches)))
         return 2
     nid = matches[0]
-    store.set_name(nid, None if args.clear else " ".join(args.name).strip() or None)
+    try:
+        store.set_name(nid, None if args.clear else " ".join(args.name).strip() or None)
+    except OSError as e:
+        out(f"netpick: couldn't write the names file {store.names_path}: {e.strerror or e}")
+        return 1
     out(f"{nid}: " + ("name cleared" if args.clear or not args.name else f"named {' '.join(args.name).strip()!r}"))
     return 0
 
@@ -1736,6 +1966,21 @@ def cmd_interfaces(args, prober, out):
     return 0
 
 
+def _num(kind, lo, hi):
+    """An argparse type for a finite number from lo to hi. A NaN budget or an
+    infinite settle would otherwise slip past every limit check."""
+    def parse(text):
+        try:
+            x = kind(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+        if not math.isfinite(x) or not lo <= x <= hi:
+            raise argparse.ArgumentTypeError(f"{text} is outside {lo:g} to {hi:g}")
+        return x
+    parse.__name__ = kind.__name__
+    return parse
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="netpick",
@@ -1751,11 +1996,13 @@ def build_parser():
 
     def probe_flags(sp):
         g = sp.add_argument_group("probes")
-        g.add_argument("--pings", type=int, default=40, help="pings per link, 0.25 s apart (default 40)")
-        g.add_argument("--conns", type=int, default=4, help="HTTPS connections per host per link (default 4, so 8)")
-        g.add_argument("--budget-mb", type=float, default=100.0,
-                       help="data cap per link per run, networkQuality included (default 100)")
-        g.add_argument("--nq-seconds", type=int, default=20, help="longest networkQuality run (default 20)")
+        g.add_argument("--pings", type=_num(int, 1, 400), default=40, help="pings per link, 0.25 s apart (default 40)")
+        g.add_argument("--conns", type=_num(int, 1, 20), default=4,
+                       help="HTTPS connections per host per link (default 4, so 8)")
+        g.add_argument("--budget-mb", type=_num(float, 0, 10000), default=100.0,
+                       help="data cap per link per run: the bounded transfer and networkQuality (default 100)")
+        g.add_argument("--nq-seconds", type=_num(int, NQ_MIN_SECONDS, 60), default=20,
+                       help="longest networkQuality run (default 20)")
         g.add_argument("--no-nq", action="store_true", help="skip networkQuality (no responsiveness)")
         g.add_argument("--no-transfer", action="store_true", help="skip the bounded 5 MB down / 2.5 MB up transfer")
         g.add_argument("--quick", action="store_true", help="ping, DNS and connections only: well under 1 MB per link")
@@ -1765,25 +2012,28 @@ def build_parser():
     now = sub.add_parser("now", help="measure the live links now and recommend one (the default)")
     probe_flags(now)
     now.add_argument("--interfaces", metavar="LIST", help="comma-separated, e.g. en0,en13 (default: every en* link)")
-    now.add_argument("--rounds", type=int, default=1, help="repeat the paired measurement and pool the rounds")
+    now.add_argument("--rounds", type=_num(int, 1, 10), default=1,
+                     help="repeat the paired measurement and pool the rounds (one budget covers them all)")
     now.add_argument("--recent", default="2h", help="also list other networks measured this recently (default 2h; 0 hides)")
     now.add_argument("--json", action="store_true", help="print records, ranking and recommendation as JSON")
 
-    w = sub.add_parser("watch", help="measure each new Wi-Fi network Max switches to")
+    w = sub.add_parser("watch", help="measure each new Wi-Fi network you switch to")
     probe_flags(w)
     w.add_argument("--seen", metavar="GATEWAYS", help="comma-separated gateways already tested (skipped)")
     w.add_argument("--baseline", action="store_true", help="measure the current Wi-Fi network first")
-    w.add_argument("--max", type=int, default=3, help="stop after this many new networks (default 3)")
-    w.add_argument("--minutes", type=float, default=30.0, help="stop after this long (default 30)")
-    w.add_argument("--portal-wait", type=float, default=480.0, help="seconds to wait for a portal sign-in (default 480)")
-    w.add_argument("--settle", type=float, default=30.0, help="seconds to let DNS settle before measuring (default 30)")
-    w.add_argument("--poll", type=float, default=2.0, help="seconds between gateway checks (default 2)")
+    w.add_argument("--max", type=_num(int, 0, 50), default=3, help="stop after this many new networks (default 3)")
+    w.add_argument("--minutes", type=_num(float, 0, 1440), default=30.0, help="stop after this long (default 30)")
+    w.add_argument("--portal-wait", type=_num(float, 0, 3600), default=480.0,
+                   help="seconds to wait for a portal sign-in (default 480)")
+    w.add_argument("--settle", type=_num(float, 0, 600), default=30.0,
+                   help="seconds to let DNS settle before measuring (default 30)")
+    w.add_argument("--poll", type=_num(float, 0.5, 60), default=2.0, help="seconds between gateway checks (default 2)")
 
     h = sub.add_parser("history", help="past measurements")
     history_flag(h)
     h.add_argument("--since", default="all", help="window such as 2h, 7d or all (default all)")
     h.add_argument("--network", metavar="ID|TEXT", help="only this network id (prefix) or name/label text")
-    h.add_argument("--limit", type=int, default=30, help="rows to show (default 30)")
+    h.add_argument("--limit", type=_num(int, 1, 1_000_000), default=30, help="rows to show (default 30)")
     mode = h.add_mutually_exclusive_group()
     mode.add_argument("--rank", action="store_true", help="rank each network's latest measurement")
     mode.add_argument("--by-network", action="store_true", help="one row per network with medians")
@@ -1810,7 +2060,15 @@ def main(argv=None, *, prober=None, store=None, out=None) -> int:
     if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version")):
         argv = ["now", *argv]
     args = build_parser().parse_args(argv)
-    out = out or (lambda s="": print(s, flush=True))
+    if out is None:
+        # A label from a damaged history line can hold a character the
+        # terminal can't encode; print its escape rather than fail.
+        with contextlib.suppress(AttributeError, ValueError):
+            sys.stdout.reconfigure(errors="backslashreplace")
+
+        def out(s=""):
+            print(s, flush=True)
+
     store = store or Store(getattr(args, "history", None))
     for flag in ("recent", "since"):
         try:
@@ -1818,6 +2076,10 @@ def main(argv=None, *, prober=None, store=None, out=None) -> int:
         except ValueError as e:
             out(f"netpick: --{flag}: {e}")
             return 2
+    problem = store.problem() if args.cmd != "interfaces" else None
+    if problem:
+        out(f"netpick: {problem}")
+        return 2
     if args.cmd == "history":
         return cmd_history(args, store, out)
     if args.cmd == "import":

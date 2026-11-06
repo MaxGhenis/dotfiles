@@ -12,23 +12,19 @@ from __future__ import annotations
 import ast
 import json
 import math
-import os
 import socket
 import statistics
 import struct
+import subprocess
 import sys
 import threading
+import time
 
 import pytest
-from hypothesis import assume, given, settings
+from hypothesis import assume, given
 from hypothesis import strategies as st
 
-from netpick_fakes import FIXTURES, NP, SCRIPT
-
-# Quick by default; NETPICK_HYPOTHESIS=thorough runs 25 times the examples.
-settings.register_profile("netpick", max_examples=200, deadline=None)
-settings.register_profile("thorough", max_examples=5000, deadline=None)
-settings.load_profile(os.environ.get("NETPICK_HYPOTHESIS", "netpick"))
+from netpick_fakes import FIXTURES, NP, SCRIPT  # netpick_fakes also loads the Hypothesis profile
 
 
 def fixture(name):
@@ -140,11 +136,82 @@ def test_routes_one_link_and_two():
     assert NP.parse_default_routes("default  link#22  UCSIg  utun3\n") == {"utun3": {"gateway": None, "flags": "UCSIg"}}
 
 
-def test_interface_byte_counters():
-    assert NP.parse_if_bytes(fixture("netstat_ibn_en0.txt"), "en0") == (8431698381, 1882638951)
-    assert NP.parse_if_bytes(fixture("netstat_ibn_en0.txt"), "en13") is None
-    no_addr = "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\nen13 1500 <Link#24> 5 0 700 6 0 800 0\n"
-    assert NP.parse_if_bytes(no_addr, "en13") == (700, 800)
+def ifmib(name, ibytes, obytes, size=180):
+    """A struct ifmibdata as the kernel returns it (180 bytes on macOS 26)."""
+    b = bytearray(size)
+    b[: len(name)] = name.encode()
+    struct.pack_into("=QQ", b, NP.IFMIB_DATA_AT + NP.IFDATA64_IBYTES_AT, ibytes, obytes)
+    return bytes(b)
+
+
+def test_interface_mib_record():
+    assert NP.parse_ifmib(ifmib("en0", 8431698381, 1882638951), "en0") == (8431698381, 1882638951)
+    assert NP.parse_ifmib(ifmib("en13", 2**40 + 5, 2**33 + 7), "en13") == (2**40 + 5, 2**33 + 7)  # 64-bit counts
+    assert NP.parse_ifmib(ifmib("en0", 1, 2, size=132), "en0") == (1, 2)  # just long enough
+    assert NP.parse_ifmib(ifmib("en0", 1, 2, size=132)[:131], "en0") is None
+    assert NP.parse_ifmib(ifmib("en1", 1, 2), "en0") is None  # another interface's record
+    assert NP.parse_ifmib(ifmib("en01", 1, 2), "en0") is None
+    assert NP.parse_ifmib(None, "en0") is None
+
+
+def netstat_link_bytes(text, iface):
+    """Bytes in and out from `netstat -ibn`'s link row (lo0 has no address column)."""
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) >= 10 and f[0] == iface and f[2].startswith("<Link#"):
+            return int(f[-5]), int(f[-2])
+    return None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the interface MIB is macOS's")
+def test_kernel_byte_counters_match_netstat():
+    """Differential: netstat -ib, read between two of netpick's reads, lies
+    between them. (NET_RT_IFLIST2, tried first, rounded to 1 KiB.)"""
+    assert netstat_link_bytes(fixture("netstat_ibn_en0.txt"), "en0") == (8431698381, 1882638951)
+    checked = 0
+    for iface in ("lo0", "en0"):
+        before = NP.if_counters(iface)
+        if before is None:
+            assert iface != "lo0", "every Mac has lo0"
+            continue
+        text = subprocess.run(["/usr/sbin/netstat", "-ibn", "-I", iface], capture_output=True, text=True,
+                              timeout=30).stdout
+        after = NP.if_counters(iface)
+        got = netstat_link_bytes(text, iface)
+        assert before[0] <= got[0] <= after[0] and before[1] <= got[1] <= after[1], (iface, before, got, after)
+        checked += 1
+    assert checked >= 1
+    assert NP.if_counters("en99") is None and NP.if_counters("en0\0x") is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the interface MIB is macOS's")
+def test_a_counter_read_is_quick_enough_for_the_watchdog():
+    t = time.perf_counter()
+    for _ in range(1000):
+        assert NP.if_counters("lo0") is not None
+    assert time.perf_counter() - t < 2.0  # about 13 µs each on this Mac; the watchdog reads every 0.5 s
+
+
+def test_the_only_sysctl_call_reads():
+    """sysctl(name, namelen, oldp, oldlenp, newp, newlen) changes a value
+    only when newp is set: every call netpick makes passes None, 0."""
+    tree = ast.parse(SCRIPT.read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "id", getattr(n.func, "attr", None)) in ("sysctl", "sysctlbyname", "sysctlnametomib")]
+    assert len(calls) == 1
+    for call in calls:
+        assert getattr(call.func, "id", None) == "sysctl" and len(call.args) == 6
+        assert [type(a).__name__ for a in call.args[4:]] == ["Constant", "Constant"]
+        assert [a.value for a in call.args[4:]] == [None, 0]
+    assert NP.IFMIB_IFDATA_GENERAL == (4, 18, 0, 2, None, 1)  # CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA
+
+
+def test_first_dns_server():
+    assert NP.first_ipv4("172.21.112.1\n") == "172.21.112.1"
+    assert NP.first_ipv4("1.1.1.1 8.8.8.8\n") == "1.1.1.1"
+    assert NP.first_ipv4("1.1.1.1,8.8.8.8") == "1.1.1.1"
+    assert NP.first_ipv4("fe80::1 999.1.1.1 10.0.0.1") == "10.0.0.1"
+    assert NP.first_ipv4("") is None and NP.first_ipv4(None) is None and NP.first_ipv4("no server") is None
 
 
 def test_hardware_ports_summary_route_and_wifi_stats():
@@ -387,6 +454,31 @@ def test_unusable_values_count_as_missing(m, field, bad):
     assert NP.rank_key(dict(m, **{field: bad})) == NP.rank_key(dict(m, **{field: None}))
 
 
+@pytest.mark.parametrize("cuts", [NP.CONN_CUTS, NP.UP_CUTS, NP.DOWN_CUTS], ids=["conns", "up", "down"])
+def test_higher_is_better_bands_include_their_cut(cuts):
+    for i, cut in enumerate(cuts):
+        assert NP.band_high(cut, cuts) == i
+        assert NP.band_high(math.nextafter(cut, math.inf), cuts) == i
+        assert NP.band_high(math.nextafter(cut, -math.inf), cuts) == i + 1
+
+
+@pytest.mark.parametrize("cuts", [NP.LOSS_CUTS, NP.LATENCY_CUTS], ids=["loss", "latency"])
+def test_lower_is_better_bands_include_their_cut(cuts):
+    for i, cut in enumerate(cuts):
+        assert NP.band_low(cut, cuts) == i
+        assert NP.band_low(math.nextafter(cut, -math.inf), cuts) == i
+        assert NP.band_low(math.nextafter(cut, math.inf), cuts) == i + 1
+
+
+def test_bands_match_the_documented_table():
+    """docs/netpick.md: all connections, one lost ping in 40, 100 ms, 20 Mbps
+    each sit in the best band."""
+    assert [NP.band_high(x, NP.CONN_CUTS) for x in (1.0, 7 / 8, 0.85, 5 / 8, 0.6, 4 / 8, None)] == [0, 1, 1, 2, 2, 3, 3]
+    assert [NP.band_low(x, NP.LOSS_CUTS) for x in (0.0, 100.0 * 1 / 40, 5.0, 7.5, 15.0, 22.5, None)] == [0, 0, 1, 1, 2, 3, 3]
+    assert [NP.band_low(x, NP.LATENCY_CUTS) for x in (51.1, 100.0, 225.6, 250.0, 500.0, 550.0)] == [0, 0, 1, 1, 2, 3]
+    assert [NP.band_high(x, NP.UP_CUTS) for x in (113.7, 20.0, 8.0, 3.0, 1.0, 0.5, None)] == [0, 0, 1, 2, 3, 4, 4]
+
+
 @given(finite(-10, 5000), finite(-10, 5000))
 def test_bands_are_monotone(x, y):
     lo, hi = min(x, y), max(x, y)
@@ -441,8 +533,8 @@ def test_networkquality_plan_fits_the_budget(budget, used, down, up, longest):
     mbps = (down or 0) + (up or 0)
     if mbps > 0:
         assert secs * NP.NQ_SAFETY * mbps * 1e6 / 8 <= remaining * (1 + 1e-9)
-    else:
-        assert secs <= NP.NQ_BLIND_SECONDS
+    else:  # no estimate: a short blind run, and only with room for the watchdog to let it finish
+        assert secs <= NP.NQ_BLIND_SECONDS and remaining >= NP.NQ_BLIND_MIN_MB * 1e6
 
 
 def test_networkquality_plan_examples():
@@ -455,7 +547,43 @@ def test_networkquality_plan_examples():
     secs, why = NP.nq_plan(o, 7.5e6, {"down_mbps": 38, "up_mbps": 60})
     assert secs is None and "100 MB budget" in why
     assert NP.nq_plan(o, 0, {}) == (NP.NQ_BLIND_SECONDS, None)
-    assert NP.nq_plan(o, 2e8, {})[0] is None
+    assert NP.nq_plan(o, 2e8, {}) == (None, "skipped: the 100 MB budget is used up")
+    assert NP.nq_plan(NP.Options(budget_mb=20), 0, None) == (NP.NQ_BLIND_SECONDS, None)
+    assert NP.nq_plan(NP.Options(budget_mb=15), 0, None) == (
+        None, "skipped: no transfer estimate, and under 20 MB of the budget left")
+    assert NP.nq_plan(NP.Options(budget_mb=0), 0, None) == (None, "skipped: the 0 MB budget is used up")
+
+
+@pytest.mark.parametrize("field, bad", [
+    ("budget_mb", math.nan), ("budget_mb", math.inf), ("budget_mb", -1.0), ("budget_mb", "100"), ("budget_mb", True),
+    ("stream_down_mb", math.nan), ("stream_up_mb", -0.5), ("stream_seconds", math.inf), ("ping_interval", -0.25),
+    ("pings", 1.5), ("pings", True), ("pings", -1), ("conns", "4"), ("dns_tries", None), ("nq_seconds", 8.0),
+])
+def test_options_refuse_limits_that_would_disarm_a_check(field, bad):
+    with pytest.raises(ValueError, match=field):
+        NP.Options(**{field: bad})
+
+
+@pytest.mark.parametrize("argv", [
+    ["now", "--budget-mb", "nan"], ["now", "--budget-mb", "inf"], ["now", "--budget-mb", "1e400"],
+    ["now", "--budget-mb", "-1"], ["now", "--budget-mb", "10001"], ["now", "--pings", "0"], ["now", "--pings", "1.5"],
+    ["now", "--conns", "21"], ["now", "--nq-seconds", "4"], ["now", "--rounds", "11"], ["now", "--rounds", "nan"],
+    ["watch", "--settle", "inf"], ["watch", "--minutes", "nan"], ["watch", "--minutes", "-1"],
+    ["watch", "--portal-wait", "-5"], ["watch", "--poll", "0"], ["watch", "--max", "-1"], ["watch", "--budget-mb", "nan"],
+    ["history", "--limit", "0"],
+], ids=lambda a: " ".join(a))
+def test_cli_refuses_nonfinite_and_out_of_range_limits(argv, capsys):
+    with pytest.raises(SystemExit) as e:
+        NP.build_parser().parse_args(argv)
+    assert e.value.code == 2 and argv[-2] in capsys.readouterr().err
+
+
+def test_cli_accepts_the_range_ends():
+    p = NP.build_parser()
+    assert p.parse_args(["now", "--budget-mb", "0"]).budget_mb == 0.0
+    assert p.parse_args(["now", "--budget-mb", "10000", "--pings", "400", "--nq-seconds", "5"]).pings == 400
+    w = p.parse_args(["watch", "--minutes", "0", "--settle", "600", "--poll", "0.5", "--max", "0"])
+    assert (w.minutes, w.settle, w.poll, w.max) == (0.0, 600.0, 0.5, 0)
 
 
 # ---------------------------------------------------------------- pooling rounds
@@ -532,6 +660,7 @@ FORBIDDEN = [
     ["curl", "--interface", "lo0", "https://api.anthropic.com/"],
     ["networkQuality", "-M", "20"],
     ["netstat", "-rn"],
+    ["netstat", "-ibn", "-I", "en0"],  # byte counters come from sysctl now, not a command the watchdog waits on
     ["osascript", "-e", 'do shell script "networksetup -setairportpower en0 off"'],
     ["osascript", "-l", "JavaScript", "-e", "$.CWWiFiClient.sharedWiFiClient.interface.disassociate", "en0"],
     ["osascript", "-l", "JavaScript", "-e", NP.WLAN_JXA, "en0; rm -rf ~"],
@@ -549,7 +678,7 @@ def test_guard_refuses_anything_but_bound_reads(argv):
 def test_guard_allows_the_reads_and_bound_probes():
     for argv in (["ping", "-b", "en13", "-c", "40", "1.1.1.1"], ["curl", "-s", "--interface", "en0", "https://x/"],
                  ["networkQuality", "-I", "en0", "-M", "8", "-c"], ["netstat", "-rn", "-f", "inet"],
-                 ["netstat", "-ibn", "-I", "en0"], ["ipconfig", "getifaddr", "en0"],
+                 ["ipconfig", "getifaddr", "en0"],
                  ["ipconfig", "getoption", "en13", "domain_name_server"], ["networksetup", "-listallhardwareports"],
                  ["route", "-n", "get", "default"], ["osascript", "-l", "JavaScript", "-e", NP.WLAN_JXA, "en0"]):
         NP.check_command(argv)
