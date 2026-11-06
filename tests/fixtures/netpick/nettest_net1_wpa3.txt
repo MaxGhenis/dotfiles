@@ -1,0 +1,15 @@
+### net1_wpa3 on en0  2026-11-05T20:09:59Z
+ip: 10.243.10.147   default via: 10.243.10.226
+wifi link: Channel: 161 (5GHz, 80MHz);Security: WPA2/WPA3 Personal;Signal / Noise: -45 dBm / -92 dBm;Transmit Rate: 960
+captive check: 1 (1 = online)
+== ping 1.1.1.1 x40 (0.25 s apart)
+40 packets transmitted, 40 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 34.606/152.117/299.874/73.516 ms
+== 4 Claude API + 4 GitHub connections (HEAD request, DNS excluded)
+api 4/4, github 4/4 connected; TLS done at: 0.29 0.21 0.30 0.30 0.23 0.19 0.19 0.19 s
+== networkQuality -I en0 (max 20 s, parallel up/down)
+==== SUMMARY ====
+Uplink capacity: 32.359 Mbps
+Downlink capacity: 10.211 Mbps
+Responsiveness: Low (1.029 seconds | 58 RPM)
+Idle Latency: 101.210 milliseconds | 592 RPM

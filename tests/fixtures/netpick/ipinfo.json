@@ -1,0 +1,11 @@
+{
+  "ip": "203.0.113.7",
+  "hostname": "host-203-0-113-7.example.net",
+  "city": "Boston",
+  "region": "Massachusetts",
+  "country": "US",
+  "loc": "42.3584,-71.0598",
+  "org": "AS64500 Example Venue Networks",
+  "postal": "02108",
+  "timezone": "America/New_York"
+}
