@@ -627,13 +627,20 @@ def test_a_drop_as_a_baseline_measurement_starts_keeps_it_waiting(tmp_path):
     mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 1.8, None), (T0 + 2.3, wifi(**A))]
     rc, text, store = watch(mac, tmp_path, baseline=True, max_new=0, settle=5, minutes=5)
     assert "baseline: measuring the current network" in text and "baseline: gateway 172.21.112.1" in text
+    assert "the network changed as the measurement started, so netpick waits for it" in text
     assert [r["gateway"] for r in store.load()[0]] == [A["gateway"]]
 
 
+@pytest.mark.parametrize("drop", [False, True], ids=["directly", "through a drop"])
 @pytest.mark.parametrize("max_new, measured", [(0, []), (1, [B])], ids=["--max 0", "--max 1"])
-def test_a_baseline_ends_when_the_wifi_moves_to_another_network(tmp_path, max_new, measured):
+def test_a_baseline_ends_when_the_wifi_moves_to_another_network(tmp_path, max_new, measured, drop):
+    """A pick in the Wi-Fi menu can drop the first network before the other
+    one appears. The wait's read then finds the drop, which keeps the baseline
+    waiting, and the loop's own read finds the other network."""
     mac = FakeMac([], primary="en0")
-    mac.wifi_schedule = [(T0, wifi(online_after=1e9, **A)), (T0 + 20, wifi(**B))]
+    first = wifi(online_after=1e9, **A)
+    mac.wifi_schedule = ([(T0, first), (T0 + 20, None), (T0 + 26, wifi(**B))] if drop
+                         else [(T0, first), (T0 + 20, wifi(**B))])
     rc, text, store = watch(mac, tmp_path, baseline=True, max_new=max_new, settle=5, minutes=5)
     assert "the network changed while waiting for internet" in text
     assert "baseline: the Wi-Fi moved to another network first, so netpick skipped the baseline" in text
@@ -647,6 +654,57 @@ def test_a_baseline_that_lapsed_counts_as_a_new_network_on_return(tmp_path):
     rc, text, store = watch(mac, tmp_path, baseline=True, max_new=2, settle=5, minutes=5)
     assert [r["gateway"] for r in store.load()[0]] == [B["gateway"], A["gateway"]]
     assert "new network: gateway 172.21.112.1" in text
+
+
+@pytest.mark.parametrize("options, measured", [(dict(seen=[A["gateway"]], max_new=0), []), (dict(max_new=1), [A])],
+                         ids=["--seen A --max 0", "--max 1"])
+@pytest.mark.parametrize("gap, online_after, settle", [(T0 + 8.8, 20.0, 30), (T0 + 10.8, 5.0, 30),
+                                                       (T0 + 11.8, 5.0, 5), (T0 + 0.8, 0.0, 5)],
+                         ids=["during the wait for internet", "while DNS settles", "as the measurement starts",
+                              "as the first measurement starts"])
+def test_a_baseline_ends_when_any_read_finds_another_network(tmp_path, gap, online_after, settle, options, measured):
+    """Round-5 review: when only a wait, a settle or a measurement's own read
+    found the other network, the baseline kept waiting, and netpick measured
+    the first network as the baseline when the Wi-Fi came back. A read takes
+    1 s, so the next one finds the first network back, which then counts as
+    new."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = [(T0, wifi(online_after=online_after, **A)), (gap, wifi(**B)),
+                         (gap + 0.5, wifi(online_after=online_after, **A))]
+    rc, text, store = watch(mac, tmp_path, **dict(dict(baseline=True, settle=settle, minutes=5), **options))
+    assert [gw for _t, gw, argv in mac.calls if argv[0] == "netstat"].count(B["gateway"]) == 1
+    assert "baseline: the Wi-Fi moved to another network first, so netpick skipped the baseline" in text
+    assert "measurement started, so netpick waits for it" not in text
+    assert rc == 0 and [r["gateway"] for r in store.load()[0]] == [n["gateway"] for n in measured]
+    assert ("new network: gateway 172.21.112.1" in text) == bool(measured)
+
+
+@given(max_new=st.integers(0, 3), in_seen=st.booleans(), portal=st.sampled_from([0.0, 20.0]), at=st.floats(0.01, 60),
+       drop=st.none() | st.floats(0.1, 3), stay=st.floats(0.1, 5))
+def test_a_short_switch_ends_the_baseline_exactly_when_a_read_finds_it(max_new, in_seen, portal, at, drop, stay):
+    """Invariant: a watch that starts on a network, moves to another for a few
+    seconds, directly or through a drop, and comes back skips the baseline
+    exactly when a gateway read before the first measurement found the other
+    network. Otherwise it measures the first network once, as the baseline.
+    After a skip, that network counts as new, or as tested when --seen lists
+    it. With --max 0, the watch announces no network as new."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    gone = [(T0 + at, None)] if drop else []
+    other = T0 + at + (drop or 0)
+    mac.wifi_schedule = [(T0, wifi(online_after=portal, **A)), *gone, (other, wifi(**B)),
+                         (other + stay, wifi(online_after=portal, **A))]
+    seen = [A["gateway"]] if in_seen else []
+    with tempfile.TemporaryDirectory() as d:
+        rc, text, store = watch(mac, pathlib.Path(d), baseline=True, seen=seen, max_new=max_new, settle=30,
+                                portal_wait=60, minutes=4)
+        recs = [r["gateway"] for r in store.load()[0]]
+    first_ping = min((t for t, _gw, argv in mac.calls if argv[0] == "ping"), default=float("inf"))
+    found = any(argv[0] == "netstat" and gw == B["gateway"] and t < first_ping for t, gw, argv in mac.calls)
+    assert rc == 0 and ("so netpick skipped the baseline" in text) == found, text
+    assert recs == ([] if found and (max_new == 0 or in_seen) else [A["gateway"]]), text
+    assert max_new > 0 or "new network:" not in text, text
 
 
 def test_a_baseline_whose_portal_wait_runs_out_ends_a_watch_with_nothing_else_to_do(tmp_path):
