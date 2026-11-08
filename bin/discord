@@ -1,0 +1,1204 @@
+#!/usr/bin/env python3
+"""discord: Discord's bot API from the command line.
+
+Discord's rules ban scripting a normal user account (its self-bot rule), so
+everything here goes through a bot account, the route it sanctions. The token
+comes from $DISCORD_BOT_TOKEN, else `agent-secret get agent/discord-bot-token`.
+This script never prints it and only ever sends it to https://discord.com/api.
+
+  discord setup [--yes]                 check the token, turn on the message-content
+                                        and members intents, print the invite link
+  discord whoami                        bot, app, intents and server count
+  discord invite [--guild ID]           link that adds the bot to a server
+  discord guilds                        servers the bot is in
+  discord channels GUILD [--threads]    channels (and active threads) in a server
+  discord read CHANNEL [-n 50] [--before WHEN] [--after WHEN] [--all] [--grep RE]
+  discord search GUILD [TEXT] [--channel C] [--author U] [--has link] [-n 25]
+  discord members GUILD [--query NAME]
+  discord send CHANNEL [TEXT|-] [--reply-to MSG] [--file PATH] [--yes]
+  discord dm USER [TEXT|-] [--file PATH] [--yes]
+  discord edit CHANNEL MSG [TEXT|-] [--yes]
+  discord delete CHANNEL MSG [--yes]
+  discord react CHANNEL MSG EMOJI [--remove] [--yes]
+  discord download CHANNEL MSG [--dir DIR]
+
+CHANNEL takes an id, a link (https://discord.com/channels/G/C[/M]) or a name:
+"Server/#channel", or "#channel" when only one of the bot's servers has it. A
+message link stands in for CHANNEL MSG, and `send` to a message link replies
+to that message. WHEN takes a message id or an ISO date or time (local time
+unless it carries an offset). Read commands take --json or --jsonl.
+
+Write commands (send, dm, edit, delete, react, setup) print a dry run and exit
+3 unless given --yes. Mentions never ping anyone unless --allow-mentions.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import mimetypes
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+VERSION = "1.0.0"
+API = "https://discord.com/api/v10"
+USER_AGENT = f"DiscordBot (https://github.com/MaxGhenis/dotfiles, {VERSION})"
+SECRET_SERVICE = "agent/discord-bot-token"
+DISCORD_EPOCH_MS = 1_420_070_400_000
+CONTENT_LIMIT = 2000  # Create Message: content up to 2000 characters
+HISTORY_PAGE = 100  # Get Channel Messages: limit 1-100
+SEARCH_PAGE = 25  # Search Guild Messages: limit 1-25
+SEARCH_MAX_OFFSET = 9975
+MEMBERS_PAGE = 1000
+MAX_FILES = 10
+MAX_RATE_WAIT = 60.0  # seconds; a longer 429 fails instead of hanging the CLI
+DRY_RUN_EXIT = 3
+
+# Permission bits (topics/permissions) the invite link asks for.
+PERMISSIONS = {
+    "add_reactions": 1 << 6,
+    "view_channel": 1 << 10,
+    "send_messages": 1 << 11,
+    "embed_links": 1 << 14,
+    "attach_files": 1 << 15,
+    "read_message_history": 1 << 16,
+    "send_messages_in_threads": 1 << 38,
+}
+
+# Application flags (resources/application). A bot in under 100 servers may set
+# the *_LIMITED intent flags itself with PATCH /applications/@me.
+INTENTS = {  # name -> (flag for 100+ servers, limited flag for under 100)
+    "message-content": (1 << 18, 1 << 19),
+    "members": (1 << 14, 1 << 15),
+    "presence": (1 << 12, 1 << 13),
+}
+
+CHANNEL_TYPES = {
+    0: "text", 1: "dm", 2: "voice", 3: "group-dm", 4: "category", 5: "announcement",
+    10: "announcement-thread", 11: "thread", 12: "private-thread", 13: "stage",
+    14: "directory", 15: "forum", 16: "media",
+}
+CATEGORY = 4
+
+SNOWFLAKE_RE = re.compile(r"^\d{15,22}$")
+LINK_RE = re.compile(
+    r"^<?(?:https?://)?(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/(@me|\d+)/(\d+)(?:/(\d+))?/?>?$"
+)
+MENTION_RE = re.compile(r"^<@!?(\d+)>$")
+CUSTOM_EMOJI_RE = re.compile(r"^<?a?:?([A-Za-z0-9_~]+):(\d+)>?$")
+CDN_HOSTS = ("cdn.discordapp.com", "media.discordapp.net")
+
+HINTS = {
+    401: "the token is invalid or was reset; copy a new one from the Bot page and run: "
+    f"agent-secret set {SECRET_SERVICE}",
+    10003: "unknown channel: check the id, and that the bot is in that server",
+    10004: "unknown server: the bot isn't in it (see: discord invite)",
+    10008: "unknown message",
+    10013: "unknown user",
+    10014: "unknown emoji: use a unicode emoji, or name:id for a custom one",
+    50001: "the bot can't see that channel: add it to the server (discord invite) "
+    "or give it View Channel there",
+    50007: "Discord won't let the bot DM that user (no shared server, or they block DMs)",
+    50013: "the bot lacks a permission it needs in that channel",
+}
+
+
+class UsageError(Exception):
+    """Bad arguments; main() prints it and exits 2."""
+
+
+class DiscordError(Exception):
+    """A failed API call. str() is safe to print: it never holds the token."""
+
+    def __init__(self, status: int, message: str, code: int | None = None, hint: str | None = None):
+        super().__init__(message)
+        self.status, self.message, self.code, self.hint = status, message, code, hint
+
+    def __str__(self) -> str:
+        head = f"HTTP {self.status}" if self.status else "network"
+        code = f" (code {self.code})" if self.code is not None else ""
+        hint = f"\n  hint: {self.hint}" if self.hint else ""
+        return f"{head}: {self.message}{code}{hint}"
+
+
+def error_from_response(status: int, raw: bytes) -> DiscordError:
+    message, code = "", None
+    try:
+        body = json.loads(raw or b"{}")
+        message = str(body.get("message", ""))[:300]
+        code = body.get("code") if isinstance(body.get("code"), int) else None
+    except (ValueError, AttributeError):
+        message = (raw or b"").decode("utf-8", "replace")[:300]
+    return DiscordError(status, message or "request failed", code, HINTS.get(code) or HINTS.get(status))
+
+
+# --------------------------------------------------------------------------- pure helpers
+
+
+def u16len(text: str) -> int:
+    """Length in UTF-16 code units. Discord's 2000 limit can't be exceeded by a
+    string whose UTF-16 length fits, whichever unit Discord counts."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _fitting_prefix(text: str, limit: int) -> int:
+    """Largest k with u16len(text[:k]) <= limit."""
+    units = 0
+    for i, ch in enumerate(text):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > limit:
+            return i
+    return len(text)
+
+
+def chunk_text(text: str, limit: int = CONTENT_LIMIT) -> list[str]:
+    """Split text into messages of at most `limit` UTF-16 units.
+
+    Breaks after a newline, else after a space, when one falls in the back half
+    of the window, else mid-word. Pieces holding only whitespace are dropped
+    (Discord rejects them), so every non-whitespace character survives, in order.
+    """
+    if limit < 2:
+        raise ValueError("limit must leave room for a surrogate pair")
+    pieces: list[str] = []
+    rest = text
+    while rest:
+        if u16len(rest) <= limit:
+            pieces.append(rest)
+            break
+        cut = _fitting_prefix(rest, limit)
+        window = rest[:cut]
+        for sep in ("\n", " "):
+            at = window.rfind(sep)
+            if at >= cut // 2:
+                cut = at + 1
+                break
+        pieces.append(rest[:cut])
+        rest = rest[cut:]
+    return [p for p in pieces if p.strip()]
+
+
+def snowflake_ms(snowflake: int | str) -> int:
+    return (int(snowflake) >> 22) + DISCORD_EPOCH_MS
+
+
+def ms_snowflake(ms: int) -> int:
+    """The smallest snowflake at millisecond `ms` (a cursor for before/after)."""
+    return max(0, int(ms) - DISCORD_EPOCH_MS) << 22
+
+
+def snowflake_time(snowflake: int | str) -> dt.datetime:
+    return dt.datetime.fromtimestamp(snowflake_ms(snowflake) / 1000, tz=dt.timezone.utc)
+
+
+@dataclass(frozen=True)
+class Target:
+    channel_id: str
+    guild_id: str | None = None  # None = not known yet; "@me" = a DM
+    message_id: str | None = None
+    label: str | None = None
+
+
+def parse_target(text: str) -> Target | None:
+    """An id or a discord.com/channels link; None for anything else (names)."""
+    s = text.strip()
+    if SNOWFLAKE_RE.match(s):
+        return Target(s)
+    m = LINK_RE.match(s)
+    if m:
+        return Target(m.group(2), m.group(1), m.group(3))
+    return None
+
+
+def message_link(guild_id: str | None, channel_id: str, message_id: str) -> str:
+    return f"https://discord.com/channels/{guild_id or '@me'}/{channel_id}/{message_id}"
+
+
+def parse_when(value: str) -> int:
+    """A message id, a link, or an ISO date/time -> a snowflake cursor."""
+    t = parse_target(value)
+    if t:
+        return int(t.message_id or t.channel_id)
+    v = value.strip()
+    try:
+        when = dt.datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith(("Z", "z")) else v)
+    except ValueError:
+        raise UsageError(f"{value!r} is neither a message id nor an ISO date or time") from None
+    if when.tzinfo is None:
+        when = when.astimezone()  # naive means local time
+    return ms_snowflake(int(when.timestamp() * 1000))
+
+
+def encode_emoji(emoji: str) -> str:
+    """Path segment for the reaction endpoints: unicode percent-encoded, custom as name:id."""
+    m = CUSTOM_EMOJI_RE.match(emoji.strip())
+    if m:
+        return f"{m.group(1)}:{m.group(2)}"
+    return urllib.parse.quote(emoji.strip(), safe="")
+
+
+def user_id(text: str) -> str:
+    s = text.strip()
+    m = MENTION_RE.match(s)
+    if m:
+        s = m.group(1)
+    if not SNOWFLAKE_RE.match(s):
+        raise UsageError(f"{text!r} isn't a user id; find one with: discord members GUILD --query NAME")
+    return s
+
+
+def permissions_value(spec: str | None) -> int:
+    if not spec:
+        return sum(PERMISSIONS.values())
+    if spec.isdigit():
+        return int(spec)
+    total = 0
+    for name in spec.replace(" ", "").split(","):
+        key = name.lower().replace("-", "_")
+        if key not in PERMISSIONS:
+            raise UsageError(f"unknown permission {name!r}; known: {', '.join(PERMISSIONS)}")
+        total |= PERMISSIONS[key]
+    return total
+
+
+def invite_url(app_id: str, permissions: int | None = None, guild_id: str | None = None) -> str:
+    query = {
+        "client_id": app_id,
+        "scope": "bot",
+        "permissions": str(sum(PERMISSIONS.values()) if permissions is None else permissions),
+        "integration_type": "0",  # guild install
+    }
+    if guild_id:
+        query.update(guild_id=guild_id, disable_guild_select="true")
+    return "https://discord.com/oauth2/authorize?" + urllib.parse.urlencode(query)
+
+
+def safe_filename(name: str, fallback: str) -> str:
+    """A bare file name that can't climb out of the download directory."""
+    base = re.split(r"[\\/]", name or "")[-1]
+    base = "".join(c for c in base if c.isprintable() and c not in '<>:"|?*').strip().lstrip(".")
+    return base[:200] or fallback
+
+
+def encode_multipart(payload: dict, files: list[Path]) -> tuple[bytes, str]:
+    """multipart/form-data body: payload_json plus files[n] (reference: Uploading Files)."""
+    boundary = "discordcli" + uuid.uuid4().hex
+    payload = dict(payload)
+    payload["attachments"] = [{"id": i, "filename": f.name} for i, f in enumerate(files)]
+    out = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n'
+        "Content-Type: application/json\r\n\r\n".encode() + json.dumps(payload).encode() + b"\r\n"
+    ]
+    for i, f in enumerate(files):
+        fname = re.sub(r'["\r\n]', "_", f.name)
+        ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+        out.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="files[{i}]"; filename="{fname}"\r\n'
+            f"Content-Type: {ctype}\r\n\r\n".encode() + f.read_bytes() + b"\r\n"
+        )
+    out.append(f"--{boundary}--\r\n".encode())
+    return b"".join(out), f"multipart/form-data; boundary={boundary}"
+
+
+def _query(params: dict | None) -> str:
+    """Repeated keys for arrays and true/false for booleans (reference: query strings)."""
+    pairs = []
+    for key, value in (params or {}).items():
+        for v in value if isinstance(value, (list, tuple)) else [value]:
+            if v is None:
+                continue
+            pairs.append((key, ("true" if v else "false") if isinstance(v, bool) else str(v)))
+    return "?" + urllib.parse.urlencode(pairs) if pairs else ""
+
+
+_MAJOR_RE = re.compile(r"/(?:channels|guilds|webhooks)/\d+")
+_ID_RE = re.compile(r"/\d{5,}")
+
+
+def route_key(method: str, path: str) -> str:
+    """Approximates Discord's rate-limit bucket: ids masked except the major one."""
+    path = path.split("?", 1)[0]
+    m = _MAJOR_RE.search(path)
+    if not m:
+        return f"{method} {_ID_RE.sub('/:id', path)}"
+    return f"{method} {path[: m.end()]}{_ID_RE.sub('/:id', path[m.end():])}"
+
+
+# --------------------------------------------------------------------------- HTTP
+
+
+class TransportError(Exception):
+    """The request never got an HTTP answer (DNS, TLS, timeout, reset)."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib's default handler copies the Authorization header onto the next
+    hop, even to another host; the API opener follows no redirect at all."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_API_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def urllib_transport(method: str, url: str, headers: dict, body: bytes | None, timeout: float = 30.0):
+    """-> (status, lower-cased headers, body). Raises TransportError without an answer."""
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with _API_OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, e.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise TransportError(str(getattr(e, "reason", e))) from None
+
+
+def fetch_url(url: str, timeout: float = 60.0) -> bytes:
+    """Download an attachment from Discord's CDN, which needs no token, so none is sent."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in CDN_HOSTS:
+        raise DiscordError(0, f"refusing to fetch an attachment from {parts.hostname!r}")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        raise DiscordError(e.code, f"attachment download failed: {e.reason}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise DiscordError(0, f"attachment download failed: {getattr(e, 'reason', e)}") from None
+
+
+def _body_json(raw: bytes) -> dict:
+    try:
+        body = json.loads(raw or b"{}")
+        return body if isinstance(body, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _retry_after(headers: dict, raw: bytes, default: float = 1.0) -> float:
+    value = _body_json(raw).get("retry_after", headers.get("retry-after"))
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+class Client:
+    """Discord REST client for one bot token.
+
+    Retries: every method retries a 429 (Discord turns it away before acting).
+    GET, PUT and DELETE also retry 5xx answers and network errors; POST and PATCH
+    do so only with retry_unsafe=True, which callers pass when a repeat can't
+    act twice (a message create carrying nonce + enforce_nonce, opening a DM,
+    re-sending the same PATCH).
+    """
+
+    def __init__(self, token: str, *, transport=urllib_transport, sleep=time.sleep,
+                 clock=time.monotonic, max_retries: int = 5):
+        if not token:
+            raise ValueError("empty token")
+        self._token = token
+        self.transport, self.sleep, self.clock, self.max_retries = transport, sleep, clock, max_retries
+        self._route_ready: dict[str, float] = {}
+        self._global_ready = 0.0
+
+    def __repr__(self) -> str:
+        return "Client(<token hidden>)"
+
+    def request(self, method: str, path: str, *, params: dict | None = None, body=None,
+                files: list[Path] | None = None, retry_unsafe: bool = False, retry_202: bool = False):
+        url = API + path + _query(params)
+        headers = {"Authorization": f"Bot {self._token}", "User-Agent": USER_AGENT,
+                   "Accept": "application/json"}
+        data = None
+        if files:
+            data, headers["Content-Type"] = encode_multipart(body or {}, files)
+        elif body is not None:
+            data, headers["Content-Type"] = json.dumps(body).encode(), "application/json"
+        safe = method in ("GET", "PUT", "DELETE") or retry_unsafe
+        key = route_key(method, path)
+        attempt = 0
+        while True:
+            attempt += 1
+            wait = max(self._global_ready, self._route_ready.get(key, 0.0)) - self.clock()
+            if wait > 0:
+                self.sleep(wait)
+            try:
+                status, rheaders, raw = self.transport(method, url, headers, data)
+            except TransportError as e:
+                if safe and attempt <= self.max_retries:
+                    self.sleep(min(30.0, 0.5 * 2 ** attempt))
+                    continue
+                raise DiscordError(0, f"no answer from Discord: {e}") from None
+            rheaders = {k.lower(): v for k, v in (rheaders or {}).items()}
+            if rheaders.get("x-ratelimit-remaining") == "0":
+                try:
+                    self._route_ready[key] = self.clock() + float(rheaders.get("x-ratelimit-reset-after", 0))
+                except ValueError:
+                    pass
+            if status == 429:
+                pause = _retry_after(rheaders, raw)
+                if pause > MAX_RATE_WAIT or attempt > self.max_retries:
+                    raise DiscordError(429, f"rate limited; Discord asks to wait {pause:.1f}s")
+                if rheaders.get("x-ratelimit-global") == "true" or _body_json(raw).get("global"):
+                    self._global_ready = self.clock() + pause  # later calls on any route wait too
+                self.sleep(pause)
+                continue
+            if status == 202 and retry_202:
+                if attempt > self.max_retries:
+                    raise DiscordError(202, "Discord is still indexing this server for search; "
+                                            "try again in a minute")
+                self.sleep(min(MAX_RATE_WAIT, _retry_after(rheaders, raw, default=2.0)))
+                continue
+            if status >= 500 and safe and attempt <= self.max_retries:
+                self.sleep(min(30.0, 0.5 * 2 ** attempt))
+                continue
+            if status >= 300:
+                raise error_from_response(status, raw)
+            if status == 204 or not raw:
+                return None
+            return json.loads(raw)
+
+
+def load_token(env=None, run=subprocess.run) -> str:
+    env = os.environ if env is None else env
+    token = env.get("DISCORD_BOT_TOKEN", "").strip()
+    if not token:
+        try:
+            got = run(["agent-secret", "get", SECRET_SERVICE], capture_output=True, text=True, timeout=60)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            got = None
+        if got is None or got.returncode != 0 or not got.stdout.strip():
+            raise UsageError(
+                "no bot token. Create a bot at https://discord.com/developers/applications, "
+                f"then store its token with: agent-secret set {SECRET_SERVICE}"
+            )
+        token = got.stdout.strip()
+    if token.lower().startswith("bot "):
+        token = token[4:].strip()
+    return token
+
+
+# --------------------------------------------------------------------------- API helpers
+
+
+def _id(item: dict) -> int:
+    return int(item["id"])
+
+
+def _rows(value, what: str) -> list[dict]:
+    """A list endpoint's answer, or a clear error if Discord sent another shape."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(v, dict) for v in value):
+        raise DiscordError(0, f"unexpected answer for {what}: expected a list, got {type(value).__name__}")
+    return value
+
+
+def list_guilds(client: Client) -> list[dict]:
+    out, after = [], None
+    while True:
+        batch = _rows(client.request("GET", "/users/@me/guilds", params={"limit": 200, "after": after}), "servers")
+        out.extend(batch)
+        if len(batch) < 200:
+            return out
+        after = max(_id(g) for g in batch)
+
+
+def guild_channels(client: Client, guild_id: str) -> list[dict]:
+    return _rows(client.request("GET", f"/guilds/{guild_id}/channels"), "channels")
+
+
+def _pick(items: list[dict], query: str, kind: str, name_of) -> dict:
+    """Exact (case-insensitive) name match; anything looser could aim a write wrong."""
+    want = query.strip().casefold()
+    exact = [i for i in items if name_of(i).casefold() == want]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        ids = ", ".join(i["id"] for i in exact)
+        raise UsageError(f"several {kind}s are named {query!r} ({ids}); use the id")
+    close = [name_of(i) for i in items if want and want in name_of(i).casefold()][:8]
+    tail = f"; close: {', '.join(close)}" if close else ""
+    raise UsageError(f"no {kind} named {query!r}{tail}")
+
+
+def resolve_guild(client: Client, text: str) -> str:
+    s = text.strip()
+    if SNOWFLAKE_RE.match(s):
+        return s
+    return _pick(list_guilds(client), s, "server", lambda g: g.get("name", ""))["id"]
+
+
+def resolve_channel(client: Client, text: str) -> Target:
+    target = parse_target(text)
+    if target:
+        return target
+    s = text.strip()
+    if "/" in s:
+        gpart, cpart = s.rsplit("/", 1)
+        gid = resolve_guild(client, gpart)
+        chans = [c for c in guild_channels(client, gid) if c.get("type") != CATEGORY]
+        ch = _pick(chans, cpart.lstrip("#"), "channel", lambda c: c.get("name", ""))
+        return Target(ch["id"], gid, label=f"#{ch['name']}")
+    if s.startswith("#"):
+        name = s[1:].casefold()
+        hits = [(g, c) for g in list_guilds(client) for c in guild_channels(client, g["id"])
+                if c.get("type") != CATEGORY and c.get("name", "").casefold() == name]
+        if len(hits) == 1:
+            g, c = hits[0]
+            return Target(c["id"], g["id"], label=f"{g['name']}/#{c['name']}")
+        if not hits:
+            raise UsageError(f"no channel named {s} in the bot's servers")
+        both = ", ".join(f"{g['name']}/#{c['name']}" for g, c in hits)
+        raise UsageError(f"several channels are named {s}: {both}; use Server/#channel")
+    raise UsageError(f"can't read {text!r} as a channel: give an id, a link, or Server/#channel")
+
+
+def message_target(client: Client, args: list[str], trailing: int) -> tuple[Target, list[str]]:
+    """[LINK | CHANNEL MSG] followed by up to `trailing` more arguments."""
+    if not args:
+        raise UsageError("give a message link, or CHANNEL MSG")
+    first = parse_target(args[0])
+    if first and first.message_id:
+        target, rest = first, args[1:]
+    else:
+        if len(args) < 2:
+            raise UsageError("give a message link, or CHANNEL MSG")
+        chan = resolve_channel(client, args[0])
+        msg = parse_target(args[1])
+        if not msg:
+            raise UsageError(f"{args[1]!r} isn't a message id or link")
+        target = Target(chan.channel_id, chan.guild_id, msg.message_id or msg.channel_id, chan.label)
+        rest = args[2:]
+    if len(rest) > trailing:
+        raise UsageError(f"unexpected arguments: {' '.join(rest[trailing:])}")
+    return target, rest
+
+
+def describe_channel(client: Client, target: Target) -> Target:
+    """Fill in guild id and a readable label from GET /channels/{id}."""
+    ch = client.request("GET", f"/channels/{target.channel_id}") or {}
+    guild = ch.get("guild_id") or ("@me" if ch.get("type") in (1, 3) else target.guild_id)
+    if ch.get("type") == 1:
+        names = ", ".join(u.get("username", "?") for u in ch.get("recipients") or [])
+        label = f"DM with {names or 'user'}"
+    else:
+        label = target.label or f"#{ch.get('name', target.channel_id)}"
+    return Target(target.channel_id, guild, target.message_id, label)
+
+
+def history(client: Client, channel_id: str, *, limit: int | None, before: int | None = None,
+            after: int | None = None, around: int | None = None, progress=None) -> list[dict]:
+    """Messages from one channel, oldest first, unique by id.
+
+    Without `after`: the newest `limit` before `before` (or now). With only
+    `after`: the first `limit` after it. With both: the newest `limit` strictly
+    between them. limit=None means no cap. Works whichever order a page comes in.
+    """
+    path = f"/channels/{channel_id}/messages"
+    if around is not None:
+        batch = _rows(client.request("GET", path, params={"around": around,
+                                                          "limit": min(limit or 50, HISTORY_PAGE)}), "messages")
+        return sorted({_id(m): m for m in batch}.values(), key=_id)
+    out: dict[int, dict] = {}
+
+    def room() -> int:
+        return HISTORY_PAGE if limit is None else min(HISTORY_PAGE, limit - len(out))
+
+    if after is not None and before is None:
+        cursor = int(after)
+        while room() > 0:
+            page = room()
+            answer = _rows(client.request("GET", path, params={"after": cursor, "limit": page}), "messages")
+            batch = sorted((m for m in answer if _id(m) > cursor), key=_id)
+            for m in batch[: room()]:
+                out[_id(m)] = m
+            if len(batch) < page:
+                break
+            cursor = _id(batch[-1])
+            if progress and len(out) % 1000 < page:
+                progress(len(out))
+        return sorted(out.values(), key=_id)
+
+    cursor = int(before) if before is not None else None
+    floor = int(after) if after is not None else None
+    while room() > 0:
+        page = room()
+        params = {"limit": page, "before": cursor}
+        answer = _rows(client.request("GET", path, params=params), "messages")
+        batch = sorted((m for m in answer if cursor is None or _id(m) < cursor), key=_id, reverse=True)
+        full = len(batch) >= page
+        if floor is not None:
+            kept = [m for m in batch if _id(m) > floor]
+            full = full and len(kept) == len(batch)
+            batch = kept
+        for m in batch[: room()]:
+            out[_id(m)] = m
+        if not batch or not full:
+            break
+        cursor = _id(batch[-1])
+        if progress and len(out) % 1000 < page:
+            progress(len(out))
+    return sorted(out.values(), key=_id)
+
+
+def search_messages(client: Client, guild_id: str, *, content=None, channels=(), authors=(), has=(),
+                    before=None, after=None, limit=25, sort_by=None, ascending=False):
+    """-> (hits, total_results). The API no longer sends context, so each hit group holds one message."""
+    hits: list[dict] = []
+    offset, total = 0, None
+    while len(hits) < limit and offset <= SEARCH_MAX_OFFSET:
+        page = min(SEARCH_PAGE, limit - len(hits))
+        res = client.request("GET", f"/guilds/{guild_id}/messages/search", retry_202=True, params={
+            "content": content, "channel_id": list(channels), "author_id": list(authors),
+            "has": list(has), "max_id": before, "min_id": after, "limit": page, "offset": offset,
+            "sort_by": sort_by, "sort_order": "asc" if ascending else None,
+        }) or {}
+        total = res.get("total_results", total)
+        groups = res.get("messages") or []
+        found = [m for g in groups for m in (g or [])[:1]]
+        if not found:
+            break
+        hits.extend(found)
+        offset += len(groups)
+        if total is not None and offset >= total:
+            break
+    return hits[:limit], total
+
+
+def allowed_mentions(args) -> dict:
+    parse = []
+    if getattr(args, "allow_mentions", False):
+        parse += ["users", "roles"]
+    if getattr(args, "allow_everyone", False):
+        parse.append("everyone")
+    return {"parse": parse, "replied_user": bool(getattr(args, "allow_mentions", False))}
+
+
+def message_payloads(text: str, *, mentions: dict, reply_to: str | None = None) -> list[dict]:
+    """One Create Message body per chunk. Each carries its own nonce with
+    enforce_nonce, so a retried POST returns the first message instead of a twin."""
+    chunks = chunk_text(text) if text.strip() else [""]
+    bodies = []
+    for i, chunk in enumerate(chunks):
+        body = {"allowed_mentions": mentions, "nonce": uuid.uuid4().hex[:25], "enforce_nonce": True}
+        if chunk:
+            body["content"] = chunk
+        if reply_to and i == 0:
+            body["message_reference"] = {"message_id": reply_to}
+        bodies.append(body)
+    return bodies
+
+
+# --------------------------------------------------------------------------- output
+
+
+class Ctx:
+    def __init__(self, stdin, stdout, stderr):
+        self.stdin, self.out, self.err = stdin, stdout, stderr
+
+    def say(self, text: str = "") -> None:
+        print(text, file=self.out)
+
+    def note(self, text: str) -> None:
+        print(text, file=self.err)
+
+
+def emit_json(ctx: Ctx, args, rows) -> bool:
+    if getattr(args, "jsonl", False):
+        for row in rows:
+            ctx.say(json.dumps(row, ensure_ascii=False))
+        return True
+    if getattr(args, "json", False):
+        ctx.say(json.dumps(rows, ensure_ascii=False, indent=2))
+        return True
+    return False
+
+
+def local_time(snowflake) -> str:
+    return snowflake_time(snowflake).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def format_message(m: dict, channel_names: dict | None = None) -> str:
+    author = m.get("author") or {}
+    name = author.get("global_name") or author.get("username") or "?"
+    bits = [m["id"]]
+    where = m.get("channel_id")
+    if channel_names is not None and where:
+        bits.insert(0, f"#{channel_names.get(where, where)}")
+    ref = (m.get("message_reference") or {}).get("message_id")
+    if ref and m.get("type") == 19:
+        bits.append(f"reply to {ref}")
+    if m.get("attachments"):
+        bits.append(f"{len(m['attachments'])} file(s)")
+    if m.get("embeds"):
+        bits.append(f"{len(m['embeds'])} embed(s)")
+    if m.get("edited_timestamp"):
+        bits.append("edited")
+    if (m.get("thread") or {}).get("id"):
+        bits.append(f"thread {m['thread']['id']}")
+    line = f"[{local_time(m['id'])}] {name}  ({'; '.join(bits)})"
+    content = (m.get("content") or "").rstrip()
+    if content:
+        line += "\n    " + content.replace("\n", "\n    ")
+    for a in m.get("attachments") or []:
+        line += f"\n    [file] {a.get('filename')} ({a.get('size', '?')} bytes)"
+    return line
+
+
+def read_text(arg: str | None, stdin, *, allow_empty: bool = False) -> str:
+    if arg is None or arg == "-":
+        if stdin is None or stdin.isatty():
+            text = ""
+        else:
+            text = stdin.read()
+    else:
+        text = arg
+    if not text.strip() and not allow_empty:
+        raise UsageError("no text: pass it as an argument or pipe it on stdin")
+    return text
+
+
+def dry_run(ctx: Ctx, what: str, detail: list[str] | None = None) -> int:
+    ctx.say(f"DRY RUN, nothing sent: would {what}.")
+    for line in detail or []:
+        ctx.say(line)
+    ctx.say("Re-run with --yes to do it.")
+    return DRY_RUN_EXIT
+
+
+def _files(paths: list[str] | None) -> list[Path]:
+    files = [Path(p).expanduser() for p in paths or []]
+    if len(files) > MAX_FILES:
+        raise UsageError(f"at most {MAX_FILES} files per message")
+    for f in files:
+        if not f.is_file():
+            raise UsageError(f"no such file: {f}")
+    return files
+
+
+# --------------------------------------------------------------------------- commands
+
+
+def _intent_state(flags: int) -> dict[str, str]:
+    state = {}
+    for name, (full, limited) in INTENTS.items():
+        state[name] = "on" if flags & full else ("on (limited)" if flags & limited else "off")
+    return state
+
+
+def cmd_whoami(client: Client, args, ctx: Ctx) -> int:
+    me = client.request("GET", "/users/@me") or {}
+    app = client.request("GET", "/applications/@me") or {}
+    if emit_json(ctx, args, [{"bot": me, "application": app}]):
+        return 0
+    flags = int(app.get("flags") or 0)
+    ctx.say(f"bot      {me.get('username')} (id {me.get('id')})")
+    servers = app.get("approximate_guild_count")
+    ctx.say(f"app      {app.get('name')} (id {app.get('id')})"
+            + (f", in {servers} server(s)" if servers is not None else ""))
+    ctx.say("intents  " + "   ".join(f"{k}: {v}" for k, v in _intent_state(flags).items()))
+    if app.get("bot_public"):
+        ctx.say("public   yes: anyone with the invite link can add it (switch off Public Bot on the Bot page)")
+    else:
+        ctx.say("public   no: only you can add it")
+    return 0
+
+
+def cmd_setup(client: Client, args, ctx: Ctx) -> int:
+    me = client.request("GET", "/users/@me") or {}
+    app = client.request("GET", "/applications/@me") or {}
+    ctx.say(f"token ok: bot {me.get('username')} (id {me.get('id')}), app {app.get('name')} (id {app.get('id')})")
+    flags = int(app.get("flags") or 0)
+    wanted = ["message-content"] + ([] if args.no_members else ["members"])
+    missing = [n for n in wanted if not flags & (INTENTS[n][0] | INTENTS[n][1])]
+    rc = 0
+    if not missing:
+        ctx.say("intents already on: " + ", ".join(wanted))
+    elif (app.get("approximate_guild_count") or 0) >= 100:
+        ctx.say("the bot is in 100+ servers, so Discord must approve " + ", ".join(missing)
+                + " (Bot page, Privileged Gateway Intents)")
+        rc = 1
+    elif not args.yes:
+        rc = dry_run(ctx, "turn on the " + ", ".join(missing) + " intent(s) with PATCH /applications/@me")
+    else:
+        new = flags | sum(INTENTS[n][1] for n in missing)
+        app = client.request("PATCH", "/applications/@me", body={"flags": new}, retry_unsafe=True) or app
+        flags = int(app.get("flags") or 0)
+        still = [n for n in missing if not flags & (INTENTS[n][0] | INTENTS[n][1])]
+        if still:
+            ctx.say("Discord did not turn on " + ", ".join(still)
+                    + "; switch it on by hand: Bot page, Privileged Gateway Intents")
+            rc = 1
+        else:
+            ctx.say("turned on: " + ", ".join(missing))
+    if app.get("bot_public"):
+        ctx.say("note: Public Bot is on, so anyone with the link can add the bot; "
+                "switch it off on the Bot page (the API can't)")
+    ctx.say("invite (open once per server, pick the server, Authorize):")
+    ctx.say("  " + invite_url(str(app.get("id") or me.get("id"))))
+    return rc
+
+
+def cmd_invite(client: Client, args, ctx: Ctx) -> int:
+    app = client.request("GET", "/applications/@me") or {}
+    gid = resolve_guild(client, args.guild) if args.guild else None
+    ctx.say(invite_url(str(app.get("id")), permissions_value(args.permissions), gid))
+    return 0
+
+
+def cmd_guilds(client: Client, args, ctx: Ctx) -> int:
+    guilds = list_guilds(client)
+    if emit_json(ctx, args, guilds):
+        return 0
+    if not guilds:
+        ctx.note("the bot is in no servers yet; add it with the link from: discord invite")
+    for g in sorted(guilds, key=lambda g: g.get("name", "").casefold()):
+        ctx.say(f"{g['id']}  {g.get('name')}")
+    return 0
+
+
+def cmd_channels(client: Client, args, ctx: Ctx) -> int:
+    gid = resolve_guild(client, args.guild)
+    chans = guild_channels(client, gid)
+    if args.threads:
+        chans += (client.request("GET", f"/guilds/{gid}/threads/active") or {}).get("threads") or []
+    if emit_json(ctx, args, chans):
+        return 0
+    by_parent: dict[str | None, list[dict]] = {}
+    for c in chans:
+        by_parent.setdefault(c.get("parent_id"), []).append(c)
+
+    def order(c):
+        return (c.get("type") == CATEGORY, c.get("position", 0), c.get("name", ""))
+
+    def show(c, depth):
+        kind = CHANNEL_TYPES.get(c.get("type"), str(c.get("type")))
+        name = c.get("name", "") if c.get("type") == CATEGORY else f"#{c.get('name', '')}"
+        ctx.say(f"{c['id']}  {'  ' * depth}{kind:<13} {name}")
+        for child in sorted(by_parent.get(c["id"], []), key=order):
+            show(child, depth + 1)
+
+    for c in sorted(by_parent.get(None, []), key=order):
+        show(c, 0)
+    return 0
+
+
+def cmd_read(client: Client, args, ctx: Ctx) -> int:
+    target = resolve_channel(client, args.channel)
+    limit = None if args.all else args.limit
+    if limit is not None and limit < 1:
+        raise UsageError("-n must be at least 1")
+    msgs = history(
+        client, target.channel_id, limit=limit,
+        before=parse_when(args.before) if args.before else None,
+        after=parse_when(args.after) if args.after else None,
+        around=parse_when(args.around) if args.around else None,
+        progress=lambda n: ctx.note(f"fetched {n} messages..."),
+    )
+    if args.grep:
+        pattern = re.compile(args.grep, re.IGNORECASE)
+        msgs = [m for m in msgs if pattern.search(m.get("content") or "")]
+    if emit_json(ctx, args, msgs):
+        return 0
+    for m in msgs:
+        ctx.say(format_message(m))
+    others = [m for m in msgs if not (m.get("author") or {}).get("bot")]
+    if others and all(not m.get("content") and not m.get("attachments") and not m.get("embeds") for m in others):
+        ctx.note("note: every message came back empty; the message-content intent is probably off "
+                 "(run: discord setup)")
+    return 0
+
+
+def cmd_search(client: Client, args, ctx: Ctx) -> int:
+    gid = resolve_guild(client, args.guild)
+    channels = [resolve_channel(client, c).channel_id for c in args.channel or []]
+    hits, total = search_messages(
+        client, gid, content=args.text, channels=channels, authors=[user_id(a) for a in args.author or []],
+        has=args.has or [], before=parse_when(args.before) if args.before else None,
+        after=parse_when(args.after) if args.after else None, limit=args.limit,
+        sort_by=args.sort, ascending=args.asc,
+    )
+    if emit_json(ctx, args, hits):
+        return 0
+    names = {c["id"]: c.get("name", c["id"]) for c in guild_channels(client, gid)} if hits else {}
+    for m in hits:
+        ctx.say(format_message(m, names))
+    ctx.note(f"{len(hits)} shown of {total if total is not None else '?'} match(es)")
+    return 0
+
+
+def cmd_members(client: Client, args, ctx: Ctx) -> int:
+    gid = resolve_guild(client, args.guild)
+    if args.query:
+        rows = _rows(client.request("GET", f"/guilds/{gid}/members/search",
+                                    params={"query": args.query, "limit": min(args.limit, MEMBERS_PAGE)}), "members")
+    else:
+        rows, after = [], 0
+        while len(rows) < args.limit:
+            page = min(MEMBERS_PAGE, args.limit - len(rows))
+            batch = _rows(client.request("GET", f"/guilds/{gid}/members",
+                                         params={"limit": page, "after": after}), "members")
+            rows.extend(batch)
+            if len(batch) < page:
+                break
+            after = max(int(m["user"]["id"]) for m in batch)
+    if emit_json(ctx, args, rows):
+        return 0
+    for m in rows:
+        u = m.get("user") or {}
+        extra = " ".join(x for x in (u.get("global_name"), f"nick {m['nick']}" if m.get("nick") else None) if x)
+        ctx.say(f"{u.get('id')}  @{u.get('username')}{'  ' + extra if extra else ''}{'  [bot]' if u.get('bot') else ''}")
+    return 0
+
+
+def _post(client: Client, ctx: Ctx, target: Target, args, text: str, files: list[Path],
+          reply_to: str | None) -> int:
+    bodies = message_payloads(text, mentions=allowed_mentions(args), reply_to=reply_to)
+    if not args.yes:
+        detail = [f"  to: {target.label} ({target.channel_id})" + (f", replying to {reply_to}" if reply_to else "")]
+        if files:
+            detail.append("  files: " + ", ".join(f.name for f in files))
+        for i, b in enumerate(bodies, 1):
+            detail.append(f"  --- message {i}/{len(bodies)} ({u16len(b.get('content', ''))} chars) ---")
+            detail.extend("  " + line for line in (b.get("content") or "(files only)").splitlines())
+        return dry_run(ctx, f"post {len(bodies)} message(s)", detail)
+    for i, body in enumerate(bodies):
+        sent = client.request("POST", f"/channels/{target.channel_id}/messages", body=body,
+                              files=files if i == 0 and files else None, retry_unsafe=True) or {}
+        ctx.say(f"sent {message_link(target.guild_id, target.channel_id, sent.get('id', '?'))}")
+    return 0
+
+
+def cmd_send(client: Client, args, ctx: Ctx) -> int:
+    files = _files(args.file)
+    target = resolve_channel(client, args.channel)
+    reply_to = target.message_id
+    if args.reply_to:
+        ref = parse_target(args.reply_to)
+        if not ref:
+            raise UsageError(f"{args.reply_to!r} isn't a message id or link")
+        reply_to = ref.message_id or ref.channel_id
+    text = read_text(args.text, ctx.stdin, allow_empty=bool(files))
+    return _post(client, ctx, describe_channel(client, target), args, text, files, reply_to)
+
+
+def cmd_dm(client: Client, args, ctx: Ctx) -> int:
+    files = _files(args.file)
+    uid = user_id(args.user)
+    text = read_text(args.text, ctx.stdin, allow_empty=bool(files))
+    user = client.request("GET", f"/users/{uid}") or {}
+    label = f"DM to @{user.get('username', uid)}"
+    if not args.yes:
+        return _post(client, ctx, Target(uid, "@me", label=label), args, text, files, None)
+    ch = client.request("POST", "/users/@me/channels", body={"recipient_id": uid}, retry_unsafe=True) or {}
+    return _post(client, ctx, Target(ch["id"], "@me", label=label), args, text, files, None)
+
+
+def cmd_edit(client: Client, args, ctx: Ctx) -> int:
+    target, rest = message_target(client, args.target, trailing=1)
+    text = read_text(rest[0] if rest else None, ctx.stdin)
+    if u16len(text) > CONTENT_LIMIT:
+        raise UsageError(f"an edit must fit in one message ({CONTENT_LIMIT} characters)")
+    path = f"/channels/{target.channel_id}/messages/{target.message_id}"
+    if not args.yes:
+        old = client.request("GET", path) or {}
+        return dry_run(ctx, f"edit message {target.message_id}",
+                       ["  now:  " + (old.get("content") or "").replace("\n", "\n        "),
+                        "  new:  " + text.replace("\n", "\n        ")])
+    client.request("PATCH", path, body={"content": text, "allowed_mentions": allowed_mentions(args)},
+                   retry_unsafe=True)
+    ctx.say(f"edited {message_link(target.guild_id, target.channel_id, target.message_id)}")
+    return 0
+
+
+def cmd_delete(client: Client, args, ctx: Ctx) -> int:
+    target, _ = message_target(client, args.target, trailing=0)
+    path = f"/channels/{target.channel_id}/messages/{target.message_id}"
+    if not args.yes:
+        old = client.request("GET", path) or {}
+        return dry_run(ctx, f"delete message {target.message_id}", ["  " + format_message(old)] if old else None)
+    client.request("DELETE", path)
+    ctx.say(f"deleted message {target.message_id}")
+    return 0
+
+
+def cmd_react(client: Client, args, ctx: Ctx) -> int:
+    target, rest = message_target(client, args.target, trailing=1)
+    if not rest:
+        raise UsageError("give an emoji after the message")
+    emoji = encode_emoji(rest[0])
+    path = f"/channels/{target.channel_id}/messages/{target.message_id}/reactions/{emoji}/@me"
+    verb = "remove the bot's" if args.remove else "add"
+    if not args.yes:
+        return dry_run(ctx, f"{verb} {rest[0]} reaction on message {target.message_id}")
+    client.request("DELETE" if args.remove else "PUT", path)
+    ctx.say(f"{'removed' if args.remove else 'added'} {rest[0]} on message {target.message_id}")
+    return 0
+
+
+def cmd_download(client: Client, args, ctx: Ctx) -> int:
+    target, _ = message_target(client, args.target, trailing=0)
+    msg = client.request("GET", f"/channels/{target.channel_id}/messages/{target.message_id}") or {}
+    atts = msg.get("attachments") or []
+    if not atts:
+        ctx.note("that message has no attachments")
+        return 0
+    folder = Path(args.dir or f"discord-{target.message_id}").expanduser()
+    folder.mkdir(parents=True, exist_ok=True)
+    for i, a in enumerate(atts):
+        first = folder / safe_filename(a.get("filename", ""), f"attachment-{i}")
+        dest, n = first, 2
+        while dest.exists():
+            dest = folder / f"{first.stem} ({n}){first.suffix}"
+            n += 1
+        dest.write_bytes(fetch_url(a["url"]))
+        ctx.say(str(dest))
+    return 0
+
+
+# --------------------------------------------------------------------------- CLI
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="discord", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"discord {VERSION}")
+    sub = p.add_subparsers(dest="command", metavar="COMMAND")
+
+    def add(name, func, help_text):
+        sp = sub.add_parser(name, help=help_text, description=help_text)
+        sp.set_defaults(func=func)
+        return sp
+
+    def json_flags(sp):
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("--json", action="store_true", help="print JSON")
+        g.add_argument("--jsonl", action="store_true", help="print one JSON object per line")
+
+    def write_flags(sp, mentions=True):
+        sp.add_argument("--yes", action="store_true", help="actually do it (default: dry run, exit 3)")
+        if mentions:
+            sp.add_argument("--allow-mentions", action="store_true", help="let @user and @role mentions ping")
+            sp.add_argument("--allow-everyone", action="store_true", help="let @everyone and @here ping")
+
+    sp = add("setup", cmd_setup, "check the token, turn on intents, print the invite link")
+    sp.add_argument("--no-members", action="store_true", help="leave the members intent off")
+    sp.add_argument("--yes", action="store_true", help="apply the intent change (default: dry run)")
+
+    json_flags(add("whoami", cmd_whoami, "bot, app, intents and server count"))
+
+    sp = add("invite", cmd_invite, "print the link that adds the bot to a server")
+    sp.add_argument("--guild", help="preselect this server (id or name)")
+    sp.add_argument("--permissions", help="comma list of permission names, or an integer")
+
+    json_flags(add("guilds", cmd_guilds, "servers the bot is in"))
+
+    sp = add("channels", cmd_channels, "channels in a server")
+    sp.add_argument("guild")
+    sp.add_argument("--threads", action="store_true", help="include active threads")
+    json_flags(sp)
+
+    sp = add("read", cmd_read, "messages from a channel or thread, oldest first")
+    sp.add_argument("channel")
+    sp.add_argument("-n", "--limit", type=int, default=50, help="how many (default 50)")
+    sp.add_argument("--all", action="store_true", help="the whole history (or all of the range)")
+    sp.add_argument("--before", help="message id, link or ISO date/time")
+    sp.add_argument("--after", help="message id, link or ISO date/time")
+    sp.add_argument("--around", help="messages around this message id")
+    sp.add_argument("--grep", help="keep messages whose text matches this regex (case-insensitive)")
+    json_flags(sp)
+
+    sp = add("search", cmd_search, "search a server's messages")
+    sp.add_argument("guild")
+    sp.add_argument("text", nargs="?")
+    sp.add_argument("--channel", action="append", help="limit to this channel (repeatable)")
+    sp.add_argument("--author", action="append", help="limit to this user id (repeatable)")
+    sp.add_argument("--has", action="append", help="link, embed, poll, file, video, image, sound, sticker, snapshot")
+    sp.add_argument("--before", help="message id, link or ISO date/time")
+    sp.add_argument("--after", help="message id, link or ISO date/time")
+    sp.add_argument("--sort", choices=["timestamp", "relevance"])
+    sp.add_argument("--asc", action="store_true", help="oldest first")
+    sp.add_argument("-n", "--limit", type=int, default=25)
+    json_flags(sp)
+
+    sp = add("members", cmd_members, "a server's members (needs the members intent)")
+    sp.add_argument("guild")
+    sp.add_argument("--query", help="username or nickname prefix")
+    sp.add_argument("-n", "--limit", type=int, default=100)
+    json_flags(sp)
+
+    sp = add("send", cmd_send, "post to a channel (a message link replies to it)")
+    sp.add_argument("channel")
+    sp.add_argument("text", nargs="?", help="text, or - (or nothing) to read stdin")
+    sp.add_argument("--reply-to", help="message id or link to reply to")
+    sp.add_argument("--file", action="append", help="attach a file (repeatable, up to 10)")
+    write_flags(sp)
+
+    sp = add("dm", cmd_dm, "direct-message a user who shares a server with the bot")
+    sp.add_argument("user", help="user id or <@id> mention")
+    sp.add_argument("text", nargs="?", help="text, or - (or nothing) to read stdin")
+    sp.add_argument("--file", action="append", help="attach a file (repeatable, up to 10)")
+    write_flags(sp)
+
+    sp = add("edit", cmd_edit, "edit one of the bot's messages")
+    sp.add_argument("target", nargs="+", metavar="LINK|CHANNEL MSG [TEXT]")
+    write_flags(sp)
+
+    sp = add("delete", cmd_delete, "delete a message (the bot's own, or any with Manage Messages)")
+    sp.add_argument("target", nargs="+", metavar="LINK|CHANNEL MSG")
+    write_flags(sp, mentions=False)
+
+    sp = add("react", cmd_react, "add (or --remove) the bot's reaction")
+    sp.add_argument("target", nargs="+", metavar="LINK|CHANNEL MSG EMOJI")
+    sp.add_argument("--remove", action="store_true")
+    write_flags(sp, mentions=False)
+
+    sp = add("download", cmd_download, "save a message's attachments")
+    sp.add_argument("target", nargs="+", metavar="LINK|CHANNEL MSG")
+    sp.add_argument("--dir", help="folder to save into (default: ./discord-MSG)")
+    return p
+
+
+def redact(text: str, token: str | None) -> str:
+    return text.replace(token, "<token>") if token else text
+
+
+def main(argv: list[str] | None = None, *, client_factory=None, stdin=None, stdout=None, stderr=None) -> int:
+    stdout = stdout or sys.stdout
+    stderr = stderr or sys.stderr
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help(stdout)
+        return 0
+    ctx = Ctx(stdin if stdin is not None else sys.stdin, stdout, stderr)
+    token = None
+    try:
+        client = client_factory() if client_factory else Client(load_token())
+        token = getattr(client, "_token", None)
+        return args.func(client, args, ctx) or 0
+    except UsageError as e:
+        print(redact(f"discord: {e}", token), file=stderr)
+        return 2
+    except DiscordError as e:
+        print(redact(f"discord: {e}", token), file=stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
