@@ -762,13 +762,16 @@ def test_a_baseline_without_an_address_waits_for_one(tmp_path):
     """Round-6 recheck: when the baseline's first address read failed, watch
     measured with no address to compare, so a switch between the
     measurement's two reads gave a mixed record again. watch now measures the
-    baseline only once it has read an address. B appears at 1.5 s, between
-    the measurement's gateway read at 1 s and its address read at 2 s."""
+    baseline only once it has read an address. B appears at 1.5 s. On
+    02780f0 the first measurement's gateway read at 1 s found A and its
+    address read at 2 s found B. Now the loop's reads at 1 s and 2 s see the
+    same split, and the settle's read at 4 s finds B and skips the baseline."""
     mac = FirstAddressReadFails([], primary="en0")
     mac.cost = one_second_gateway_reads
     mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 1.5, wifi(**B))]
     rc, text, store = watch(mac, tmp_path, baseline=True, max_new=1, settle=5, minutes=5)
     assert "baseline: the current Wi-Fi network has no address yet, so netpick waits for it" in text
+    assert "baseline: the Wi-Fi moved to another network first, so netpick skipped the baseline" in text
     assert rc == 0 and [(r["gateway"], r["ip"]) for r in store.load()[0]] == [(B["gateway"], B["ip"])]
 
 
