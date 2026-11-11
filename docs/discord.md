@@ -23,31 +23,33 @@ Without the message-content intent, Discord returns other people's messages with
 | `discord whoami` | The bot, its app, which intents are on and how many servers it's in |
 | `discord guilds` | The servers the bot is in |
 | `discord channels SERVER [--threads]` | The server's channels as a tree, plus active threads if you ask |
-| `discord read CHANNEL [-n 50] [--before WHEN] [--after WHEN] [--around MSG] [--all] [--grep RE]` | Messages, oldest first |
-| `discord search SERVER [TEXT] [--channel C] [--author U] [--has link] [--before/--after WHEN] [-n 25]` | Discord's server-wide message search |
+| `discord read CHANNEL [-n 50] [--before WHEN] [--after WHEN] [--all] [--grep RE]` | Messages, oldest first. `--around MSG` instead gives up to 100 messages around one |
+| `discord search SERVER [TEXT] [--channel C] [--author U] [--has link] [--before/--after WHEN] [--nsfw] [-n 25]` | Discord's server-wide message search (10,000 hits at most; `--nsfw` adds age-restricted channels) |
 | `discord members SERVER [--query NAME]` | Members and their user ids (for `dm`) |
-| `discord send CHANNEL [TEXT\|-] [--reply-to MSG] [--file PATH]... --yes` | Post a message. A message link as CHANNEL makes it a reply |
-| `discord dm USER [TEXT\|-] [--file PATH]... --yes` | DM a user who shares a server with the bot |
+| `discord send CHANNEL [TEXT\|-] [--reply-to MSG] [--file PATH]... [--again] --yes` | Post a message. A message link as CHANNEL makes it a reply |
+| `discord dm USER [TEXT\|-] [--file PATH]... [--again] --yes` | DM a user who shares a server with the bot |
 | `discord edit CHANNEL MSG [TEXT\|-] --yes` | Edit one of the bot's messages |
 | `discord delete CHANNEL MSG --yes` | Delete a message |
 | `discord react CHANNEL MSG EMOJI [--remove] --yes` | Add or remove the bot's reaction |
 | `discord download CHANNEL MSG [--dir DIR]` | Save a message's attachments |
 | `discord invite [--guild SERVER] [--permissions LIST]` | The link that adds the bot to a server |
 
-- **CHANNEL** takes an id, a link (`https://discord.com/channels/SERVER/CHANNEL[/MESSAGE]`) or a name: `"Server/#channel"`, or `#channel` when only one of the bot's servers has a channel by that name. Names must match exactly (ignoring case), so a typo fails instead of posting somewhere else. A message link can stand in for `CHANNEL MSG`.
-- **WHEN** takes a message id, a message link or an ISO date or time. A time without an offset counts as local time.
+- **CHANNEL** takes an id, a link (`https://discord.com/channels/SERVER/CHANNEL[/MESSAGE]`, with or without `ptb.`, `canary.` or a `?query`) or a name: `"Server/#channel"`, or `#channel` when only one of the bot's servers has a channel by that name. Names must match exactly (ignoring case), so a typo fails instead of posting somewhere else. A message link can stand in for `CHANNEL MSG`.
+- **WHEN** takes a message id, a message link or an ISO date or time. A time without an offset counts as local time. Dates before Discord began, or after tomorrow, are clamped.
 - **SERVER** takes an id or the server's exact name.
 - The read commands take `--json` or `--jsonl`. `read --all --jsonl` exports a whole channel.
-- Text comes from the argument or from stdin (`-`, or no argument). Text that starts with `-` needs `--` before it.
+- Text comes from the argument, or from stdin when the argument is `-`. It never reads stdin uninvited, which would hang in an agent's shell. Text that starts with `-` needs `--` before it: `discord send C -- '-1 for this'`.
+- Options can go anywhere among the arguments (`discord edit LINK --yes 'new text'`), but must be spelled out in full: `--ye` isn't `--yes`.
 
 ## Safety
 
-- **Every write dry-runs first.** `send`, `dm`, `edit`, `delete`, `react` and `setup` print what they would do, send nothing and exit 3 unless you pass `--yes`. With `--yes` they print the link of each message they posted.
+- **Every write dry-runs first.** `send`, `dm`, `edit`, `delete`, `react` and `setup` print what they would do, send nothing and exit 3 unless you pass exactly `--yes`. With `--yes` they print the link of each message they posted. A dry run also checks every `--file`, so one that passes means the real run can read them.
 - **No pings by default.** Every message goes out with `allowed_mentions` set to ping nobody, reply pings included. `--allow-mentions` lets user and role mentions ping, and `--allow-everyone` lets `@everyone` and `@here` ping.
-- **No double posts.** Every message carries a fresh `nonce` with `enforce_nonce`, so when a lost response makes the CLI retry, Discord returns the first message instead of posting it again. Other POST and PATCH calls never retry unless a repeat can't act twice.
-- **The token goes only to `https://discord.com/api`.** The API opener follows no redirect, because urllib's default handler would carry the `Authorization` header to the next host. Attachment downloads go only to Discord's CDN hosts, without the token. No message or error ever prints the token.
-- **Downloads stay put.** Attachments go to a new folder (`./discord-MESSAGE` unless `--dir`), with names stripped of path parts and existing files never overwritten.
-- **Rate limits.** The client waits out a 429 for as long as Discord asks, up to 60 seconds, and fails beyond that. It honors exhausted buckets and global limits, and retries a search while Discord is still indexing the server.
+- **No double posts.** Every message carries a `nonce` with `enforce_nonce`, so when a lost or cut-off response makes the CLI retry, Discord returns the first message instead of posting it again. The nonces derive from the channel, the text and the files, so running the same send again within a few minutes (after a failure partway through a long message, say) returns the parts already posted, marked `already posted`, instead of repeating them. `--again` posts a deliberate repeat. A message send stops retrying 90 seconds after its first try, well inside the window in which Discord matches nonces, and a send that fails partway says how many parts went out. Other POST and PATCH calls never retry unless a repeat can't act twice.
+- **The token goes only to `https://discord.com/api`.** The API opener follows no redirect, because urllib's default handler would carry the `Authorization` header to the next host. Attachment downloads go only to Discord's CDN hosts over https, redirects included, without the token. A token holding a line break or a space is refused before it reaches an HTTP header, and every error, expected or not, prints as one line with the token removed (`DISCORD_DEBUG=1` adds a redacted traceback).
+- **Downloads stay put.** Attachments go to `./discord-MESSAGE` (or `--dir`), which must not be a symbolic link. Each file is created new, so nothing is overwritten and no symbolic link inside the folder is followed. Names lose path parts, leading dots and dashes, and control characters, and are cut to 200 bytes.
+- **What others wrote can't drive your terminal.** Plain-text output shows control characters in message text, names and file names as `\x1b`-style escapes. `--json` keeps the data exact.
+- **Rate limits.** The client waits out a 429 or an exhausted bucket for as long as Discord asks, up to 60 seconds, says so on stderr when a wait reaches 5 seconds, and fails beyond 60 seconds. Routes that Discord says share a bucket wait together. A 429 with no wait time (a Cloudflare block after too many failed requests) fails at once. Search retries, with a growing delay, while Discord is still indexing the server.
 
 ## Live messages
 
@@ -57,6 +59,8 @@ The CLI holds no Gateway connection, so it only sees messages when you ask. To c
 DISCORD_BOT_TOKEN="$(agent-secret get agent/discord-bot-token)" claude --channels plugin:discord@claude-plugins-official
 ```
 
+That exports the token to every process the session starts, MCP servers and shell commands included, so anything that prints the environment there can show it. Run it only in a session meant for the Discord channel.
+
 ## Tests
 
 ```bash
@@ -65,9 +69,12 @@ uv run --with pytest --with hypothesis python -m pytest tests/test_discord.py -q
 
 A fake transport stands in for the API, so the tests make no network calls. Property tests check these invariants:
 
-- message chunks fit the 2000-character limit, counted in UTF-16 units, and never lose or reorder a visible character;
+- message chunks fit the 2000-character limit, counted in UTF-16 units, never lose or reorder a visible character, and add only the lines that close and reopen a code block;
 - snowflake cursors round-trip, and message links parse back to their ids;
-- paging returns exactly the messages Discord's documented `before`/`after` rules select, whatever order a page arrives in;
-- no write leaves without `--yes`;
+- paging returns exactly the messages Discord's documented `before`/`after` rules select, whatever order a page arrives in, without wasted requests;
+- no write leaves without `--yes`, whatever other flags come with it;
 - the token never reaches the terminal or a host other than the API;
-- downloads can't leave their folder.
+- download names can't leave their folder, pass for an option, or overflow a file system's name limit;
+- printed text holds no control characters.
+
+The suite also pins each fix from the review of the first version, by finding: the redacting catch-all, retries after a cut-off response, nonces that hold across runs, symlink-proof downloads, exact-name matching, search paging, and the rest. CI runs it on Python 3.11 and 3.14.
