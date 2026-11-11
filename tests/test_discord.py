@@ -1172,7 +1172,16 @@ def test_dash_h_text_is_an_error_not_help_with_exit_0(text):
 def test_help_still_works(capsys):
     with pytest.raises(SystemExit) as e:
         dc.main(["send", "-h"])
-    assert e.value.code == 0 and "--reply-to" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert e.value.code == 0 and "--reply-to" in out and re.search(r"^ +-h, --help +show", out, re.M)
+    assert "[HELP]" not in out
+
+
+def test_the_dash_h_check_spares_long_options_and_text_after_dashes():
+    fake = FakeDiscord(ids(3))
+    assert run(fake, "search", "Test Server", "--has", "link")[0] == 0
+    code, out, _ = run(fake, "send", GENERAL, "--", "-hey -h")
+    assert code == dc.DRY_RUN_EXIT and "-hey -h" in out and not fake.sent
 
 
 def test_options_may_sit_between_positionals():

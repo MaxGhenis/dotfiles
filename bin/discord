@@ -1523,22 +1523,6 @@ def write_new_file(folder: Path, name: str, data: bytes) -> Path:
 # --------------------------------------------------------------------------- CLI
 
 
-class _Help(argparse.Action):
-    """-h/--help that takes an optional value only to catch text like "-hey":
-    argparse would read that as -h and print help with exit 0, which a caller
-    could take for success."""
-
-    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):
-        super().__init__(option_strings, dest, nargs="?", default=default, help="show this help and exit")
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        if values is not None:
-            parser.error("text that starts with '-' needs -- in front of it, e.g. "
-                         f"{parser.prog} ... -- '-text'")
-        parser.print_help()
-        parser.exit()
-
-
 def build_parser() -> argparse.ArgumentParser:
     # allow_abbrev=False everywhere: only the exact --yes may turn a dry run into a write.
     p = argparse.ArgumentParser(prog="discord", description=__doc__, allow_abbrev=False,
@@ -1547,8 +1531,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
 
     def add(name, func, help_text):
-        sp = sub.add_parser(name, help=help_text, description=help_text, allow_abbrev=False, add_help=False)
-        sp.add_argument("-h", "--help", action=_Help)
+        sp = sub.add_parser(name, help=help_text, description=help_text, allow_abbrev=False)
         sp.set_defaults(func=func)
         return sp
 
@@ -1655,7 +1638,14 @@ def parse_args(parser: argparse.ArgumentParser, argv: list[str] | None) -> argpa
     for i, word in enumerate(argv):
         if word in sub.choices:
             parser.parse_args(argv[:i])  # --version, -h, or an error, before the command
-            args = sub.choices[word].parse_intermixed_args(argv[i + 1:])
+            rest = argv[i + 1:]
+            for arg in rest[:rest.index("--") if "--" in rest else None]:
+                # argparse reads text like "-hey" as -h plus flags and prints help
+                # with exit 0, which a caller could take for success.
+                if arg.startswith("-h") and arg != "-h" and " " not in arg:
+                    sub.choices[word].error(f"text that starts with '-' needs -- in front of it: "
+                                            f"discord {word} ... -- '{arg}'")
+            args = sub.choices[word].parse_intermixed_args(rest)
             args.command = word
             return args
         if not word.startswith("-") or word == "--":
