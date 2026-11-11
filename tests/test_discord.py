@@ -15,10 +15,13 @@ request. Example tests pin each command; Hypothesis pins the invariants:
   and never follows a redirect; attachment downloads carry no token;
 - POST and PATCH repeat only when the caller marks the repeat safe; every
   message create carries a fresh nonce with enforce_nonce and pings no one;
-- downloads stay inside the target folder.
+- downloads stay inside the target folder;
+- uploads: the size check counts the exact multipart body the upload sends
+  (a differential check against encode_multipart).
 """
 from __future__ import annotations
 
+import argparse
 import email
 import email.policy
 import email.utils
@@ -376,6 +379,7 @@ GRAPHEME_PARTS = st.sampled_from([
     "\U0001F1FA", "\U0001F1F8", "\U000E0067", "\U0001F468", "\U0001F44D", "\u0e01", "\u0e33", "\u0eb3",
     "\u1100", "\u1161", "\u11a8", "\uac00", "\uac01", "\ua960", "\ud7b0", "\ud7cb", "\u0600", "\u0d4e",
     "\U000110BD", "\u0915", "\u094d", "\u0937", "\uff76", "\uff9e", "\u00ad", "\u034f",
+    "\u0951", "\u1780", "\u17d2", "\u1000", "\u1039", "\U000113D1",
 ])
 
 
@@ -1231,7 +1235,7 @@ def test_text_spelled_like_a_flag_never_opens_the_gate():
     assert code == dc.DRY_RUN_EXIT and "--yes" in out and not fake.sent
 
 
-@pytest.mark.parametrize("text", ["-hey", "-hello", "-help", "-h1"])
+@pytest.mark.parametrize("text", ["-hey", "-hello", "-help", "-h1", "-hello world", "-h is the help flag"])
 def test_dash_h_text_is_an_error_not_help_with_exit_0(text):
     """C15: argparse read -hey as -h and exited 0, which looked like success."""
     with pytest.raises(SystemExit) as e:
@@ -2220,3 +2224,152 @@ def test_dash_at_a_terminal_is_refused_instead_of_waiting():
     code = dc.main(["send", GENERAL, "-"], client_factory=lambda: dc.Client(TOKEN, transport=FakeDiscord()),
                    stdin=Terminal(), stdout=out, stderr=err)
     assert code == 2 and "stdin is a terminal" in err.getvalue()
+
+
+# --------------------------------------------------------------------------- round-4 review fixes
+
+def test_dashdash_before_the_command_is_refused(tmp_path, capsys):
+    """NEW-F2: `discord -- send ...` skipped the command's own parsing, so on Python 3.12.7+
+    `discord -- send C hi --yes` posted and `--file=KEY` uploaded the key."""
+    key = tmp_path / "id_ed25519"
+    key.write_text("private key")
+    for argv in (["--", "send", "--yes", GENERAL, f"--file={key}"], ["--", "send", GENERAL, "hi", "--yes"],
+                 ["--version", "--", "send", GENERAL, "hi", "--yes"], ["--"]):
+        fake = FakeDiscord()
+        with pytest.raises(SystemExit) as e:
+            run(fake, *argv)
+        assert e.value.code == 2 and not fake.calls, argv
+        assert "-- goes after the command" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv, option", [
+    (["read", GENERAL, "-n", "--", "5"], "-n"),
+    (["search", GUILD, "x", "--sort", "--", "relevance"], "--sort"),
+    (["send", GENERAL, "--file", "--", "x"], "--file"),
+])
+def test_an_option_whose_value_follows_dashdash_is_named(argv, option, capsys):
+    """NEW-F4: argparse quoted the placeholder standing in for the word after --."""
+    with pytest.raises(SystemExit) as e:
+        run(FakeDiscord(), *argv)
+    err = capsys.readouterr().err
+    assert e.value.code == 2 and f"{option} needs its value before --" in err
+    assert "\\x00" not in err and "\0" not in err
+
+
+def test_errors_show_the_real_word_where_argparse_quotes_it(capsys):
+    toy = argparse.ArgumentParser(prog="toy")
+    toy.add_argument("count", type=int)
+    with pytest.raises(SystemExit):
+        dc._parse_command(toy, "toy", ["--", "five"])
+    err = capsys.readouterr().err
+    assert "invalid int value: 'five'" in err and "\\x00" not in err
+
+
+@pytest.mark.parametrize("word, cut", [
+    ("\u0915\u094d\u0937", 2),          # Devanagari KA VIRAMA SSA
+    ("\u0915\u094d\u0951\u0915", 3),    # a stress mark between the virama and the consonant
+    ("\u0915\u094d\u0301\u0915", 3),    # an acute accent there
+    ("\u0915\u094d\u200d\u0915", 3),    # a zero-width joiner there
+    ("\u1780\u17d2\u1780", 2),          # Khmer KA COENG KA
+    ("\u1000\u1039\u1000", 2),          # Myanmar KA, the invisible stacker, KA
+    ("\u1a20\u1a60\u1a20", 2),          # Tai Tham HIGH KA SAKOT HIGH KA
+    ("\u1b13\u1b44\u1b13", 2),          # Balinese KA ADEG ADEG KA
+    ("\ua98f\ua9c0\ua98f", 2),          # Javanese KA PANGKON KA
+    ("\U000113D1\u0915", 1),            # a Unicode 16 Prepend joins what follows
+])
+def test_cuts_never_strand_half_a_conjunct(word, cut):
+    """NEW-F3: a cut after Khmer COENG or Myanmar's stacker, or after a virama with a mark
+    behind it, left the consonant that belongs under the one before at the top of the
+    next message. Pinned here because the newest regex module doesn't apply GB9c at all."""
+    assert not dc.safe_cut(word, cut)
+    assert dc.safe_cut(word + word, len(word))  # between two conjuncts is fine
+
+
+@pytest.mark.parametrize("unit", ["\u1780\u17d2\u179f", "\u1000\u1039\u1000", "\u0915\u094d\u0951\u0915"])
+def test_long_unspaced_text_breaks_between_conjuncts(unit):
+    for shift in range(len(unit)):
+        text = "x" * shift + unit * 1000
+        pieces = dc.chunk_text(text)
+        assert len(pieces) >= 2 and "".join(pieces) == text
+        at = 0
+        for piece in pieces[:-1]:
+            at += len(piece)
+            assert (at - shift) % len(unit) == 0, (shift, at)
+
+
+def test_a_folder_swapped_for_a_link_before_it_opens_is_refused(tmp_path, monkeypatch):
+    """O_NOFOLLOW pin (round 4): the folder is made, then swapped for a link to someone's
+    ~/.ssh before open_folder runs. Following the link would pass the owner check."""
+    dl, victim = tmp_path / "dl", tmp_path / "victim" / ".ssh"
+    victim.mkdir(parents=True)
+    real_mkdir = Path.mkdir
+
+    def mkdir_then_swap(self, *a, **k):
+        real_mkdir(self, *a, **k)
+        if self == dl:
+            dl.rename(tmp_path / "dl.real")
+            dl.symlink_to(victim)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_then_swap)
+    monkeypatch.setattr(dc, "fetch_url", lambda url, timeout=60.0: b"ssh-ed25519 attacker")
+    fake, link = download_fake(["authorized_keys"])
+    code, _, err = run(fake, "download", link, "--dir", str(dl))
+    assert code == 2 and "can't use" in err and list(victim.iterdir()) == []
+    with pytest.raises(OSError):
+        dc.open_folder(dl)
+
+
+def test_a_channel_of_forwards_alone_doesnt_suggest_a_missing_intent():
+    """NEW-8 pin: one forward-only channel, so dropping the snapshot clause fails."""
+    fake = FakeDiscord()
+    fake.history[GENERAL] = [
+        {**FakeDiscord.message(GENERAL, i, content=""),
+         "message_snapshots": [{"message": {"content": "", "embeds": [{"title": "t"}, {"title": "u"}]}}]}
+        for i in ids(3)]
+    code, out, err = run(fake, "read", GENERAL)
+    assert code == 0 and "intent" not in err
+    assert out.count("forwarded") == 3 and out.count("2 embed(s)") == 3  # a forward's embeds count too
+
+
+def test_the_upload_limit_counts_the_whole_request(tmp_path):
+    """C18 residue: files of exactly 25 MiB passed, though the request around them is larger."""
+    exact = tmp_path / "exact.bin"
+    with open(exact, "wb") as fh:  # sparse: no real disk use
+        fh.truncate(dc.REQUEST_LIMIT)
+    fake = FakeDiscord()
+    code, _, err = run(fake, "send", GENERAL, "--file", str(exact))
+    assert code == 2 and "25 MiB per message" in err and not fake.sent
+    small = tmp_path / "small.bin"
+    with open(small, "wb") as fh:
+        fh.truncate(dc.REQUEST_LIMIT - 64 * 1024)
+    code, out, _ = run(FakeDiscord(), "send", GENERAL, "--file", str(small))
+    assert code == dc.DRY_RUN_EXIT and "small.bin" in out
+
+
+# Quotes, backslashes and line breaks (which the form escapes) and multi-byte characters, but
+# only ones every file system takes: APFS refuses code points its Unicode tables don't know.
+FILE_NAMES = st.text(st.sampled_from(list('aZ09 ._-"\\\r\n') + ["\u00e9", "\u65e5", "\U0001F600", "\u0301"]),
+                     min_size=1, max_size=20).filter(lambda n: n not in (".", ".."))
+
+
+@settings(max_examples=60, deadline=None)
+@given(text=st.text(max_size=300), names=st.lists(FILE_NAMES, min_size=0, max_size=3, unique_by=str.lower),
+       sizes=st.lists(st.integers(0, 4000), min_size=3, max_size=3))
+def test_multipart_size_matches_the_encoded_body(tmp_path_factory, text, names, sizes):
+    """Differential: the size check and the upload build the same body."""
+    folder = tmp_path_factory.mktemp("multipart")
+    files = []
+    for name, size in zip(names, sizes):
+        f = folder / name
+        f.write_bytes(b"x" * size)
+        files.append(f)
+    payload = dc.message_payloads(text or "", mentions={"parse": []}, seed="s")[0]
+    assert dc.multipart_size(payload, files) == len(dc.encode_multipart(payload, files)[0])
+
+
+def test_a_refused_token_isnt_redacted_out_of_the_advice(monkeypatch):
+    """N4 residue: DISCORD_BOT_TOKEN=agent-secret turned the advice into "<token> set ..."."""
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "agent-secret")
+    err = io.StringIO()
+    assert dc.main(["whoami"], stdout=io.StringIO(), stderr=err) == 2
+    assert "agent-secret set agent/discord-bot-token" in err.getvalue() and "<token>" not in err.getvalue()

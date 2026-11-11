@@ -22,9 +22,15 @@ jobs:
     timeout-minutes: 15
     strategy:
       matrix:
-        python: ["3.9", "3.11", "3.12.5", "3.14"]  # 3.9: macOS /usr/bin/python3
+        # regex is the grapheme test's oracle, and its releases disagree on rule GB9c,
+        # so each leg pins one: 2026.1.15 is the newest that installs on 3.9.
+        include:
+          - {python: "3.9", regex: "2026.1.15"}  # macOS /usr/bin/python3
+          - {python: "3.11", regex: "2026.11.9"}
+          - {python: "3.12.5", regex: "2026.11.9"}  # the last argparse seen mishandling --
+          - {python: "3.14", regex: "2026.11.9"}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - name: pytest
-        run: uv run --no-project --python ${{ matrix.python }} --with pytest --with hypothesis --with regex pytest tests/test_discord.py -q
+        run: uv run --no-project --python ${{ matrix.python }} --with pytest --with hypothesis --with regex==${{ matrix.regex }} pytest tests/test_discord.py -q

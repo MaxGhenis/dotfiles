@@ -226,12 +226,16 @@ def _attaches_to_previous(ch: str) -> bool:
             or 0xE0100 <= o <= 0xE01EF or 0x1160 <= o <= 0x11FF or 0xD7B0 <= o <= 0xD7FB)
 
 
-# UAX #29 Prepend: these join the character after them.
+# UAX #29 Prepend (Unicode 16): these join the character after them.
 _PREPEND = frozenset([*range(0x0600, 0x0606), 0x06DD, 0x070F, 0x0890, 0x0891, 0x08E2, 0x0D4E, 0x110BD,
                       0x110CD, 0x111C2, 0x111C3, 0x1193F, 0x11941, 0x11A3A, *range(0x11A84, 0x11A8A),
-                      0x11D46, 0x11F02])
-# Viramas that link two consonants into one conjunct (UAX #29 rule GB9c).
-_LINKERS = frozenset([0x094D, 0x09CD, 0x0ACD, 0x0B4D, 0x0C4D, 0x0D4D])
+                      0x11D46, 0x11F02, 0x113D1])
+# Signs that stack the next consonant onto the one before: the six Indic
+# viramas of UAX #29 rule GB9c, plus Khmer COENG, Myanmar's invisible stacker,
+# Tai Tham SAKOT, Balinese ADEG ADEG and Javanese PANGKON, which do the same
+# in scripts written without spaces. A cut after one strands half a conjunct.
+_LINKERS = frozenset([0x094D, 0x09CD, 0x0ACD, 0x0B4D, 0x0C4D, 0x0D4D,
+                      0x17D2, 0x1039, 0x1A60, 0x1B44, 0xA9C0])
 
 
 def _hangul_lead(o: int) -> bool:
@@ -251,8 +255,14 @@ def safe_cut(text: str, i: int) -> bool:
     if _attaches_to_previous(after) or before == "‍" or (before, after) == ("\r", "\n"):
         return False
     b, a = ord(before), ord(after)
-    if b in _PREPEND or (b in _LINKERS and unicodedata.category(after) == "Lo"):
+    if b in _PREPEND:
         return False
+    if unicodedata.category(after) == "Lo":  # a consonant: is a linker waiting for it?
+        j = i - 1  # GB9c lets marks sit between the linker and the consonant
+        while j >= 0 and _attaches_to_previous(text[j]):  # every linker is itself a mark
+            if ord(text[j]) in _LINKERS:
+                return False
+            j -= 1
     if _hangul_lead(b) and (_hangul_lead(a) or 0xAC00 <= a <= 0xD7A3):  # a lead jamo joins what follows
         return False
     if before == "`" and after == "`":
@@ -488,24 +498,39 @@ def safe_filename(name: str, fallback: str) -> str:
     return stem + ext if stem else fallback
 
 
-def encode_multipart(payload: dict, files: list[Path]) -> tuple[bytes, str]:
-    """multipart/form-data body: payload_json plus files[n] (reference: Uploading Files)."""
-    boundary = "discordcli" + uuid.uuid4().hex
+def _multipart_pieces(payload: dict, files: list[Path], boundary: str) -> list:
+    """A multipart body in order: bytes, or the Path whose contents go there."""
     payload = dict(payload)
     payload["attachments"] = [{"id": i, "filename": f.name} for i, f in enumerate(files)]
-    out = [
+    pieces: list = [
         f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n'
         "Content-Type: application/json\r\n\r\n".encode() + json.dumps(payload).encode() + b"\r\n"
     ]
     for i, f in enumerate(files):
         fname = re.sub(r'["\\\r\n]', "_", f.name)
         ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-        out.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="files[{i}]"; filename="{fname}"\r\n'
-            f"Content-Type: {ctype}\r\n\r\n".encode() + f.read_bytes() + b"\r\n"
-        )
-    out.append(f"--{boundary}--\r\n".encode())
-    return b"".join(out), f"multipart/form-data; boundary={boundary}"
+        pieces += [f'--{boundary}\r\nContent-Disposition: form-data; name="files[{i}]"; filename="{fname}"\r\n'
+                   f"Content-Type: {ctype}\r\n\r\n".encode(), f, b"\r\n"]
+    pieces.append(f"--{boundary}--\r\n".encode())
+    return pieces
+
+
+def _boundary() -> str:
+    return "discordcli" + uuid.uuid4().hex  # always 42 characters
+
+
+def encode_multipart(payload: dict, files: list[Path]) -> tuple[bytes, str]:
+    """multipart/form-data body: payload_json plus files[n] (reference: Uploading Files)."""
+    boundary = _boundary()
+    pieces = _multipart_pieces(payload, files, boundary)
+    return (b"".join(p.read_bytes() if isinstance(p, Path) else p for p in pieces),
+            f"multipart/form-data; boundary={boundary}")
+
+
+def multipart_size(payload: dict, files: list[Path]) -> int:
+    """The length of encode_multipart's body, from the files' sizes, without reading them."""
+    return sum(p.stat().st_size if isinstance(p, Path) else len(p)
+               for p in _multipart_pieces(payload, files, _boundary()))
 
 
 def _query(params: dict | None) -> str:
@@ -1082,12 +1107,22 @@ def message_text(m: dict) -> str:
     return ""
 
 
+def _with_forwarded(m: dict, key: str) -> list[dict]:
+    """m[key] (a list of objects), plus the same list in each forwarded message."""
+    found = [m.get(key)]
+    for snap in m.get("message_snapshots") or []:
+        found.append(((snap or {}).get("message") or {}).get(key))
+    return [a for items in found if isinstance(items, list) for a in items if isinstance(a, dict)]
+
+
 def message_attachments(m: dict) -> list[dict]:
     """A message's attachments, a forward's included."""
-    found = list(m.get("attachments") or [])
-    for snap in m.get("message_snapshots") or []:
-        found += ((snap or {}).get("message") or {}).get("attachments") or []
-    return [a for a in found if isinstance(a, dict)]
+    return _with_forwarded(m, "attachments")
+
+
+def message_embeds(m: dict) -> list[dict]:
+    """A message's embeds, a forward's included."""
+    return _with_forwarded(m, "embeds")
 
 
 # --------------------------------------------------------------------------- output
@@ -1136,8 +1171,9 @@ def format_message(m: dict, channel_names: dict | None = None) -> str:
     files = message_attachments(m)
     if files:
         bits.append(f"{len(files)} file(s)")
-    if m.get("embeds"):
-        bits.append(f"{len(m['embeds'])} embed(s)")
+    embeds = message_embeds(m)
+    if embeds:
+        bits.append(f"{len(embeds)} embed(s)")
     if m.get("edited_timestamp"):
         bits.append("edited")
     if (m.get("thread") or {}).get("id"):
@@ -1443,6 +1479,10 @@ def _post(client: Client, ctx: Ctx, target: Target, args, text: str, files: list
     mentions = allowed_mentions(args)
     seed = None if args.again else send_seed(target.channel_id, text, files, reply_to, mentions)
     bodies = message_payloads(text, mentions=mentions, reply_to=reply_to, seed=seed)
+    if files and multipart_size(bodies[0], files) > REQUEST_LIMIT:  # the limit counts the whole request
+        raise UsageError(f"with the text and form fields around them, the files come to "
+                         f"{_mib(multipart_size(bodies[0], files))}; Discord takes at most "
+                         f"{REQUEST_LIMIT >> 20} MiB per message")
     if not args.yes:
         detail = [f"  to: {clean(target.label)} ({target.channel_id})"
                   + (f", replying to {reply_to}" if reply_to else "")]
@@ -1755,15 +1795,18 @@ def _parse_command(sp: argparse.ArgumentParser, name: str, words: list[str]) -> 
     k = words.index("--") if "--" in words else len(words)
     head, tail = words[:k], words[k + 1:]
     for word in head:
-        # argparse reads text like "-hey" as -h plus flags and prints help with
-        # exit 0, which a caller could take for success.
-        if word.startswith("-h") and word != "-h" and " " not in word:
+        # argparse reads text like "-hey" or "-hello world" as -h plus more and
+        # prints help with exit 0, which a caller could take for success.
+        if word.startswith("-h") and word != "-h":
             sp.error(f"text that starts with '-' needs -- in front of it: discord {name} ... -- '{word}'")
+    taker = sp._option_string_actions.get(head[-1]) if head and k < len(words) else None
+    if taker is not None and taker.nargs != 0:  # `-n -- 5`: the value is on the far side of --
+        sp.error(f"{head[-1]} needs its value before --")
     masks = {f"\0{n}\0": word for n, word in enumerate(tail)}
 
     def unmask(text: str) -> str:
-        for mask, word in masks.items():
-            text = text.replace(mask, word)
+        for mask, word in masks.items():  # argparse quotes some values with repr()
+            text = text.replace(repr(mask)[1:-1], word).replace(mask, word)
         return text
 
     sp.error = lambda message: argparse.ArgumentParser.error(sp, unmask(message))
@@ -1793,7 +1836,9 @@ def parse_args(parser: argparse.ArgumentParser, argv: list[str] | None) -> argpa
             args = _parse_command(sub.choices[word], word, argv[i + 1:])
             args.command = word
             return args
-        if not word.startswith("-") or word == "--":
+        if word == "--":  # argparse would hand the rest to the command unguarded
+            parser.error("-- goes after the command: discord send CHANNEL -- TEXT")
+        if not word.startswith("-"):
             break
     return parser.parse_args(argv)
 
@@ -1825,7 +1870,11 @@ def main(argv: list[str] | None = None, *, client_factory=None, stdin=None, stdo
         if client_factory:
             client = client_factory()
         else:
-            token = load_token()
+            try:
+                token = load_token()
+            except UsageError:  # its words name no token, and a refused value isn't one:
+                secrets.clear()  # redacting "agent-secret" would garble the advice itself
+                raise
             secrets.append(token)
             client = Client(token, on_wait=lambda s, why: ctx.note(f"waiting {s:.0f}s ({why})..."))
         secrets.append(getattr(client, "_token", None))
