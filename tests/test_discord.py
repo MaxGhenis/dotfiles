@@ -305,7 +305,7 @@ TEXT = st.text(st.characters(codec="utf-8"), max_size=700)
 # Text rich in what chunking must not break: code fences, flags, accents, ZWJ emoji.
 TRICKY = st.lists(st.sampled_from([
     "a", "b", " ", "\n", "```", "```py\n", "e\u0301", "\U0001F1FA\U0001F1F8", "\U0001F44D\U0001F3FD",
-    "\U0001F468\u200d\U0001F469\u200d\U0001F467", "\u65e5", "\r\n", "`",
+    "\U0001F468\u200d\U0001F469\u200d\U0001F467", "\u65e5", "\r\n", "`", " \u0301",
 ]), max_size=400).map("".join)
 squash = lambda s: "".join(s.split())  # noqa: E731
 
@@ -354,6 +354,8 @@ def test_chunks_never_split_flags_emoji_or_accents():
     accents = "e\u0301" * 1500
     assert all(not p.startswith("\u0301") for p in dc.chunk_text(accents))
     thai, hangul = "\u0e01\u0e33" * 1500, "\u1100\u1161\u11a8" * 1000
+    space_accent = "a" * 1500 + " \u0301" + "b" * 600  # a break after the space would strand the accent
+    assert all(not p.startswith("\u0301") for p in dc.chunk_text(space_accent))
     assert all(not p.startswith("\u0e33") for p in dc.chunk_text(thai))
     assert all(p.startswith("\u1100") for p in dc.chunk_text(hangul))
 
@@ -2210,11 +2212,11 @@ def test_a_failed_attachment_fetch_skips_only_that_file(tmp_path, monkeypatch, e
 
 
 def test_dash_at_a_terminal_is_refused_instead_of_waiting():
-    class Terminal(io.StringIO):
+    class Terminal(NeverEnds):  # reading it would wait for someone to type
         def isatty(self):
             return True
 
     out, err = io.StringIO(), io.StringIO()
     code = dc.main(["send", GENERAL, "-"], client_factory=lambda: dc.Client(TOKEN, transport=FakeDiscord()),
                    stdin=Terminal(), stdout=out, stderr=err)
-    assert code == 2 and "stdin" in err.getvalue()
+    assert code == 2 and "stdin is a terminal" in err.getvalue()
