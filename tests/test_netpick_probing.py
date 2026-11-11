@@ -20,7 +20,7 @@ import threading
 import time
 
 import pytest
-from hypothesis import given
+from hypothesis import example, given
 from hypothesis import strategies as st
 
 from netpick_fakes import FIXTURES, NP, SCRIPT, T0, FakeMac, make_prober, tether, wifi
@@ -682,6 +682,7 @@ def test_a_baseline_ends_when_any_read_finds_another_network(tmp_path, gap, onli
 
 @given(max_new=st.integers(0, 3), in_seen=st.booleans(), portal=st.sampled_from([0.0, 20.0]), at=st.floats(0.01, 60),
        drop=st.none() | st.floats(0.1, 3), stay=st.floats(0.1, 5), after=st.none() | st.floats(0.1, 3))
+@example(max_new=0, in_seen=False, portal=0.0, at=1.0, drop=None, stay=1.0, after=1.0)  # round 6's minor finding
 def test_a_short_switch_ends_the_baseline_exactly_when_a_read_finds_it(max_new, in_seen, portal, at, drop, stay, after):
     """Invariant: a watch that starts on a network, moves to another for a few
     seconds and comes back, each way directly or through a drop, skips the
@@ -745,6 +746,45 @@ def test_a_switch_between_a_measurements_reads_gives_no_mixed_record(tmp_path, b
     assert "the network changed as the measurement started" in text
     assert ("so netpick waits for it" in text) == baseline  # no gateway read found B, so the baseline waits
     assert rc == 0 and [(r["gateway"], r["ip"]) for r in store.load()[0]] == [(B["gateway"], B["ip"])]
+
+
+class FirstAddressReadFails(FakeMac):
+    failed = False
+
+    def answer(self, argv, stdin):
+        if argv[:2] == ["ipconfig", "getifaddr"] and not self.failed:
+            self.failed = True
+            return NP.Proc(1, "", "")
+        return super().answer(argv, stdin)
+
+
+def test_a_baseline_without_an_address_waits_for_one(tmp_path):
+    """Round-6 recheck: when the baseline's first address read failed, watch
+    measured with no address to compare, so a switch between the
+    measurement's two reads gave a mixed record again. watch now measures the
+    baseline only once it has read an address. B appears at 1.5 s, between
+    the measurement's gateway read at 1 s and its address read at 2 s."""
+    mac = FirstAddressReadFails([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 1.5, wifi(**B))]
+    rc, text, store = watch(mac, tmp_path, baseline=True, max_new=1, settle=5, minutes=5)
+    assert "baseline: the current Wi-Fi network has no address yet, so netpick waits for it" in text
+    assert rc == 0 and [(r["gateway"], r["ip"]) for r in store.load()[0]] == [(B["gateway"], B["ip"])]
+
+
+def test_a_drop_as_a_later_baseline_measurement_starts_keeps_it_waiting(tmp_path):
+    """Round-6 recheck: when a baseline measurement inside the loop met a drop,
+    watch said it skipped the network, then measured it as the baseline when
+    it came back. The portal opens at 6 s and the settle ends with a read at
+    11 s, so the measurement's gateway read at 12 s finds the drop."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = [(T0, wifi(online_after=5.0, **A)), (T0 + 11.8, None),
+                         (T0 + 12.3, wifi(online_after=5.0, **A))]
+    rc, text, store = watch(mac, tmp_path, baseline=True, max_new=0, settle=5, minutes=5)
+    assert "the network changed as the measurement started, so netpick waits for it" in text
+    assert "skipped it" not in text
+    assert rc == 0 and [r["gateway"] for r in store.load()[0]] == [A["gateway"]]
 
 
 def test_a_baseline_whose_portal_wait_runs_out_ends_a_watch_with_nothing_else_to_do(tmp_path):
@@ -1088,6 +1128,7 @@ def test_a_drop_as_a_measurement_starts_ends_the_visit(tmp_path, gap):
     mac.cost = one_second_gateway_reads
     mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 10, wifi(**C)), (gap, None), (gap + 0.5, wifi(**C))]
     rc, text, store = watch(mac, tmp_path, settle=5, max_new=1, minutes=5)
+    assert "the network changed as the measurement started, so netpick skipped it" in text
     assert text.count("new network: gateway 172.16.224.1") == 2
     assert [r["gateway"] for r in store.load()[0]] == [C["gateway"]]
 

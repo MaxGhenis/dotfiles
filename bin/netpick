@@ -1935,7 +1935,7 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
         pending = None
         if baseline:
             ip = prober.ipaddr(wifi) if gw else None
-            if gw and prober.captive(wifi) and left() > 0:
+            if gw and ip and prober.captive(wifi) and left() > 0:  # measure_now needs the visit's address
                 out(f"{stamp()} baseline: measuring the current network (gateway {gw})")
                 how = measure_now(gw, ip)
                 if how == "measured":
@@ -1950,7 +1950,8 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
             elif left() <= 0:
                 out(f"{stamp()} baseline: the {minutes:g}-minute limit has passed, so netpick skipped it")
             elif gw:
-                out(f"{stamp()} baseline: the current Wi-Fi network has no internet yet, so netpick waits for it")
+                out(f"{stamp()} baseline: the current Wi-Fi network has no {'internet' if ip else 'address'} yet, so "
+                    "netpick waits for it")
                 pending, last = gw, None
             else:
                 out(f"{stamp()} baseline: {wifi} has no network right now, so netpick skipped it")
@@ -2023,7 +2024,9 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
                         tested.add(gw)
                     show(gw)
                 else:
-                    out("   the network changed as the measurement started, so netpick skipped it")
+                    waits = gw == pending and how == "dropped"  # a drop keeps the baseline waiting
+                    out("   the network changed as the measurement started, so netpick "
+                        + ("waits for it" if waits else "skipped it"))
                     end_visit(how)
             prober.sleep(min(poll, max(left(), 0)))
     out(f"{stamp()} done: measured {len(measured)} network(s)")
