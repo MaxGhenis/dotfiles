@@ -1,0 +1,76 @@
+{
+  "base_rtt": 27.352706909179688,
+  "dl_bytes_transferred": 24197713,
+  "dl_flows": 6,
+  "dl_phase_duration": 5.8365559577941895,
+  "dl_phase_end": "2026-11-05 16:00:28.380",
+  "dl_phase_start": "2026-11-05 16:00:22.544",
+  "dl_throughput": 35782364,
+  "end_date": "2026-11-05 16:00:28.417",
+  "il_h2_req_resp": [
+    58.668018341064453,
+    61.221004486083984,
+    53.307056427001953
+  ],
+  "il_tcp_handshake_443": [
+    6,
+    6,
+    5
+  ],
+  "il_tls_handshake": [
+    17,
+    15,
+    23
+  ],
+  "interface_name": "en0",
+  "lud_foreign_h2_req_resp": [
+    13,
+    109,
+    107
+  ],
+  "lud_foreign_tcp_handshake_443": [
+    25,
+    50,
+    95
+  ],
+  "lud_foreign_tls_handshake": [
+    100,
+    11,
+    15
+  ],
+  "lud_self_h2_req_resp": [
+    38,
+    168,
+    127
+  ],
+  "os_version": "Version 26.6.2 (Build 25G83)",
+  "other": {
+    "ecn_values": {
+      "ecn_disabled": 91
+    },
+    "interface-type": {
+      "wifi": 91
+    },
+    "l4s_enablement": {
+      "disabled": 91
+    },
+    "protocols_seen": {
+      "h2": 91
+    },
+    "proxy_state": {
+      "not_proxied": 91
+    },
+    "rat": {
+      "unknown": 91
+    }
+  },
+  "responsiveness": 415.03408813476562,
+  "start_date": "2026-11-05 16:00:22.269",
+  "test_endpoint": "usbos3-edge-bx-007.aaplimg.com",
+  "ul_bytes_transferred": 106430464,
+  "ul_flows": 6,
+  "ul_phase_duration": 5.8365559577941895,
+  "ul_phase_end": "2026-11-05 16:00:28.380",
+  "ul_phase_start": "2026-11-05 16:00:22.544",
+  "ul_throughput": 156004736
+}

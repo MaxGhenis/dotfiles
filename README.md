@@ -9,6 +9,7 @@ Config and scripts for my development machine. The interesting part is `bin/`:
 | [`codex-run`](bin/codex-run) | Hardened `codex exec` dispatch — retries transient failures, salvages work on crash, unbreaks git in sandboxed worktrees. Documented below. |
 | [`cc`](bin/cc) | Claude Code pane launcher (superseded by [tmux-claude-code](https://github.com/MaxGhenis/tmux-claude-code)) |
 | [`sweep-worktrees`](bin/sweep-worktrees) | Rescue-and-bundle stale git worktrees before removing them |
+| [`netpick`](bin/netpick) | Which network this Mac should use right now. Measures Wi-Fi and any tethered phone or Ethernet link together, sends every probe through one link's interface, ranks the links for Claude Code sessions and git, and never switches networks itself. See [docs/netpick.md](docs/netpick.md). |
 
 ## Workflow docs
 

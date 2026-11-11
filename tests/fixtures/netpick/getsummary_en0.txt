@@ -1,0 +1,23 @@
+<dictionary> {
+  BSSID : <redacted>
+  ConnectionID : 6
+  IPv4 : <array> {
+    0 : <dictionary> {
+      Addresses : <array> {
+        0 : 172.21.121.112
+      }
+      ConfigMethod : DHCP
+      IsPublished : TRUE
+      Router : 172.21.112.1
+      RouterARPVerified : TRUE
+      SubnetMasks : <array> {
+        0 : 255.255.240.0
+      }
+    }
+  }
+  InterfaceType : WiFi
+  LinkStatusActive : TRUE
+  NetworkID : <redacted>
+  SSID : <redacted>
+  Security : WPA2_PSK
+}
