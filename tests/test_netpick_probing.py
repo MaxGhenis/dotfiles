@@ -760,12 +760,13 @@ class FirstAddressReadFails(FakeMac):
 
 def test_a_baseline_without_an_address_waits_for_one(tmp_path):
     """Round-6 recheck: when the baseline's first address read failed, watch
-    measured with no address to compare, so a switch between the
-    measurement's two reads gave a mixed record again. watch now measures the
-    baseline only once it has read an address. B appears at 1.5 s. On
-    02780f0 the first measurement's gateway read at 1 s found A and its
-    address read at 2 s found B. Now the loop's reads at 1 s and 2 s see the
-    same split, and the settle's read at 4 s finds B and skips the baseline."""
+    measured with no address to compare, so when the Wi-Fi switched between
+    the measurement's two reads, watch wrote a mixed record again. watch now
+    measures the baseline only once it has read an address. B appears at
+    1.5 s. On 02780f0 the first measurement's gateway read at 1 s found A
+    and its address read at 2 s found B. Now the loop's reads at 1 s and 2 s
+    see the same split, and when the settle's read at 4 s finds B, watch
+    skips the baseline."""
     mac = FirstAddressReadFails([], primary="en0")
     mac.cost = one_second_gateway_reads
     mac.wifi_schedule = [(T0, wifi(**A)), (T0 + 1.5, wifi(**B))]
