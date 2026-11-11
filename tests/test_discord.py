@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import email
 import email.policy
+import email.utils
 import http.server
 import importlib.machinery
 import importlib.util
@@ -33,6 +34,7 @@ import stat
 import subprocess
 import sys
 import threading
+import unicodedata
 import urllib.parse
 import urllib.request
 import datetime as dt
@@ -58,7 +60,8 @@ def _load():
 
 dc = _load()
 
-TOKEN = "SENTINEL-bot-token.must.never.leak-0123456789abcdef"
+# Shaped like a real bot token (three dot-joined parts), so load_token accepts it.
+TOKEN = "SENTINEL-bot-token-must-never-leak.AbCdEf.0123456789abcdef-SENTINEL"
 GUILD = "100000000000000001"
 CATEGORY_ID = "200000000000000009"
 GENERAL = "200000000000000001"
@@ -144,10 +147,12 @@ class FakeDiscord:
         self.history = {GENERAL: [self.message(GENERAL, i) for i in sorted(ids)], RANDOM: []}
         self.members = [{"user": {"id": str(int(USER) + i), "username": f"user{i}"}, "nick": None}
                         for i in range(members)]
+        self.threads: list[dict] = []
         self.sent: list[dict] = []
         self.nonces: dict[str, dict] = {}
         self.next_id = BASE_ID + 10**15
-        self.created_at = lambda: dt.datetime.now(dt.timezone.utc)
+        self.server_now = lambda: dt.datetime.now(dt.timezone.utc)  # Discord's clock, sent as Date
+        self.created_at = lambda: self.server_now()
 
     @staticmethod
     def message(channel, mid, content=None, attachments=()):
@@ -170,7 +175,8 @@ class FakeDiscord:
             raw = payload if isinstance(payload, bytes) else b"" if payload is None else json.dumps(payload).encode()
             return status, rheaders, raw
         status, payload = self.route(call)
-        return status, {}, b"" if payload is None else json.dumps(payload).encode()
+        date = email.utils.format_datetime(self.server_now().astimezone(dt.timezone.utc), usegmt=True)
+        return status, {"Date": date}, b"" if payload is None else json.dumps(payload).encode()
 
     def route(self, call: Call):
         m, p, q = call.method, call.path, call.query
@@ -182,7 +188,8 @@ class FakeDiscord:
             self.app = {**self.app, "flags": call.json()["flags"]}
             return 200, self.app
         if (m, p) == ("GET", "/users/@me/guilds"):
-            return 200, self.guilds
+            after, limit = int(q.get("after", ["0"])[0]), int(q.get("limit", ["200"])[0])
+            return 200, sorted((g for g in self.guilds if int(g["id"]) > after), key=lambda g: int(g["id"]))[:limit]
         if (m, p) == ("POST", "/users/@me/channels"):
             return 200, {"id": DM_CHANNEL, "type": 1, "recipients": [{"id": USER, "username": "max"}]}
         if (m, p) == ("GET", f"/users/{USER}"):
@@ -195,7 +202,7 @@ class FakeDiscord:
             assert 1 <= limit <= 1000
             return 200, [x for x in self.members if int(x["user"]["id"]) > after][:limit]
         if (m, p) == ("GET", f"/guilds/{GUILD}/threads/active"):
-            return 200, {"threads": [], "members": []}
+            return 200, {"threads": self.threads, "members": []}
         if (m, p) == ("GET", f"/guilds/{GUILD}/members/search"):
             return 200, [{"user": {"id": USER, "username": "max"}, "nick": None}]
         if (m, p) == ("GET", f"/guilds/{GUILD}/messages/search"):
@@ -317,12 +324,72 @@ def test_chunks_fit_are_never_blank_and_lose_nothing(text, limit):
     assert all(c in ("", "```", "\n```") for _, _, c in parts)
     if limit < dc.FENCE_MIN_LIMIT:
         assert all(r == c == "" for r, _, c in parts)
+    else:
+        assert all(dc._fence_after(p, None) is None for p in pieces[:-1]), "a piece left a code block open"
+    # Each body is the slice of text that starts where the last slice ended. Its end
+    # is a safe cut, unless the back half of its window held none.
+    pos = 0
+    for _, body, _ in parts:
+        start = text.index(body, pos)
+        end = pos = start + len(body)
+        if end < len(text) and not dc.safe_cut(text, end):
+            assert not any(dc.safe_cut(text, j) for j in range(start + (end - start) // 2 + 1, end + 1))
 
 
 @given(text=TEXT.filter(str.strip))
 def test_text_that_fits_stays_one_piece(text):
     if dc.u16len(text) <= dc.CONTENT_LIMIT:
         assert dc.chunk_text(text) == [text]
+
+
+def test_chunks_never_split_flags_emoji_or_accents():
+    """B4: the cuts that the property above allows only when nothing else fits."""
+    flags = "\U0001F1FA\U0001F1F8" * 600  # 600 US flags: 1200 code points, 2400 UTF-16 units
+    pieces = dc.chunk_text(flags)
+    assert len(pieces) == 2 and "".join(pieces) == flags
+    assert all(len(p) % 2 == 0 and p.startswith("\U0001F1FA") for p in pieces)
+    family = "\U0001F468\u200d\U0001F469\u200d\U0001F467"
+    pieces = dc.chunk_text(family * 300)
+    assert all(p.startswith("\U0001F468") and p.endswith("\U0001F467") for p in pieces)
+    accents = "e\u0301" * 1500
+    assert all(not p.startswith("\u0301") for p in dc.chunk_text(accents))
+    thai, hangul = "\u0e01\u0e33" * 1500, "\u1100\u1161\u11a8" * 1000
+    assert all(not p.startswith("\u0e33") for p in dc.chunk_text(thai))
+    assert all(p.startswith("\u1100") for p in dc.chunk_text(hangul))
+
+
+def test_a_code_block_cut_in_two_closes_and_reopens_with_its_language():
+    code = "```python\n" + "".join(f"x{i} = {i}\n" for i in range(400)) + "```\nafter"
+    pieces = dc.chunk_text(code)
+    assert len(pieces) >= 2 and all(dc.u16len(p) <= dc.CONTENT_LIMIT for p in pieces)
+    assert pieces[0].startswith("```python\n") and pieces[0].endswith("```")
+    assert all(p.startswith("```python\n") for p in pieces[1:])
+    assert all(dc._fence_after(p, None) is None for p in pieces)
+    assert pieces[-1].endswith("```\nafter")
+
+
+# What UAX #29 treats specially, for the differential test against the regex module.
+GRAPHEME_PARTS = st.sampled_from([
+    "a", " ", "\n", "\r", "`", "e", "\u0301", "\u093f", "\u200d", "\u200c", "\ufe0f", "\U0001F3FD",
+    "\U0001F1FA", "\U0001F1F8", "\U000E0067", "\U0001F468", "\U0001F44D", "\u0e01", "\u0e33", "\u0eb3",
+    "\u1100", "\u1161", "\u11a8", "\uac00", "\uac01", "\ua960", "\ud7b0", "\ud7cb", "\u0600", "\u0d4e",
+    "\U000110BD", "\u0915", "\u094d", "\u0937", "\uff76", "\uff9e", "\u00ad", "\u034f",
+])
+
+
+@settings(max_examples=600, deadline=None)
+@given(text=st.lists(st.one_of(GRAPHEME_PARTS, st.characters(codec="utf-8").filter(
+    lambda c: unicodedata.category(c) != "Cn")), max_size=40).map("".join))
+def test_every_safe_cut_is_a_grapheme_boundary(text):
+    """B4/NEW-7: differential against the regex module's \\X (UAX #29). safe_cut may refuse a
+    real boundary (it is stricter around ZWJ, backticks, controls and Indic conjuncts),
+    but every cut it allows must be one. Characters this Python doesn't know are left out:
+    the regex module's newer Unicode tables would disagree about them."""
+    regex = pytest.importorskip("regex")
+    bounds = {0} | {m.end() for m in regex.finditer(r"\X", text)}
+    for i in range(len(text) + 1):
+        if dc.safe_cut(text, i):
+            assert i in bounds, (text, i)
 
 
 def test_chunks_break_after_newlines_and_count_astral_characters_twice():
@@ -843,9 +910,9 @@ def test_token_sources():
         def __init__(self, rc, out):
             self.returncode, self.stdout, self.stderr = rc, out, ""
 
-    assert dc.load_token({"DISCORD_BOT_TOKEN": "Bot abc"}, run=None) == "abc"
+    assert dc.load_token({"DISCORD_BOT_TOKEN": f"Bot {TOKEN}"}, run=None) == TOKEN
     calls = []
-    assert dc.load_token({}, run=lambda argv, **kw: calls.append(argv) or Got(0, "xyz\n")) == "xyz"
+    assert dc.load_token({}, run=lambda argv, **kw: calls.append(argv) or Got(0, f"{TOKEN}\n")) == TOKEN
     assert calls == [["agent-secret", "get", "agent/discord-bot-token"]]
     with pytest.raises(dc.UsageError) as e:
         dc.load_token({}, run=lambda argv, **kw: Got(1, ""))
@@ -927,15 +994,18 @@ def test_an_unexpected_exception_is_one_redacted_line_not_a_traceback():
 
 def test_an_echoed_token_is_redacted_before_the_error_is_cut():
     """A2: the token straddling the 300-character cut once printed all but its tail."""
-    for pad in (200, 240, 270, 290):
+    def leaked(err):  # any 6 characters of the token in a row
+        return [TOKEN[i:i + 6] for i in range(len(TOKEN) - 5) if TOKEN[i:i + 6] in err]
+
+    for pad in range(200, 300, 7):  # the cut lands before, inside and after each part of the token
         fake = FakeDiscord()
         fake.script(400, {"message": "x" * pad + f" Bot {TOKEN} trailing"})
         code, _, err = run(fake, "whoami")
-        assert code == 1 and TOKEN[:12] not in err, pad
+        assert code == 1 and not leaked(err), pad
         fake = FakeDiscord()
         fake.script(403, b"<html>" + b"y" * pad + f"Authorization: Bot {TOKEN}".encode())
         code, _, err = run(fake, "whoami")
-        assert code == 1 and TOKEN[:12] not in err, pad
+        assert code == 1 and not leaked(err), pad
 
 
 def test_redact_catches_quoted_and_partial_forms():
@@ -1260,7 +1330,7 @@ def test_rerunning_a_failed_long_send_repeats_nothing():
     fake.create = create
     code, out, err = run(transport, "send", GENERAL, text, "--yes")
     assert code == 1 and out.count("sent ") == 1
-    assert "1 of 3 messages went out" in err and "same nonces" in err
+    assert "1 of 3 messages went out" in err and "reuses its nonces" in err
 
     def a_minute_passes():
         for msg in fake.nonces.values():
@@ -1303,12 +1373,17 @@ def test_nonces_differ_by_channel_text_reply_and_files(tmp_path):
 def test_a_near_miss_name_fails_instead_of_posting_somewhere_else():
     """C21: exact names only; duplicates across servers and categories never resolve silently."""
     for target, why in (("#general", "several channels"), ("Test Server/#gen", "no channel named"),
+                        ("#gen", "no channel named"),
                         ("Test Server/#General-", "no channel named"), ("Test Srv/#general", "no server named"),
                         ("#general/Test Server", "server first")):
         fake = FakeDiscord(servers=2)
         code, _, err = run(fake, "send", target, "hi", "--yes")
         assert code == 2 and why in err, (target, err)
         assert not fake.sent and {c.method for c in fake.calls} <= {"GET"}
+    fake = FakeDiscord()
+    fake.channels.append({"id": "200000000000000031", "name": "general", "type": 0, "guild_id": GUILD})
+    code, _, err = run(fake, "send", "Test Server/#general", "hi", "--yes")
+    assert code == 2 and "several channels are named" in err and not fake.sent
     fake = FakeDiscord(servers=2)
     assert run(fake, "send", "test server/#GENERAL", "hi", "--yes")[0] == 0  # the category "general" is skipped
     assert [c.path for c in fake.calls if c.method == "POST"] == [f"/channels/{GENERAL}/messages"]
@@ -1471,7 +1546,7 @@ def test_search_reports_cuts_on_stderr_in_json_mode_and_sends_documented_params(
     assert code == 0 and len(json.loads(out)) == 5 and "5 shown of 40" in err
     q = next(c.query for c in fake.calls if c.path.endswith("/messages/search"))
     assert q["channel_id"] == [GENERAL, RANDOM] and q["author_id"] == [USER] and q["has"] == ["link", "file"]
-    assert q["include_nsfw"] == ["true"] and q["limit"] == ["5"]
+    assert q["include_nsfw"] == ["true"] and q["limit"] == ["25"]  # always a full page, trimmed here
 
 
 def test_search_never_passes_the_offset_cap():
@@ -1718,7 +1793,7 @@ def test_other_peoples_control_characters_never_reach_the_terminal():
     code, out, _ = run(fake, "read", GENERAL)
     assert "\\x1b[2K" in out and "\\u202e" in out
     code, out, _ = run(fake, "read", GENERAL, "--json")
-    assert json.loads(out)[0]["content"] == evil  # JSON keeps the data exact (and escaped)
+    assert json.loads(out)[0]["content"] == evil  # JSON keeps the data exact, controls included
 
 
 @given(st.text())
@@ -1748,3 +1823,398 @@ def test_no_traceback_reaches_the_user(argv):
     assert code in (0, 1, 2, 3) and "Traceback" not in out + err
     if code in (1, 2):
         assert err.startswith("discord: ")
+
+
+# --------------------------------------------------------------------------- round-3 review fixes
+
+def test_words_after_dashdash_are_never_options_on_any_python(tmp_path):
+    """N5: parse_intermixed_args up to Python 3.12.5 read words after -- as options."""
+    key = tmp_path / "id_ed25519"
+    key.write_text("private key")
+    fake = FakeDiscord()
+    code, _, _ = run(fake, "send", "--yes", "--", GENERAL, f"--file={key}")
+    assert code == 0 and fake.sent[0]["content"] == f"--file={key}" and "_files" not in fake.sent[0]
+    chart = tmp_path / "chart.png"
+    chart.write_bytes(b"png")
+    fake = FakeDiscord()
+    code, out, _ = run(fake, "send", "--file", str(chart), "--", GENERAL, "--yes")
+    assert code == dc.DRY_RUN_EXIT and not fake.sent and "--yes" in out
+    mid = str(ids(1)[0])
+    fake = FakeDiscord(ids(1))
+    code, _, _ = run(fake, "delete", "--", dc.message_link(GUILD, GENERAL, mid), "--yes")
+    assert code == 2 and not any(c.method == "DELETE" for c in fake.calls)
+
+
+def test_dashdash_keeps_dash_for_stdin_and_shows_real_words_in_errors(capsys):
+    fake = FakeDiscord()
+    code, _, _ = run(fake, "send", GENERAL, "--yes", "--", "-", stdin="from stdin")
+    assert code == 0 and fake.sent[0]["content"] == "from stdin"
+    with pytest.raises(SystemExit) as e:
+        run(FakeDiscord(), "guilds", "--", "stray")
+    err = capsys.readouterr().err
+    assert e.value.code == 2 and "stray" in err and "\0" not in err
+
+
+def test_an_option_cannot_take_its_value_from_after_dashdash(tmp_path, capsys):
+    with pytest.raises(SystemExit) as e:
+        run(FakeDiscord(), "send", GENERAL, "--file", "--", str(tmp_path / "x"))
+    assert e.value.code == 2 and "--file needs its value before --" in capsys.readouterr().err
+
+
+def test_a_changed_file_is_a_new_send(tmp_path):
+    """N1: the seed hashed name and size only, so a same-size edit came back "sent" and never posted."""
+    f = tmp_path / "status.txt"
+    base = dict(channel_id=GENERAL, text="", reply_to=None, mentions={"parse": []})
+    f.write_text("OK")
+    first = dc.send_seed(files=[f], **base)
+    f.write_text("NO")
+    assert dc.send_seed(files=[f], **base) != first
+    fake = FakeDiscord()
+    f.write_text("OK")
+    run(fake, "send", GENERAL, "--file", str(f), "--yes")
+    f.write_text("NO")
+    run(fake, "send", GENERAL, "--file", str(f), "--yes")
+    assert [b["_files"]["files[0]"][1] for b in fake.sent] == [b"OK", b"NO"]
+
+
+def test_the_advice_after_a_failed_send_fits_again():
+    """N2: with --again the nonces are fresh, so a re-run repeats everything."""
+    text = "\n".join("y" * 150 for _ in range(30))  # 3 messages
+
+    def transport_failing_second(fake):
+        def transport(method, url, headers, body):
+            if method == "POST" and len(fake.sent) == 1:
+                return 403, {}, b'{"message": "Missing Permissions", "code": 50013}'
+            return fake(method, url, headers, body)
+        return transport
+
+    fake = FakeDiscord()
+    _, _, err = run(transport_failing_second(fake), "send", GENERAL, text, "--yes", "--again")
+    assert "1 of 3 messages went out" in err and "posts every message again" in err and "reuses" not in err
+    fake = FakeDiscord()
+    _, _, err = run(transport_failing_second(fake), "send", GENERAL, text, "--yes")
+    assert "reuses its nonces" in err and "posts every message again" not in err
+
+
+def test_a_wrong_local_clock_cant_make_a_new_message_look_old():
+    """N3: "already posted" compared Discord's timestamp with this machine's clock."""
+    fake = FakeDiscord()
+    fake.server_now = lambda: dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    code, out, _ = run(fake, "send", GENERAL, "fresh", "--yes")
+    assert code == 0 and out.startswith("sent ") and "already" not in out
+    code, out, _ = run(fake, "send", GENERAL, "fresh", "--yes")  # the same send again: Discord matched it
+    assert code == 0 and len(fake.sent) == 1
+
+
+def test_http_dates_parse_and_bad_ones_are_ignored():
+    assert dc._http_date("Tue, 11 Nov 2026 04:00:00 GMT") == dt.datetime(2026, 11, 11, 4, tzinfo=dt.timezone.utc).timestamp()
+    assert dc._http_date("not a date") is None and dc._http_date(None) is None
+
+
+@pytest.mark.parametrize("bad", ["abc", "e", "a.b.c", "x" * 70, TOKEN.replace(".", ""), f"{TOKEN}.extra"])
+def test_a_token_of_the_wrong_shape_is_refused(bad):
+    """N4: a placeholder like "e" got through, then redaction ate every e in every error."""
+    with pytest.raises(dc.UsageError) as e:
+        dc.load_token({"DISCORD_BOT_TOKEN": bad}, run=None)
+    assert "doesn't look like a bot token" in str(e.value)
+
+
+def test_a_placeholder_token_leaves_errors_readable(monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "e")
+    err = io.StringIO()
+    assert dc.main(["whoami"], stdout=io.StringIO(), stderr=err) == 2
+    assert "doesn't look like a bot token" in err.getvalue()
+    assert dc.redact("request failed", ["a", "e"]) == "request failed"
+
+
+def test_a_failed_write_leaves_no_partial_file(tmp_path, monkeypatch):
+    """N6: a half-written report.pdf stayed behind and pushed the re-run to "report (2).pdf"."""
+    real_fdopen = os.fdopen
+
+    class DiskFull:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+
+        def write(self, data):
+            self.fh.write(data[:100])
+            raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(dc.os, "fdopen", lambda fd, mode: DiskFull(real_fdopen(fd, mode)))
+    with pytest.raises(OSError):
+        dc.write_new_file(tmp_path, "report.pdf", b"x" * 1000)
+    assert list(tmp_path.iterdir()) == []
+    monkeypatch.undo()
+    assert dc.write_new_file(tmp_path, "report.pdf", b"x").name == "report.pdf"
+
+
+def test_names_in_lookup_errors_are_escaped():
+    """N8: server and channel names reached stderr raw, escapes and bidi overrides included."""
+    fake = FakeDiscord(servers=2)
+    fake.guilds[1]["name"] = "Evil\x1b[31m‮Server"
+    code, _, err = run(fake, "send", "#general", "hi", "--yes")
+    assert code == 2 and "several channels" in err
+    assert "\x1b" not in err and "‮" not in err and "\\x1b" in err and "\\u202e" in err
+    assert dc.clean("؜") == "\\u061c"
+
+
+class ShortTail(FakeDiscord):
+    """Discord sends one hit fewer than asked, and an old, large total."""
+
+    def search(self, q):
+        res = super().search(q)
+        res["messages"] = res["messages"][:-1]
+        res["total_results"] = 12_000
+        return res
+
+
+def test_a_short_tail_ends_the_search_instead_of_thousands_of_requests():
+    """N7/NEW-1: pages that shrank to the hits still missing, and no stop on a page that added
+    nothing, made 9,952 requests."""
+    fake = ShortTail(ids(40))
+    code, out, _ = run(fake, "search", GUILD, "message", "-n", "50", "--jsonl")
+    searches = [c for c in fake.calls if c.path.endswith("/messages/search")]
+    assert code == 0 and len(out.splitlines()) == 38 and len(searches) == 3
+    assert all(c.query["limit"] == ["25"] for c in searches)
+
+
+def test_an_empty_page_ends_the_search_whatever_the_total():
+    class Stale(FakeDiscord):
+        def search(self, q):
+            return {"total_results": 5000, "messages": []}
+
+    fake = Stale()
+    code, _, err = run(fake, "search", GUILD, "x")
+    assert code == 0 and sum(c.path.endswith("/messages/search") for c in fake.calls) == 1
+    assert "0 shown of 5000" in err
+
+
+def test_a_low_total_cant_end_the_search_while_pages_come_back_full():
+    """NEW-2: total_results lags while messages come and go."""
+    class LowTotal(FakeDiscord):
+        def search(self, q):
+            return {**super().search(q), "total_results": 10}
+
+    code, out, _ = run(LowTotal(ids(40)), "search", GUILD, "message", "-n", "40", "--jsonl")
+    assert code == 0 and len(out.splitlines()) == 40
+
+
+def test_the_10000_note_shows_when_short_pages_hit_the_cap():
+    """NEW-4."""
+    class Huge(FakeDiscord):
+        def search(self, q):
+            offset = int(q["offset"][0])
+            return {"total_results": 12_000, "messages": [[FakeDiscord.message(GENERAL, BASE_ID + offset + i)]
+                                                          for i in range(24)]}
+
+    code, _, err = run(Huge(), "search", GUILD, "x", "-n", "20000", "--jsonl")
+    assert code == 0 and "reaches only the first 10,000" in err
+
+
+def test_a_202_that_asks_for_more_than_a_minute_fails_instead_of_retrying_early():
+    """NEW-3: it slept 60 s and asked again before the time Discord gave."""
+    fake = FakeDiscord()
+    fake.script(202, {"code": 110000, "retry_after": 120})
+    clock = Clock()
+    code, _, err = run(fake, "search", GUILD, "x", clock=clock)
+    assert code == 1 and "try again in 120s" in err and clock.slept == []
+
+
+def test_forwards_stickers_and_system_messages_dont_suggest_a_missing_intent():
+    """NEW-8: a channel of forwards or stickers warned that the content intent was off."""
+    msgs = [{**FakeDiscord.message(GENERAL, i, content=""), **extra} for i, extra in zip(ids(4), [
+        {"message_snapshots": [{"message": {"content": "", "embeds": [{"title": "t"}]}}]},
+        {"sticker_items": [{"id": "1", "name": "wave", "format_type": 1}]},
+        {"type": 7},  # a member joined
+        {"poll": {"question": {"text": "?"}}},
+    ])]
+    fake = FakeDiscord()
+    fake.history[GENERAL] = msgs
+    _, _, err = run(fake, "read", GENERAL)
+    assert "intent" not in err
+    fake.history[GENERAL] = [{**FakeDiscord.message(GENERAL, i, content=""), "type": 7} for i in ids(3)]
+    _, _, err = run(fake, "read", GENERAL)  # only join notices: nothing to learn about the intent
+    assert "intent" not in err
+    fake.history[GENERAL] = [FakeDiscord.message(GENERAL, i, content="") for i in ids(3)]
+    _, _, err = run(fake, "read", GENERAL)
+    assert "intent is probably off" in err
+
+
+def test_retry_after_null_falls_back_to_the_header():
+    assert dc._retry_after({"retry-after": "3"}, b'{"retry_after": null}') == 3.0
+
+
+def test_the_post_budget_runs_from_a_try_that_may_have_posted_and_names_its_status():
+    """Nits: a send that only met 429s can't have posted, so it may wait past 90 s; a give-up
+    says what kept failing instead of "network"."""
+    clock = Clock()
+    answers = [(429, {}, b'{"retry_after": 50}')] * 3 + [(200, {}, b'{"id": "1"}')]
+    client = dc.Client(TOKEN, transport=lambda *a: answers.pop(0), sleep=clock.sleep, clock=clock.now)
+    body = dc.message_payloads("hi", mentions={"parse": []}, seed="s")[0]
+    assert client.request("POST", f"/channels/{GENERAL}/messages", body=body, retry_unsafe=True) == {"id": "1"}
+    assert sum(clock.slept) == 150
+    clock = Clock()
+    client = dc.Client(TOKEN, transport=lambda *a: (500, {}, b"{}"), sleep=clock.sleep, clock=clock.now,
+                       max_retries=50)
+    with pytest.raises(dc.DiscordError) as e:
+        client.request("POST", f"/channels/{GENERAL}/messages", body=body, retry_unsafe=True)
+    assert str(e.value).startswith("HTTP 500: gave up retrying") and "may have gone through" in str(e.value)
+
+
+def test_the_search_text_limit_counts_utf16_units():
+    code, _, err = run(FakeDiscord(), "search", GUILD, "\U0001F600" * 600)  # 600 code points, 1200 units
+    assert code == 2 and "1024 characters" in err
+
+
+def test_a_folder_swapped_for_a_link_mid_download_gets_nothing(tmp_path, monkeypatch):
+    """NEW-2 (V1): the folder was checked once and each file then opened by path."""
+    dl, outside = tmp_path / "dl", tmp_path / "victim" / ".ssh"
+    outside.mkdir(parents=True)
+
+    def swap_then_fetch(url, timeout=60.0):
+        if not (tmp_path / "dl.real").exists():
+            dl.rename(tmp_path / "dl.real")
+            dl.symlink_to(outside)
+        return b"ssh-ed25519 attacker"
+
+    monkeypatch.setattr(dc, "fetch_url", swap_then_fetch)
+    fake, link = download_fake(["authorized_keys"])
+    code, _, _ = run(fake, "download", link, "--dir", str(dl))
+    assert code == 0 and list(outside.iterdir()) == []
+    assert (tmp_path / "dl.real" / "authorized_keys").read_bytes() == b"ssh-ed25519 attacker"
+
+
+def test_a_folder_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(dc, "fetch_url", lambda url, timeout=60.0: b"x")
+    monkeypatch.setattr(dc.os, "getuid", lambda: os.stat(tmp_path).st_uid + 1)
+    fake, link = download_fake(["a.txt"])
+    code, _, err = run(fake, "download", link, "--dir", str(tmp_path))
+    assert code == 2 and "belongs to another user" in err and not (tmp_path / "a.txt").exists()
+
+
+def test_an_upload_cut_off_mid_way_points_at_the_file_size(tmp_path):
+    """C18 (V1): it read as a plain network failure."""
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"x" * 1000)
+
+    def transport(method, url, headers, body):
+        if method == "POST":
+            raise dc.TransportError("BrokenPipeError: [Errno 32] Broken pipe")
+        return FakeDiscord()(method, url, headers, body)
+
+    code, _, err = run(transport, "send", GENERAL, "--file", str(f), "--yes")
+    assert code == 1 and "upload limit" in err and "may have gone through" in err
+
+
+def test_the_error_code_stays_on_the_first_line():
+    e = dc.DiscordError(403, "Missing Permissions\n  1 of 3 messages went out", code=50013)
+    assert str(e).splitlines()[0] == "HTTP 403: Missing Permissions (code 50013)"
+
+
+def test_an_agent_secret_that_wont_run_says_so():
+    def not_executable(argv, **kw):
+        raise PermissionError(13, "Permission denied", "agent-secret")
+
+    with pytest.raises(dc.UsageError) as e:
+        dc.load_token({}, run=not_executable)
+    assert "couldn't run agent-secret" in str(e.value) and "Permission denied" in str(e.value)
+
+
+def test_servers_page_past_200():
+    """C22 (V1): nothing pinned the guild cursor."""
+    fake = FakeDiscord()
+    fake.guilds = [{"id": str(int(GUILD) + i), "name": f"server {i}"} for i in range(450)]
+    code, out, _ = run(fake, "guilds", "--json")
+    got = [g["id"] for g in json.loads(out)]
+    assert code == 0 and len(got) == len(set(got)) == 450
+    assert sum(c.path == "/users/@me/guilds" for c in fake.calls) == 3
+
+
+def stalling_server(how):
+    class Handler(Quiet):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Length", "500")
+            self.end_headers()
+            self.wfile.write(b'{"id": "1"')
+            self.wfile.flush()
+            if how == "stall":
+                threading.Event().wait(2)  # past the client's 1 s timeout
+            else:  # reset
+                self.connection.setsockopt(__import__("socket").SOL_SOCKET, __import__("socket").SO_LINGER,
+                                           __import__("struct").pack("ii", 1, 0))
+            self.close_connection = True
+
+    return serve(Handler)
+
+
+@pytest.mark.parametrize("how", ["stall", "reset"])
+def test_a_stalled_or_reset_body_is_no_answer(how, monkeypatch):
+    """C23 (V1): a bare TimeoutError or ConnectionResetError from read() is A9's bug class."""
+    server, base = stalling_server(how)
+    monkeypatch.setattr(dc, "_API_OPENER", urllib.request.build_opener(urllib.request.ProxyHandler({}), dc._NoRedirect))
+    try:
+        with pytest.raises(dc.TransportError):
+            dc.urllib_transport("POST", base + "/x", {"Content-Type": "application/json"}, b"{}", timeout=1)
+    finally:
+        stop(server)
+
+
+def test_dm_with_a_file_sends_the_file(tmp_path):
+    """C23 (V1): nothing sent a dm with --file --yes."""
+    f = tmp_path / "note.txt"
+    f.write_text("hello")
+    fake = FakeDiscord()
+    code, _, _ = run(fake, "dm", USER, "see attached", "--file", str(f), "--yes")
+    posts = [c for c in fake.calls if c.method == "POST" and c.path == f"/channels/{DM_CHANNEL}/messages"]
+    assert code == 0 and len(posts) == 1 and fake.sent[0]["_files"]["files[0]"] == ("note.txt", b"hello")
+
+
+def test_the_edit_dry_run_shows_both_texts():
+    mid = str(ids(1)[0])
+    code, out, _ = run(FakeDiscord(ids(1)), "edit", dc.message_link(GUILD, GENERAL, mid), "new words")
+    assert code == dc.DRY_RUN_EXIT and f"now:  message {mid}" in out and "new:  new words" in out
+
+
+def test_threads_show_under_their_channel():
+    fake = FakeDiscord()
+    fake.threads = [{"id": "300000000000000001", "name": "a thread", "type": 11, "parent_id": GENERAL,
+                     "guild_id": GUILD}]
+    code, out, _ = run(fake, "channels", "Test Server", "--threads")
+    lines = out.splitlines()
+    general = next(i for i, line in enumerate(lines) if "#general" in line)
+    assert code == 0 and "#a thread" in lines[general + 1] and lines[general + 1].index("#a") > lines[general].index("#g")
+
+
+@pytest.mark.parametrize("error", [
+    __import__("http.client").client.IncompleteRead(b"par", 10),
+    ConnectionResetError(54, "Connection reset by peer"),
+])
+def test_a_failed_attachment_fetch_skips_only_that_file(tmp_path, monkeypatch, error):
+    """C23 (V1): an IncompleteRead from the CDN reached the catch-all and stopped the rest."""
+    def opener(req, timeout=60.0):
+        if getattr(req, "full_url", req).endswith("/0"):
+            raise error
+        return io.BytesIO(b"fine")
+
+    monkeypatch.setattr(dc._CDN_OPENER, "open", opener)
+    fake, link = download_fake(["bad.bin", "good.bin"])
+    code, out, err = run(fake, "download", link, "--dir", str(tmp_path / "dl"))
+    assert code == 1 and "bad.bin" in err and (tmp_path / "dl" / "good.bin").read_bytes() == b"fine"
+
+
+def test_dash_at_a_terminal_is_refused_instead_of_waiting():
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    out, err = io.StringIO(), io.StringIO()
+    code = dc.main(["send", GENERAL, "-"], client_factory=lambda: dc.Client(TOKEN, transport=FakeDiscord()),
+                   stdin=Terminal(), stdout=out, stderr=err)
+    assert code == 2 and "stdin" in err.getvalue()

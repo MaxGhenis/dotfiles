@@ -22,9 +22,9 @@ jobs:
     timeout-minutes: 15
     strategy:
       matrix:
-        python: ["3.11", "3.14"]
+        python: ["3.9", "3.11", "3.12.5", "3.14"]  # 3.9: macOS /usr/bin/python3
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - name: pytest
-        run: uv run --no-project --python ${{ matrix.python }} --with pytest --with hypothesis pytest tests/test_discord.py -q
+        run: uv run --no-project --python ${{ matrix.python }} --with pytest --with hypothesis --with regex pytest tests/test_discord.py -q

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import email.utils
 import errno
 import hashlib
 import http.client
@@ -55,7 +56,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 API = "https://discord.com/api/v10"
 USER_AGENT = f"DiscordBot (https://github.com/MaxGhenis/dotfiles, {VERSION})"
 SECRET_SERVICE = "agent/discord-bot-token"
@@ -113,7 +114,8 @@ LINK_HOSTS = {f"{sub}discord{app}.com" for sub in ("", "www.", "ptb.", "canary."
 MENTION_RE = re.compile(r"^<@!?([0-9]{15,22})>$")
 # name:id, :name:id, <:name:id> or <a:name:id>. The "a" belongs to "<a:" only.
 CUSTOM_EMOJI_RE = re.compile(r"^(?:<a?:|:)?([A-Za-z0-9_~]+):([0-9]{15,22})>?$")
-TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+$")  # bot tokens are base64url segments joined by dots
+# A bot token is three base64url parts joined by dots (id, timestamp, HMAC), about 70 characters.
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{16,}$")
 CDN_HOSTS = ("cdn.discordapp.com", "media.discordapp.net")
 
 HINTS = {
@@ -150,7 +152,8 @@ class DiscordError(Exception):
         head = f"HTTP {self.status}" if self.status else "network"
         code = f" (code {self.code})" if self.code is not None else ""
         hint = f"\n  hint: {self.hint}" if self.hint else ""
-        return f"{head}: {self.message}{code}{hint}"
+        first, nl, rest = self.message.partition("\n")
+        return f"{head}: {first}{code}{nl}{rest}{hint}"
 
 
 def _snippet(raw: bytes, size: int = 200) -> str:
@@ -213,11 +216,26 @@ def _fitting_prefix(text: str, limit: int) -> int:
 
 
 def _attaches_to_previous(ch: str) -> bool:
-    """True when `ch` belongs to the character before it: a combining mark, a
-    zero-width joiner, a variation selector, a skin-tone modifier or an emoji tag."""
+    """True when `ch` belongs to the character before it (UAX #29's Extend,
+    ZWJ and SpacingMark): a combining mark, a zero-width (non-)joiner, a
+    variation selector, a skin-tone modifier, an emoji tag, Thai and Lao
+    SARA AM, a half-width kana voicing mark, or a Hangul vowel or final jamo."""
     o = ord(ch)
-    return (unicodedata.category(ch) in ("Mn", "Mc", "Me") or o == 0x200D or 0xFE00 <= o <= 0xFE0F
-            or 0x1F3FB <= o <= 0x1F3FF or 0xE0020 <= o <= 0xE007F or 0xE0100 <= o <= 0xE01EF)
+    return (unicodedata.category(ch) in ("Mn", "Mc", "Me") or o in (0x200C, 0x200D, 0x0E33, 0x0EB3, 0xFF9E, 0xFF9F)
+            or 0xFE00 <= o <= 0xFE0F or 0x1F3FB <= o <= 0x1F3FF or 0xE0020 <= o <= 0xE007F
+            or 0xE0100 <= o <= 0xE01EF or 0x1160 <= o <= 0x11FF or 0xD7B0 <= o <= 0xD7FB)
+
+
+# UAX #29 Prepend: these join the character after them.
+_PREPEND = frozenset([*range(0x0600, 0x0606), 0x06DD, 0x070F, 0x0890, 0x0891, 0x08E2, 0x0D4E, 0x110BD,
+                      0x110CD, 0x111C2, 0x111C3, 0x1193F, 0x11941, 0x11A3A, *range(0x11A84, 0x11A8A),
+                      0x11D46, 0x11F02])
+# Viramas that link two consonants into one conjunct (UAX #29 rule GB9c).
+_LINKERS = frozenset([0x094D, 0x09CD, 0x0ACD, 0x0B4D, 0x0C4D, 0x0D4D])
+
+
+def _hangul_lead(o: int) -> bool:
+    return 0x1100 <= o <= 0x115F or 0xA960 <= o <= 0xA97C
 
 
 def _regional(ch: str) -> bool:
@@ -231,6 +249,11 @@ def safe_cut(text: str, i: int) -> bool:
         return True
     before, after = text[i - 1], text[i]
     if _attaches_to_previous(after) or before == "‍" or (before, after) == ("\r", "\n"):
+        return False
+    b, a = ord(before), ord(after)
+    if b in _PREPEND or (b in _LINKERS and unicodedata.category(after) == "Lo"):
+        return False
+    if _hangul_lead(b) and (_hangul_lead(a) or 0xAC00 <= a <= 0xD7A3):  # a lead jamo joins what follows
         return False
     if before == "`" and after == "`":
         return False
@@ -283,7 +306,7 @@ def chunk_parts(text: str, limit: int = CONTENT_LIMIT) -> list[tuple[str, str, s
             window = rest[:cut]
             for sep in ("\n", " "):
                 at = window.rfind(sep)
-                if at >= cut // 2:
+                if at >= cut // 2 and safe_cut(rest, at + 1):
                     cut = at + 1
                     break
             else:  # no whitespace: step back to a character boundary
@@ -316,7 +339,7 @@ def chunk_text(text: str, limit: int = CONTENT_LIMIT) -> list[str]:
 
 # C0 and C1 controls other than tab and newline, DEL, and the bidi controls
 # that can reorder what a terminal shows.
-_CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f‎‏‪-‮⁦-⁩]")
+_CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩]")
 
 
 def clean(text) -> str:
@@ -587,16 +610,28 @@ def _body_json(raw: bytes) -> dict:
 
 def _retry_after(headers: dict, raw: bytes) -> float | None:
     """Seconds Discord asks to wait (body retry_after, else the Retry-After header), or None."""
-    value = _body_json(raw).get("retry_after", headers.get("retry-after"))
+    value = _body_json(raw).get("retry_after")
+    if value is None:
+        value = headers.get("retry-after")
     try:
         return max(0.0, float(value))
     except (TypeError, ValueError):
         return None
 
 
-MAYBE_POSTED = ("; it may have gone through, so check before sending it again "
-                "(re-running the same send within a few minutes reuses its nonces, and Discord returns "
-                "the message it already has)")
+REDACT_MIN = 8
+
+def _http_date(value) -> float | None:
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when is None:
+        return None
+    return (when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)).timestamp()
+
+
+MAYBE_POSTED = "; it may have gone through, so check before sending it again"
 
 
 class Client:
@@ -621,6 +656,15 @@ class Client:
         self._ready: dict[str, float] = {}  # rate-limit key -> clock time its bucket refills
         self._bucket_of: dict[str, str] = {}  # route key -> Discord's X-RateLimit-Bucket id
         self._global_ready = 0.0
+        self._server_clock: tuple[float, float] | None = None  # (Discord's time, self.clock()) at the last Date
+
+    def server_now(self) -> float:
+        """Discord's time now (seconds since the epoch), from the last Date header;
+        this machine's clock until one arrives."""
+        if self._server_clock is None:
+            return time.time()
+        then, at = self._server_clock
+        return then + (self.clock() - at)
 
     def __repr__(self) -> str:
         return "Client(<token hidden>)"
@@ -653,38 +697,47 @@ class Client:
         transport_retries = 1 if files else self.max_retries
         key = route_key(method, path)
         posts_message = method == "POST" and isinstance(body, dict) and "nonce" in body
-        first_sent = None
         attempt = 0
-        doubt = False  # an earlier attempt may have created the message
+        sent_at = 0.0
+        doubt_since = None  # when the first attempt that may have created the message went out
 
-        def retry(seconds: float, why: str) -> None:
-            if method == "POST" and first_sent is not None and \
-                    self.clock() + seconds - first_sent > POST_RETRY_BUDGET:
-                raise DiscordError(0, f"gave up retrying {self.clock() - first_sent:.0f}s after the first "
-                                   f"try ({why})" + (MAYBE_POSTED if doubt else ""))
+        def retry(seconds: float, why: str, status: int = 0) -> None:
+            # Discord matches a nonce only for a few minutes: past the budget, a retry could post twice.
+            if posts_message and doubt_since is not None and \
+                    self.clock() + seconds - doubt_since > POST_RETRY_BUDGET:
+                raise DiscordError(status, f"gave up retrying {self.clock() - doubt_since:.0f}s after a try "
+                                           f"that may have posted ({why})" + MAYBE_POSTED)
             self._pause(seconds, why)
 
         while True:
             attempt += 1
             wait = max(self._global_ready, self._ready.get(self._limit_key(key), 0.0)) - self.clock()
+            doubt = doubt_since is not None
             if wait > MAX_RATE_WAIT:
                 raise DiscordError(429, f"rate limited: this route's limit resets in {wait:.0f}s; try again then"
                                    + (MAYBE_POSTED if doubt else ""))
             if wait > 0:
-                retry(wait, "rate limit")
-            if first_sent is None:
-                first_sent = self.clock()
+                retry(wait, "rate limit", 429)
+            sent_at = self.clock()
             try:
                 status, rheaders, raw = self.transport(method, url, headers, data)
             except TransportError as e:
-                doubt = doubt or posts_message
+                if posts_message and doubt_since is None:
+                    doubt_since, doubt = sent_at, True
                 if safe and attempt <= transport_retries:
                     retry(min(30.0, 0.5 * 2 ** attempt), "no answer")
                     continue
-                raise DiscordError(0, f"no answer from Discord: {clean(e)}"
+                size = (" (Discord closes the connection mid-upload when a file is over the server's "
+                        "upload limit; the dry run lists the sizes)") if files else ""
+                raise DiscordError(0, f"no answer from Discord: {clean(e)}".replace("\n", " ") + size
                                    + (MAYBE_POSTED if doubt else "")) from None
-            raw = (raw or b"").replace(self._token.encode(), b"<token>")  # before any error text is cut
+            raw = raw or b""
+            if len(self._token) >= REDACT_MIN:  # before any error text is cut
+                raw = raw.replace(self._token.encode(), b"<token>")
             rheaders = {k.lower(): v for k, v in (rheaders or {}).items()}
+            server_time = _http_date(rheaders.get("date"))
+            if server_time is not None:
+                self._server_clock = (server_time, self.clock())
             if rheaders.get("x-ratelimit-bucket"):
                 self._bucket_of[key] = rheaders["x-ratelimit-bucket"]
             if rheaders.get("x-ratelimit-remaining") == "0":
@@ -703,7 +756,7 @@ class Client:
                                        + (MAYBE_POSTED if doubt else ""))
                 if rheaders.get("x-ratelimit-global") == "true" or _body_json(raw).get("global"):
                     self._global_ready = self.clock() + pause  # later calls on any route wait too
-                retry(pause, "rate limit")
+                retry(pause, "rate limit", 429)
                 continue
             if status == 202 and retry_202:
                 if attempt > self.max_retries:
@@ -712,12 +765,16 @@ class Client:
                 pause = _retry_after(rheaders, raw) or 0.0
                 if pause <= 0:  # retry_after 0 means "after a short delay"
                     pause = min(30.0, 2.0 ** (attempt - 1))
-                self._pause(min(MAX_RATE_WAIT, pause), "search index")
+                if pause > MAX_RATE_WAIT:
+                    raise DiscordError(202, f"Discord is still indexing this server for search; "
+                                            f"try again in {pause:.0f}s")
+                self._pause(pause, "search index")
                 continue
             if status >= 500:
-                doubt = doubt or posts_message
+                if posts_message and doubt_since is None:
+                    doubt_since, doubt = sent_at, True
                 if safe and attempt <= self.max_retries:
-                    retry(min(30.0, 0.5 * 2 ** attempt), f"HTTP {status}")
+                    retry(min(30.0, 0.5 * 2 ** attempt), f"HTTP {status}", status)
                     continue
             if status >= 300:
                 err = error_from_response(status, raw)
@@ -739,8 +796,11 @@ def load_token(env=None, run=subprocess.run) -> str:
         source = f"agent-secret ({SECRET_SERVICE})"
         try:
             got = run(["agent-secret", "get", SECRET_SERVICE], capture_output=True, text=True, timeout=60)
-        except (OSError, subprocess.SubprocessError):
+        except FileNotFoundError:
             got = None
+        except (OSError, subprocess.SubprocessError) as e:
+            raise UsageError(f"couldn't run agent-secret to get the bot token ({type(e).__name__}: "
+                             f"{getattr(e, 'strerror', None) or e})") from None
         if got is None or got.returncode != 0 or not (got.stdout or "").strip():
             raise UsageError(
                 "no bot token. Create a bot at https://discord.com/developers/applications, "
@@ -750,8 +810,9 @@ def load_token(env=None, run=subprocess.run) -> str:
     if token.lower().startswith("bot "):
         token = token[4:].strip()
     if not TOKEN_RE.match(token):  # a line break here would end up in a traceback, whole
-        raise UsageError(f"the token from {source} holds characters no bot token has (a line break or a "
-                         f"space?); copy it again and store it with: agent-secret set {SECRET_SERVICE}")
+        raise UsageError(f"the token from {source} doesn't look like a bot token (three parts joined by dots, "
+                         "about 70 characters, with no line break or space); copy it again from the Bot page "
+                         f"of the Developer Portal and store it with: agent-secret set {SECRET_SERVICE}")
     return token
 
 
@@ -925,33 +986,38 @@ def search_messages(client: Client, guild_id: str, *, content=None, channels=(),
                     before=None, after=None, limit=25, sort_by=None, ascending=False, nsfw=False):
     """-> (hits, total_results), each hit once.
 
-    The offset advances by the page size asked for, never by the number of
-    messages that came back: Discord may return fewer than the limit and says
-    not to page by the length of the answer. The API no longer sends context,
-    so each hit group holds one message."""
+    Every page asks for SEARCH_PAGE hits and the offset advances by that, never
+    by the number of messages that came back: Discord may return slightly fewer
+    than the limit and says not to page by the length of the answer. A page
+    that adds no new hit ends the search, so a short tail can't turn into
+    thousands of requests. total_results can be off while messages come and go,
+    so a full page keeps the search going past it. The API no longer sends
+    context, so each hit group holds one message."""
     hits: list[dict] = []
     seen: set[str] = set()
     offset, total = 0, None
-    while len(hits) < limit and offset <= SEARCH_MAX_OFFSET and (total is None or offset < total):
-        page = min(SEARCH_PAGE, limit - len(hits))
+    added = 0
+    while len(hits) < limit and offset <= SEARCH_MAX_OFFSET and \
+            (total is None or offset < total or added == SEARCH_PAGE):  # total_results can lag
         res = client.request("GET", f"/guilds/{guild_id}/messages/search", retry_202=True, params={
             "content": content, "channel_id": list(channels), "author_id": list(authors),
-            "has": list(has), "max_id": before, "min_id": after, "limit": page, "offset": offset,
+            "has": list(has), "max_id": before, "min_id": after, "limit": SEARCH_PAGE, "offset": offset,
             "sort_by": sort_by, "sort_order": "asc" if ascending else None,
             "include_nsfw": True if nsfw else None,
         }) or {}
         if not isinstance(res, dict):
             raise DiscordError(0, f"unexpected answer for search: expected an object, got {type(res).__name__}")
         total = res.get("total_results", total)
-        groups = res.get("messages") or []
-        for group in groups:
+        added = 0
+        for group in res.get("messages") or []:
             for m in (group or [])[:1]:
                 if isinstance(m, dict) and m.get("id") not in seen:
                     seen.add(m.get("id"))
                     hits.append(m)
-        if not groups and total is None:
+                    added += 1
+        if not added:
             break
-        offset += page
+        offset += SEARCH_PAGE
     return hits[:limit], total
 
 
@@ -989,9 +1055,18 @@ def message_payloads(text: str, *, mentions: dict, reply_to: str | None = None,
     return bodies
 
 
+def _file_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def send_seed(channel_id: str, text: str, files: list[Path], reply_to: str | None, mentions: dict) -> str:
-    """What makes two sends the same send: where, what, which files, replying to what."""
-    described = [(f.name, f.stat().st_size) for f in files]
+    """What makes two sends the same send: where, what, which files (by name
+    and content), replying to what."""
+    described = [(f.name, _file_digest(f)) for f in files]
     return hashlib.sha256(json.dumps([channel_id, text, described, reply_to, mentions],
                                      ensure_ascii=True).encode()).hexdigest()
 
@@ -1283,8 +1358,12 @@ def cmd_read(client: Client, args, ctx: Ctx) -> int:
         return 0
     for m in msgs:
         ctx.say(format_message(m))
-    others = [m for m in msgs if not (m.get("author") or {}).get("bot")]
-    if others and all(not message_text(m) and not message_attachments(m) and not m.get("embeds") for m in others):
+    # Without the message-content intent, Discord blanks content, embeds, attachments,
+    # components and polls; only ordinary messages and replies by people tell.
+    others = [m for m in msgs if not (m.get("author") or {}).get("bot") and m.get("type", 0) in (0, 19)]
+    if others and all(not message_text(m) and not message_attachments(m) and not m.get("embeds")
+                      and not m.get("sticker_items") and not m.get("message_snapshots") and not m.get("poll")
+                      and not m.get("components") for m in others):
         ctx.note("note: every message came back empty; the message-content intent is probably off "
                  "(run: discord setup)")
     return 0
@@ -1293,7 +1372,7 @@ def cmd_read(client: Client, args, ctx: Ctx) -> int:
 def cmd_search(client: Client, args, ctx: Ctx) -> int:
     if args.limit < 1:
         raise UsageError("-n must be at least 1")
-    if args.text is not None and len(args.text) > SEARCH_TEXT_LIMIT:
+    if args.text is not None and u16len(args.text) > SEARCH_TEXT_LIMIT:
         raise UsageError(f"search text is limited to {SEARCH_TEXT_LIMIT} characters")
     if len(args.channel or []) > SEARCH_MAX_CHANNELS or len(args.author or []) > SEARCH_MAX_AUTHORS:
         raise UsageError(f"at most {SEARCH_MAX_CHANNELS} --channel and {SEARCH_MAX_AUTHORS} --author values")
@@ -1311,7 +1390,7 @@ def cmd_search(client: Client, args, ctx: Ctx) -> int:
             ctx.say(format_message(m, names))
     # On stderr in every mode, so JSON readers also learn the list was cut.
     note = f"{len(hits)} shown of {total if total is not None else '?'} match(es)"
-    if total is not None and total > SEARCH_MAX_HITS and len(hits) >= SEARCH_MAX_HITS:
+    if total is not None and total > SEARCH_MAX_HITS and args.limit > len(hits):
         note += f"; Discord's search reaches only the first {SEARCH_MAX_HITS:,}"
     ctx.note(note)
     return 0
@@ -1347,14 +1426,16 @@ def cmd_members(client: Client, args, ctx: Ctx) -> int:
     return 0
 
 
-def _sent_before(message: dict, since: dt.datetime) -> bool:
-    """Whether Discord answered with a message older than this run: it matched
-    the nonce of an identical send from the last few minutes."""
+def _sent_before(message: dict, since: float) -> bool:
+    """Whether Discord answered with a message older than this send (`since`,
+    in Discord's time): it matched the nonce of an identical send from the last
+    few minutes. Both times come from Discord's clock, so a wrong clock here
+    can't mislabel a new message."""
     try:
         when = dt.datetime.fromisoformat(str(message.get("timestamp")).replace("Z", "+00:00"))
     except ValueError:
         return False
-    return when.tzinfo is not None and when < since - dt.timedelta(seconds=5)
+    return when.tzinfo is not None and when.timestamp() < since - 5
 
 
 def _post(client: Client, ctx: Ctx, target: Target, args, text: str, files: list[Path],
@@ -1374,7 +1455,7 @@ def _post(client: Client, ctx: Ctx, target: Target, args, text: str, files: list
             detail.append(f"  --- message {i}/{len(bodies)} ({u16len(b.get('content', ''))} chars) ---")
             detail.extend("  " + clean(line) for line in (b.get("content") or "(files only)").splitlines())
         return dry_run(ctx, f"post {len(bodies)} message(s)", detail)
-    started = dt.datetime.now(dt.timezone.utc)
+    started = client.clock()
     posted = 0
     for i, body in enumerate(bodies):
         try:
@@ -1382,13 +1463,16 @@ def _post(client: Client, ctx: Ctx, target: Target, args, text: str, files: list
                                   files=files if i == 0 and files else None, retry_unsafe=True) or {}
         except DiscordError as e:
             if posted:
-                e.message += (f"\n  {posted} of {len(bodies)} messages went out (links above), the rest did not; "
-                              "running the same command again soon reuses the same nonces, so Discord returns "
-                              "the ones already posted instead of repeating them")
+                e.message += f"\n  {posted} of {len(bodies)} messages went out (links above), the rest did not"
+            if posted or MAYBE_POSTED in e.message:
+                e.message += ("\n  this send used fresh nonces (--again), so running it again posts every "
+                              "message again" if seed is None else
+                              "\n  running the same command again within a few minutes reuses its nonces, so "
+                              "Discord returns the messages it already has instead of repeating them")
             raise
         posted += 1
         link = message_link(target.guild_id, target.channel_id, sent.get("id", "?"))
-        if _sent_before(sent, started):
+        if _sent_before(sent, client.server_now() - (client.clock() - started)):
             ctx.say(f"already posted {link} (an identical send went out a moment ago; --again posts anyway)")
         else:
             ctx.say(f"sent {link}")
@@ -1477,45 +1561,76 @@ def cmd_download(client: Client, args, ctx: Ctx) -> int:
         raise UsageError(f"{folder} is a symbolic link; give the real folder with --dir")
     try:
         folder.mkdir(parents=True, exist_ok=True)
+        dir_fd = open_folder(folder)
     except FileExistsError:
         raise UsageError(f"{folder} exists and isn't a folder") from None
     except OSError as e:
-        raise UsageError(f"can't create {folder}: {e.strerror or e}") from None
+        raise UsageError(f"can't use {folder}: {e.strerror or e}") from None
     rc = 0
-    for i, a in enumerate(atts):
-        name = safe_filename(str(a.get("filename") or ""), f"attachment-{i}")
-        try:
-            data = fetch_url(str(a.get("url") or ""))
-            dest = write_new_file(folder, name, data)
-        except DiscordError as e:
-            ctx.note(f"discord: {clean(name)}: {e}")
-            rc = 1
-            continue
-        except OSError as e:
-            ctx.note(f"discord: can't save {clean(name)} in {folder}: {e.strerror or e}")
-            rc = 1
-            continue
-        ctx.say(str(dest))
+    try:
+        for i, a in enumerate(atts):
+            name = safe_filename(str(a.get("filename") or ""), f"attachment-{i}")
+            try:
+                data = fetch_url(str(a.get("url") or ""))
+                dest = write_new_file(folder, name, data, dir_fd=dir_fd)
+            except DiscordError as e:
+                ctx.note(f"discord: {clean(name)}: {e}")
+                rc = 1
+                continue
+            except OSError as e:
+                ctx.note(f"discord: can't save {clean(name)} in {folder}: {e.strerror or e}")
+                rc = 1
+                continue
+            ctx.say(str(dest))
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
     return rc
 
 
-def write_new_file(folder: Path, name: str, data: bytes) -> Path:
+def open_folder(folder: Path) -> int | None:
+    """A handle on `folder` for creating files in it, so that swapping the
+    folder for a symbolic link after this check changes nothing. Refuses a
+    link and a folder that belongs to someone else (who could read or move
+    the files). None where the system can't create files through a handle."""
+    if os.open not in os.supports_dir_fd or not hasattr(os, "O_DIRECTORY"):
+        return None
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if hasattr(os, "getuid") and os.fstat(fd).st_uid != os.getuid():
+            raise UsageError(f"{folder} belongs to another user; give your own folder with --dir")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def write_new_file(folder: Path, name: str, data: bytes, *, dir_fd: int | None = None) -> Path:
     """Write data to a new file in folder: `name`, else "stem (2).ext" and so on.
 
     O_CREAT|O_EXCL never opens an existing file, and refuses a symbolic link,
     even one that points nowhere yet, so nothing is overwritten and nothing
     lands outside the folder. It also closes the gap between checking a name
-    and creating it."""
+    and creating it. With dir_fd (from open_folder), names resolve in the
+    folder that was checked, whatever has happened to its path since."""
     stem, suffix = (name.rsplit(".", 1)[0], "." + name.rsplit(".", 1)[1]) if "." in name.lstrip(".") else (name, "")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     for n in range(1, 10_000):
-        dest = folder / (name if n == 1 else f"{stem} ({n}){suffix}")
+        leaf = name if n == 1 else f"{stem} ({n}){suffix}"
+        dest = folder / leaf
         try:
-            fd = os.open(dest, flags, 0o644)
+            fd = os.open(dest, flags, 0o644) if dir_fd is None else os.open(leaf, flags, 0o644, dir_fd=dir_fd)
         except FileExistsError:
             continue
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+        except BaseException:
+            try:  # no half-written file to mistake for the real one, or to push a re-run to "(2)"
+                os.unlink(dest) if dir_fd is None else os.unlink(leaf, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
         return dest
     raise OSError(errno.EEXIST, "too many files with that name already", str(folder / name))
 
@@ -1629,6 +1744,43 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _parse_command(sp: argparse.ArgumentParser, name: str, words: list[str]) -> argparse.Namespace:
+    """A command's words, options anywhere, and every word after the first --
+    an argument, never an option.
+
+    parse_intermixed_args doesn't keep that promise on every Python: up to
+    3.12.5 at least, `send --yes -- C --file=PATH` uploads PATH and
+    `delete -- LINK --yes` deletes. So the words after -- go in as
+    placeholders no option can match, and come back once argparse is done."""
+    k = words.index("--") if "--" in words else len(words)
+    head, tail = words[:k], words[k + 1:]
+    for word in head:
+        # argparse reads text like "-hey" as -h plus flags and prints help with
+        # exit 0, which a caller could take for success.
+        if word.startswith("-h") and word != "-h" and " " not in word:
+            sp.error(f"text that starts with '-' needs -- in front of it: discord {name} ... -- '{word}'")
+    masks = {f"\0{n}\0": word for n, word in enumerate(tail)}
+
+    def unmask(text: str) -> str:
+        for mask, word in masks.items():
+            text = text.replace(mask, word)
+        return text
+
+    sp.error = lambda message: argparse.ArgumentParser.error(sp, unmask(message))
+    try:
+        args = sp.parse_intermixed_args(head + list(masks))
+    finally:
+        del sp.error
+    positional = {a.dest for a in sp._actions if not a.option_strings}
+    for dest, value in vars(args).items():
+        values = value if isinstance(value, list) else [value]
+        if any(isinstance(v, str) and v in masks for v in values):
+            if dest not in positional:  # `--file -- TEXT`: an option took its value from after --
+                sp.error(f"--{dest.replace('_', '-')} needs its value before --")
+            setattr(args, dest, [masks.get(v, v) for v in value] if isinstance(value, list) else masks[value])
+    return args
+
+
 def parse_args(parser: argparse.ArgumentParser, argv: list[str] | None) -> argparse.Namespace:
     """Like parse_args, but a command's options may sit anywhere among its
     arguments (`edit LINK --yes TEXT`), via parse_intermixed_args, which
@@ -1638,14 +1790,7 @@ def parse_args(parser: argparse.ArgumentParser, argv: list[str] | None) -> argpa
     for i, word in enumerate(argv):
         if word in sub.choices:
             parser.parse_args(argv[:i])  # --version, -h, or an error, before the command
-            rest = argv[i + 1:]
-            for arg in rest[:rest.index("--") if "--" in rest else None]:
-                # argparse reads text like "-hey" as -h plus flags and prints help
-                # with exit 0, which a caller could take for success.
-                if arg.startswith("-h") and arg != "-h" and " " not in arg:
-                    sub.choices[word].error(f"text that starts with '-' needs -- in front of it: "
-                                            f"discord {word} ... -- '{arg}'")
-            args = sub.choices[word].parse_intermixed_args(rest)
+            args = _parse_command(sub.choices[word], word, argv[i + 1:])
             args.command = word
             return args
         if not word.startswith("-") or word == "--":
@@ -1657,7 +1802,7 @@ def redact(text: str, secrets) -> str:
     """text with every secret removed, also as Python would quote it (a token
     holding a line break shows up as \\n inside a repr) and segment by segment."""
     for secret in secrets:
-        if not secret:
+        if not secret or len(secret) < REDACT_MIN:  # no real token is this short; "a" would eat every a
             continue
         forms = {secret, repr(secret)[1:-1], repr(secret.encode("utf-8", "replace"))[2:-1]}
         forms |= {seg for seg in re.split(r"[.\s]+", secret) if len(seg) >= 8}
@@ -1686,10 +1831,10 @@ def main(argv: list[str] | None = None, *, client_factory=None, stdin=None, stdo
         secrets.append(getattr(client, "_token", None))
         return args.func(client, args, ctx) or 0
     except UsageError as e:
-        print(redact(f"discord: {e}", secrets), file=stderr)
+        print(clean(redact(f"discord: {e}", secrets)), file=stderr)
         return 2
     except DiscordError as e:
-        print(redact(f"discord: {e}", secrets), file=stderr)
+        print(clean(redact(f"discord: {e}", secrets)), file=stderr)
         return 1
     except KeyboardInterrupt:
         return 130
