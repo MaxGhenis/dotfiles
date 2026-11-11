@@ -1151,10 +1151,12 @@ class Prober:
                 return dev
         return None
 
-    def candidates(self, only=None):
+    def candidates(self, only=None, routes=None):
         """Every en* interface with an IPv4 address and a default route (or
-        the ones named in only), primary first."""
-        routes = self.default_routes()
+        the ones named in only), primary first. With routes, a
+        default_routes() read, it builds on that read instead of a new one."""
+        if routes is None:
+            routes = self.default_routes()
         ports = self.hardware_ports()
         primary = self.primary_interface()
         names = list(dict.fromkeys(only)) if only else [i for i in routes if _is_iface(i)]
@@ -1178,6 +1180,14 @@ class Prober:
             })
         out.sort(key=lambda c: (not c["primary"], c["interface"]))
         return out
+
+    def read_link(self, iface):
+        """(gateway, candidates) from one routes read: the gateway that read
+        found on iface (None for none), and candidates([iface]) built on the
+        same read. A gateway the routes read found stays known when the
+        address read after it finds nothing."""
+        routes = self.default_routes()
+        return (routes.get(iface) or {}).get("gateway"), self.candidates([iface], routes=routes)
 
     # -- probes (each bound to its interface)
     def captive(self, iface):
@@ -1866,16 +1876,20 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
     def stamp():
         return dt.datetime.fromtimestamp(prober.clock(), dt.timezone.utc).strftime("%H:%M:%SZ")
 
-    def measure_now(gateway):
-        """'measured', with the record last in measured. When the Wi-Fi has
-        left this gateway, even for this one read, it measures nothing and
-        returns what change() says. A new gateway then gets its own wait and
-        settle."""
+    def measure_now(gateway, ip):
+        """'measured', with the record last in measured. When the measurement's
+        own gateway read finds another network or none, it measures nothing
+        and returns what change() says. When the address read after it finds
+        no address, or one other than ip (the address the visit started on),
+        it returns 'dropped': the visit ends, but no gateway read found another
+        network. A new gateway then gets its own wait and settle."""
         with prober.until(None):  # it started before the limit, so it runs to its end
-            cands = prober.candidates([wifi])
-            how = change(cands[0]["gateway"] if cands else None, gateway)
+            now, cands = prober.read_link(wifi)
+            how = change(now, gateway)
             if how:
                 return how
+            if not cands or (ip and cands[0]["ip"] != ip):
+                return "dropped"
             rec = prober.measure(cands, mode="watch", names=names)[0]
         if record:
             save(store, [rec], out)
@@ -1889,9 +1903,10 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
             pending = None
 
     def end_visit(how):
-        """A switch or drop ends the visit, so the same gateway can start
-        another. A switch to another network also ends a waiting baseline,
-        whichever read finds it; after a drop the baseline keeps waiting."""
+        """watch ends the visit on a switch or drop, so the same gateway can
+        start another. On a switch to another network, whichever gateway read
+        finds it, watch also skips a waiting baseline; after a drop the
+        baseline keeps waiting."""
         nonlocal last
         last = None
         if how == "moved":
@@ -1916,12 +1931,13 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
         last = gw
         # The baseline network until netpick measures it. --seen and --max don't
         # apply to it, a drop keeps it waiting, and a move to another network
-        # (whichever read finds it) or a portal wait that runs out ends it.
+        # (whichever gateway read finds it) or a portal wait that runs out ends it.
         pending = None
         if baseline:
+            ip = prober.ipaddr(wifi) if gw else None
             if gw and prober.captive(wifi) and left() > 0:
                 out(f"{stamp()} baseline: measuring the current network (gateway {gw})")
-                how = measure_now(gw)
+                how = measure_now(gw, ip)
                 if how == "measured":
                     if measured[-1].get("online"):
                         tested.add(gw)
@@ -1998,7 +2014,7 @@ def watch_loop(prober, store, *, seen=(), baseline=False, max_new=3, minutes=30.
                     end_visit(how)
                     continue
                 out(f"{stamp()} measuring")
-                how = measure_now(gw)
+                how = measure_now(gw, ip)
                 if how == "measured":
                     if gw != pending:  # the baseline uses none of --max
                         new += 1

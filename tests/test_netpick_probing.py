@@ -681,20 +681,21 @@ def test_a_baseline_ends_when_any_read_finds_another_network(tmp_path, gap, onli
 
 
 @given(max_new=st.integers(0, 3), in_seen=st.booleans(), portal=st.sampled_from([0.0, 20.0]), at=st.floats(0.01, 60),
-       drop=st.none() | st.floats(0.1, 3), stay=st.floats(0.1, 5))
-def test_a_short_switch_ends_the_baseline_exactly_when_a_read_finds_it(max_new, in_seen, portal, at, drop, stay):
+       drop=st.none() | st.floats(0.1, 3), stay=st.floats(0.1, 5), after=st.none() | st.floats(0.1, 3))
+def test_a_short_switch_ends_the_baseline_exactly_when_a_read_finds_it(max_new, in_seen, portal, at, drop, stay, after):
     """Invariant: a watch that starts on a network, moves to another for a few
-    seconds, directly or through a drop, and comes back skips the baseline
-    exactly when a gateway read before the first measurement found the other
-    network. Otherwise it measures the first network once, as the baseline.
-    After a skip, that network counts as new, or as tested when --seen lists
-    it. With --max 0, the watch announces no network as new."""
+    seconds and comes back, each way directly or through a drop, skips the
+    baseline exactly when a gateway read before the first measurement found
+    the other network. Otherwise it measures the first network once, as the
+    baseline. After a skip, that network counts as new, or as tested when
+    --seen lists it. With --max 0, the watch announces no network as new."""
     mac = FakeMac([], primary="en0")
     mac.cost = one_second_gateway_reads
     gone = [(T0 + at, None)] if drop else []
     other = T0 + at + (drop or 0)
-    mac.wifi_schedule = [(T0, wifi(online_after=portal, **A)), *gone, (other, wifi(**B)),
-                         (other + stay, wifi(online_after=portal, **A))]
+    back = [(other + stay, None)] if after else []
+    mac.wifi_schedule = [(T0, wifi(online_after=portal, **A)), *gone, (other, wifi(**B)), *back,
+                         (other + stay + (after or 0), wifi(online_after=portal, **A))]
     seen = [A["gateway"]] if in_seen else []
     with tempfile.TemporaryDirectory() as d:
         rc, text, store = watch(mac, pathlib.Path(d), baseline=True, seen=seen, max_new=max_new, settle=30,
@@ -705,6 +706,45 @@ def test_a_short_switch_ends_the_baseline_exactly_when_a_read_finds_it(max_new, 
     assert rc == 0 and ("so netpick skipped the baseline" in text) == found, text
     assert recs == ([] if found and (max_new == 0 or in_seen) else [A["gateway"]]), text
     assert max_new > 0 or "new network:" not in text, text
+
+
+@pytest.mark.parametrize("options, measured", [(dict(seen=[A["gateway"]], max_new=0), []), (dict(max_new=1), [A])],
+                         ids=["--seen A --max 0", "--max 1"])
+@pytest.mark.parametrize("gap, online_after", [(T0 + 11.8, 5.0), (T0 + 0.8, 0.0)],
+                         ids=["as the measurement starts", "as the first measurement starts"])
+def test_a_baseline_ends_when_a_measurements_read_finds_another_network_before_a_drop(
+        tmp_path, gap, online_after, options, measured):
+    """Round-6 review: the measurement's gateway read found the other network,
+    the Wi-Fi dropped before the address read that follows it, and that empty
+    read kept the baseline waiting. A read takes 1 s, so the gateway read
+    finds B, the next reads find the drop, and A comes back 3 s after B
+    appeared."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = [(T0, wifi(online_after=online_after, **A)), (gap, wifi(**B)), (gap + 0.5, None),
+                         (gap + 3, wifi(online_after=online_after, **A))]
+    rc, text, store = watch(mac, tmp_path, **dict(dict(baseline=True, settle=5, minutes=5), **options))
+    assert [gw for _t, gw, argv in mac.calls if argv[0] == "netstat"].count(B["gateway"]) == 1
+    assert "baseline: the Wi-Fi moved to another network first, so netpick skipped the baseline" in text
+    assert "measurement started, so netpick waits for it" not in text
+    assert rc == 0 and [r["gateway"] for r in store.load()[0]] == [n["gateway"] for n in measured]
+
+
+@pytest.mark.parametrize("baseline, schedule", [(True, [(T0, wifi(**A)), (T0 + 1.5, wifi(**B))]),
+                                                (False, [(T0, None), (T0 + 0.5, wifi(**A)), (T0 + 8.5, wifi(**B))])],
+                         ids=["the baseline's measurement", "a new network's measurement"])
+def test_a_switch_between_a_measurements_reads_gives_no_mixed_record(tmp_path, baseline, schedule):
+    """Round-6 review: the measurement's gateway read found A, and the address
+    read after it found B's address, so watch measured B under A's gateway and
+    marked A tested. A read takes 1 s, so B appears between the two reads.
+    watch now ends the visit and measures B as a network of its own."""
+    mac = FakeMac([], primary="en0")
+    mac.cost = one_second_gateway_reads
+    mac.wifi_schedule = schedule
+    rc, text, store = watch(mac, tmp_path, baseline=baseline, max_new=1, settle=5, minutes=5)
+    assert "the network changed as the measurement started" in text
+    assert ("so netpick waits for it" in text) == baseline  # no gateway read found B, so the baseline waits
+    assert rc == 0 and [(r["gateway"], r["ip"]) for r in store.load()[0]] == [(B["gateway"], B["ip"])]
 
 
 def test_a_baseline_whose_portal_wait_runs_out_ends_a_watch_with_nothing_else_to_do(tmp_path):
@@ -811,7 +851,7 @@ def timed_watch(mac, **kw):
         sleeps.append((start, mac.now))
 
     p.wifi_interface, p.sleep = wifi_interface, sleep
-    p.candidates, p.measure = timed("candidates", p.candidates), timed("measure", p.measure)
+    p.read_link, p.measure = timed("read", p.read_link), timed("measure", p.measure)
     p.api_check = timed("api", p.api_check)
     with tempfile.TemporaryDirectory() as d:
         store = NP.Store(pathlib.Path(d) / "history.jsonl")
@@ -847,8 +887,8 @@ def test_watch_never_waits_past_its_time_limit(switches, minutes, settle, portal
     def inside(start, end):
         return any(a <= start and end <= b for _kind, a, b in spans)
 
-    # a measurement starts with its candidates step, which may run past the limit
-    assert all(start < limit for kind, start, _ in spans if kind in ("candidates", "api"))
+    # a measurement starts with its gateway and address reads, which may run past the limit
+    assert all(start < limit for kind, start, _ in spans if kind in ("read", "api"))
     for start, end, argv in mac.timeline:
         assert inside(start, end) or end <= limit + eps, (argv, start - T0, end - T0, limit - T0)
     assert all(end <= limit + eps for start, end in sleeps if not inside(start, end))
