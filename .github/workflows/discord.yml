@@ -1,0 +1,30 @@
+name: discord
+
+on:
+  pull_request:
+    paths:
+      - bin/discord
+      - tests/test_discord.py
+      - .github/workflows/discord.yml
+  push:
+    branches: [master]
+    paths:
+      - bin/discord
+      - tests/test_discord.py
+      - .github/workflows/discord.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: pytest
+        run: uv run --no-project --python ${{ matrix.python }} --with pytest --with hypothesis pytest tests/test_discord.py -q

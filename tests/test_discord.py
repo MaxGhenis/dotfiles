@@ -48,6 +48,8 @@ def _load():
     loader = importlib.machinery.SourceFileLoader("discord_cli", str(SCRIPT))
     spec = importlib.util.spec_from_loader("discord_cli", loader)
     module = importlib.util.module_from_spec(spec)
+    # dataclasses looks the module up in sys.modules on Python < 3.14.
+    sys.modules["discord_cli"] = module
     loader.exec_module(module)
     return module
 
