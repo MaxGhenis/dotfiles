@@ -8,6 +8,7 @@ Config and scripts for my development machine. The interesting part is `bin/`:
 | [`claude-model`](bin/claude-model) | Which model is *actually* serving a Claude Code session — reads the transcript's per-message model field; `-e <model>` exits 1 on a silent downgrade. See [docs/model-self-knowledge.md](docs/model-self-knowledge.md). |
 | [`codex-run`](bin/codex-run) | Hardened `codex exec` dispatch — retries transient failures, salvages work on crash, unbreaks git in sandboxed worktrees. Documented below. |
 | [`cc`](bin/cc) | Claude Code pane launcher (superseded by [tmux-claude-code](https://github.com/MaxGhenis/tmux-claude-code)) |
+| [`discord`](bin/discord) | Discord's bot API from the shell: read, search and post in the servers a bot is in, with a dry run before every write, no pings by default and no double posts on retry. Standard library only; the token comes from `agent-secret`. See [docs/discord.md](docs/discord.md). Tests: [tests/test_discord.py](tests/test_discord.py). |
 | [`sweep-worktrees`](bin/sweep-worktrees) | Rescue-and-bundle stale git worktrees before removing them |
 | [`netpick`](bin/netpick) | Which network this Mac should use right now. Measures Wi-Fi and any tethered phone or Ethernet link together, sends every probe through one link's interface, ranks the links for Claude Code sessions and git, and never switches networks itself. See [docs/netpick.md](docs/netpick.md). |
 
